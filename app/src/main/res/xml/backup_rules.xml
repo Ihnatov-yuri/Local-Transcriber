@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Don't back up downloaded models or recorded audio. -->
+    <exclude domain="file" path="models/" />
+    <exclude domain="file" path="recordings/" />
+</full-backup-content>

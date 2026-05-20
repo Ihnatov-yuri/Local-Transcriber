@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple mic glyph centered in the 108dp safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:translateX="30" android:translateY="22">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M24,2c-4.4,0 -8,3.6 -8,8v22c0,4.4 3.6,8 8,8s8,-3.6 8,-8V10C32,5.6 28.4,2 24,2z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M38,32c0,7.7 -6.3,14 -14,14s-14,-6.3 -14,-14H4c0,9.6 7.1,17.5 16.4,18.8V58h7.2v-7.2C36.9,49.5 44,41.6 44,32H38z" />
+    </group>
+</vector>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Lightweight base theme so the Activity has something while Compose loads.
+      Material 3 dynamic color is set up entirely in Compose (TranscriberTheme.kt);
+      this XML theme just keeps the window background and status bar from flashing.
+    -->
+    <style name="Theme.Transcriber" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
