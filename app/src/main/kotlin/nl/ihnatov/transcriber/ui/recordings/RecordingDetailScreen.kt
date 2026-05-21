@@ -341,8 +341,9 @@ fun RecordingDetailScreen(
                     presets = ui.presets,
                     statuses = ui.presetStatus,
                     onRun = { id -> vm.runPreset(id) },
+                    compact = true,
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
             }
 
             // Tab strip — Transcript / each Output.
@@ -976,12 +977,32 @@ private fun PresetGrid(
     presets: List<nl.ihnatov.transcriber.asr.PostProcessingPreset>,
     statuses: Map<String, RecordingDetailViewModel.PresetStatus>,
     onRun: (String) -> Unit,
+    /**
+     * Compact mode for the READ ⤢ fullscreen view. Shrinks cell padding,
+     * label type size, and inter-row spacing so the now-five presets
+     * (Summary / Context-aware rewrite / Clean / Proofread / Translate &
+     * polish — three grid rows) don't eat the transcript's vertical
+     * space. Normal Detail view uses the roomier default.
+     */
+    compact: Boolean = false,
 ) {
     if (presets.isEmpty()) return
     val ink = MaterialTheme.colorScheme.onBackground
     val paper = MaterialTheme.colorScheme.background
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Mono("POST-PROCESS · RUN A PRESET", color = ink.copy(alpha = 0.55f))
+    val cellVPad = if (compact) 7.dp else 12.dp
+    val cellHPad = if (compact) 10.dp else 12.dp
+    val rowGap = if (compact) 6.dp else 8.dp
+    val labelStyle = if (compact)
+        MaterialTheme.typography.labelSmall
+    else MaterialTheme.typography.labelLarge
+    Column(verticalArrangement = Arrangement.spacedBy(rowGap)) {
+        Mono(
+            "POST-PROCESS · RUN A PRESET",
+            color = ink.copy(alpha = 0.55f),
+            style = if (compact)
+                MaterialTheme.typography.labelSmall
+            else MaterialTheme.typography.labelLarge,
+        )
         // 2-column grid. Two layout fixes vs the earlier version:
         //   1. `height(IntrinsicSize.Min)` on the Row + `fillMaxHeight`
         //      on each cell makes the two cells in a row match the
@@ -995,7 +1016,7 @@ private fun PresetGrid(
         //      off the right edge of cells with long labels.
         presets.chunked(2).forEach { rowItems ->
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(rowGap),
                 modifier = Modifier.height(IntrinsicSize.Min),
             ) {
                 rowItems.forEach { preset ->
@@ -1007,23 +1028,24 @@ private fun PresetGrid(
                             .fillMaxHeight()
                             .background(ink)
                             .clickable(enabled = !running) { onRun(preset.id) }
-                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                            .padding(horizontal = cellHPad, vertical = cellVPad),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Mono(
                             preset.displayName.uppercase(),
                             color = paper,
+                            style = labelStyle,
                             modifier = Modifier.weight(1f),
                         )
-                        Spacer(Modifier.width(8.dp))
+                        Spacer(Modifier.width(6.dp))
                         if (running) {
                             CircularProgressIndicator(
                                 color = Accent,
                                 strokeWidth = 1.5.dp,
-                                modifier = Modifier.size(14.dp),
+                                modifier = Modifier.size(if (compact) 11.dp else 14.dp),
                             )
                         } else {
-                            Mono("↗", color = Accent)
+                            Mono("↗", color = Accent, style = labelStyle)
                         }
                     }
                 }

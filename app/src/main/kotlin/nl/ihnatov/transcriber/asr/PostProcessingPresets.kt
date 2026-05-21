@@ -220,10 +220,64 @@ class PresetStore(context: Context) {
             userTemplate = "Transcript to revise (read the whole thing first, then rewrite):\n{transcript}",
         )
 
+        /**
+         * Proofread-in-place. The tightest of the three "fix the
+         * transcript" presets:
+         *   - [DEFAULT_CLEAN] fixes errors line-by-line.
+         *   - [DEFAULT_CONTEXT_REWRITE] re-reads the whole conversation
+         *     and back-propagates corrections (heavier, can drift).
+         *   - This one is a focused proofread: fix typos, mishearings,
+         *     and grammar IN THE DETECTED LANGUAGE, change nothing else.
+         *
+         * The system template hammers on "stay in {language_hint}" because
+         * the most common failure mode is the model quietly translating
+         * a cleaned Arabic/Ukrainian transcript into English. The
+         * language hint now resolves from the DETECTED segment language
+         * (see PostProcessor.detectedLanguageFromSegments), so this is
+         * reliable even on Auto-mode recordings.
+         */
+        val DEFAULT_PROOFREAD = PostProcessingPreset(
+            id = "proofread",
+            displayName = "Proofread",
+            description = "Fix typos and recognizer errors, same language, nothing else changed",
+            outputTitle = "Proofread transcript",
+            systemTemplate = """
+                You are a proofreader for a speech-to-text transcript.
+                {language_hint}
+
+                CRITICAL: write your entire output in that SAME language.
+                Do NOT translate. Do NOT switch to English. If the
+                transcript is Arabic, your output is Arabic; if Ukrainian,
+                Ukrainian; and so on.
+
+                Your only job is to correct recognizer mistakes:
+                - Fix typos, misspellings, and misheard words (homophones,
+                  split or merged words, wrong diacritics).
+                - Fix grammar and add correct punctuation + casing for the
+                  language.
+                - Remove stray non-word tokens the recognizer invented.
+                - Keep the speaker's exact wording, register, and dialect.
+                  Do NOT paraphrase, summarize, formalize, or reorder.
+                - Keep every speaker label and segment in place and in order.
+                - Keep names, numbers, and dates exactly.
+
+                Hard rules:
+                - Output ONLY the corrected transcript, in the source
+                  language, as plain text.
+                - Preserve the leading [MM:SS] timestamps and speaker-label
+                  blocks exactly as they appear in the input.
+                - Begin directly with the first line. No preamble, no
+                  commentary, no code fences, no surrounding quotes.
+                {vocabulary}
+            """.trimIndent(),
+            userTemplate = "Transcript to proofread (keep the original language):\n{transcript}",
+        )
+
         val DEFAULTS: List<PostProcessingPreset> = listOf(
             DEFAULT_SUMMARY,
             DEFAULT_CONTEXT_REWRITE,
             DEFAULT_CLEAN,
+            DEFAULT_PROOFREAD,
             DEFAULT_TRANSLATE_POLISH,
         )
     }

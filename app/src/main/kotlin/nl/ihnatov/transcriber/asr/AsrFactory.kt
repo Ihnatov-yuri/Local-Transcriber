@@ -157,5 +157,17 @@ class AsrFactory(
         AsrBackendKind.Gemma4 -> setOf("litertlm", "task")
     }
 
+    /**
+     * Which backend a model file belongs to, inferred from its extension.
+     * Returns null for files that match no known backend. Used by the
+     * Settings "Installed" UI to group models and offer an active-model
+     * picker per backend (so a user with both Gemma E2B and E4B — or two
+     * Whisper sizes — can choose which one transcription uses).
+     */
+    fun kindForFile(file: File): AsrBackendKind? {
+        val ext = file.extension.lowercase()
+        return AsrBackendKind.entries.firstOrNull { ext in extensionsFor(it) }
+    }
+
     private fun selectionKey(kind: AsrBackendKind): String = "selected_model_${kind.name}"
 }
