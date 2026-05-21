@@ -8,6 +8,22 @@ Sibling research and planning docs live in the [Transcriber](../Transcriber) Mac
 
 ---
 
+## Screenshots
+
+Editorial "ink-on-paper" design — paper background, single orange accent, monospace chrome. Dark mode shown.
+
+<p align="center">
+  <img src="docs/screenshots/record.jpeg" width="19%" alt="Record screen — capture timer, live level, engine + language options" />
+  <img src="docs/screenshots/detail-diarized.jpeg" width="19%" alt="Diarized session detail — Arabic interview with per-speaker colors and RTL transcript" />
+  <img src="docs/screenshots/transcribing.jpeg" width="19%" alt="Transcription in progress — Identifying speakers stage" />
+  <img src="docs/screenshots/settings-models.jpeg" width="19%" alt="Settings — background-execution reliability and model downloads" />
+  <img src="docs/screenshots/settings-vocabulary.jpeg" width="19%" alt="Settings — quick-fill domain vocabulary packs" />
+</p>
+
+<p align="center"><sub>Record · Diarized session (Arabic, RTL) · Live transcribe · Settings/models · Quick-fill vocabulary</sub></p>
+
+---
+
 ## Requirements
 
 - **Android Studio Iguana** (or newer) — Hedgehog onward also works.
