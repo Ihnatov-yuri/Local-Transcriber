@@ -54,6 +54,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -132,6 +133,7 @@ fun SettingsScreen(container: AppContainer) {
         )
         InstalledModelsCard(
             installedFiles = state.installedFiles,
+            factory = container.asrFactory,
             importing = state.importing,
             importError = state.importError,
             onImport = { importLauncher.launch(arrayOf("*/*")) },
@@ -449,11 +451,16 @@ private fun DownloadCard(
 @Composable
 private fun InstalledModelsCard(
     installedFiles: List<File>,
+    factory: nl.ihnatov.transcriber.asr.AsrFactory,
     importing: Boolean,
     importError: String?,
     onImport: () -> Unit,
     onDelete: (File) -> Unit,
 ) {
+    // Bumped whenever the user picks a different active model, to force
+    // recomposition so the radio dots and resolveModel() reflect the
+    // new selection immediately.
+    var selectionTick by remember { mutableIntStateOf(0) }
     SettingsSection(title = "INSTALLED") {
         if (installedFiles.isEmpty()) {
             Text(
@@ -462,8 +469,34 @@ private fun InstalledModelsCard(
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             )
         } else {
+            // Group by backend so we can offer an active-model radio when
+            // a backend has more than one model installed (e.g. Gemma
+            // E2B + E4B, or two Whisper sizes). With a single model per
+            // backend there's nothing to choose, so no radio is shown.
+            val byKind = remember(installedFiles, selectionTick) {
+                installedFiles.groupBy { factory.kindForFile(it) }
+            }
             installedFiles.forEach { f ->
-                ModelRow(file = f, onDelete = { onDelete(f) })
+                val kind = factory.kindForFile(f)
+                val groupSize = kind?.let { byKind[it]?.size } ?: 1
+                val selectable = kind != null && groupSize > 1
+                // resolveModel reflects the current pin (or biggest-first
+                // default). Recomputed each composition; selectionTick
+                // forces it after a tap.
+                val active = selectable &&
+                    factory.resolveModel(kind!!)?.name == f.name
+                ModelRow(
+                    file = f,
+                    showRadio = selectable,
+                    active = active,
+                    onSelect = if (selectable) {
+                        {
+                            factory.setSelectedModel(kind!!, f.name)
+                            selectionTick++
+                        }
+                    } else null,
+                    onDelete = { onDelete(f) },
+                )
             }
         }
         if (importing) {
@@ -555,15 +588,38 @@ private fun EmbeddingPickerCard(
 }
 
 @Composable
-private fun ModelRow(file: File, onDelete: () -> Unit) {
+private fun ModelRow(
+    file: File,
+    onDelete: () -> Unit,
+    showRadio: Boolean = false,
+    active: Boolean = false,
+    onSelect: (() -> Unit)? = null,
+) {
+    val ink = MaterialTheme.colorScheme.onSurface
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onSelect != null) Modifier.clickable(onClick = onSelect) else Modifier)
+            .padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Active-model radio. Only shown when the backend has more than
+        // one model installed (e.g. Gemma E2B + E4B). The filled dot is
+        // the one transcription will actually use; tap a row to switch.
+        if (showRadio) {
+            nl.ihnatov.transcriber.ui.components.Mono(
+                if (active) "●" else "○",
+                color = if (active) nl.ihnatov.transcriber.ui.theme.Accent else ink.copy(alpha = 0.45f),
+                modifier = Modifier.padding(end = 10.dp),
+            )
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(file.name, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
             Text(
-                "%d MB".format(file.length() / 1024 / 1024),
+                buildString {
+                    append("%d MB".format(file.length() / 1024 / 1024))
+                    if (showRadio && active) append(" · active")
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
             )

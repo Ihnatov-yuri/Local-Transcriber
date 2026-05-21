@@ -79,11 +79,26 @@ object ModelCatalog {
         CatalogEntry(
             id = "whisper-large-v3-turbo-q5_0",
             displayName = "Whisper large-v3-turbo (q5_0)",
-            description = "Best for Arabic dialects + Ukrainian. Quantized for mobile.",
+            description = "Best general Whisper for Arabic dialects. Decent Ukrainian " +
+                "(~22% WER) — for Ukrainian prefer the specialized model below.",
             sizeMb = 574,
             filename = "ggml-large-v3-turbo-q5_0.bin",
             url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
             recommended = true,
+        ),
+        CatalogEntry(
+            id = "whisper-large-uk-q5_0",
+            displayName = "Whisper Ukrainian (large, q5_0)",
+            description = "Ukrainian-specialized fine-tune (arampacha/whisper-large-uk-2, " +
+                "large-v2 base). ~13.7% WER on Common Voice uk vs ~22% for stock " +
+                "large-v3-turbo — roughly 40% fewer errors. Use this for Ukrainian audio.",
+            sizeMb = 1031,
+            filename = "ggml-large-uk-q5_0.bin",
+            // GitHub Release asset on the project repo (tag: Ukrainian_model).
+            // Converted from arampacha/whisper-large-uk-2 via whisper.cpp's
+            // convert-h5-to-ggml.py then quantized to q5_0.
+            // SHA256: 842c2f2104884a14d34ff0e936a5aa2d26b039a688c75a6cb4ce68f41829aa6e
+            url = "https://github.com/Ihnatov-yuri/Local-Transcriber/releases/download/Ukrainian_model/ggml-large-uk-q5_0.bin",
         ),
         CatalogEntry(
             id = "gemma-4-e2b",

@@ -79,7 +79,19 @@ class PostProcessor(
         }
         try {
             onProgress(Progress.Running)
-            val resolvedLang = recording.sourceLanguage ?: language
+            // Language resolution priority:
+            //   1. The recording's explicitly-set source language.
+            //   2. The caller-supplied language.
+            //   3. The DETECTED language from the transcript segments —
+            //      Gemma stamps each segment with the language it heard,
+            //      so even an Auto-mode transcription knows what it is
+            //      after the fact. Without this fallback, post-process
+            //      presets on Auto recordings get "any language" and the
+            //      cleanup can't anchor on the real language (the user-
+            //      reported weak-cleanup case).
+            val resolvedLang = recording.sourceLanguage
+                ?: language
+                ?: detectedLanguageFromSegments(segments)
             val systemPrompt = renderTemplate(preset.systemTemplate, resolvedLang, segments)
             val userPrompt = renderTemplate(preset.userTemplate, resolvedLang, segments)
             Log.i(TAG, "preset=$presetId  language=$resolvedLang  segments=${segments.size}")
@@ -126,6 +138,22 @@ class PostProcessor(
         // body (not just user-edited templates) still expands.
         return snippetStore.substitute(resolved)
     }
+
+    /**
+     * Pick the dominant detected language across the transcript segments.
+     * Gemma stamps each [Segment.language] with what it heard. We take the
+     * most frequent non-null, non-"auto" value — a transcript is
+     * overwhelmingly one language even when code-switching, and the
+     * cleanup prompt only needs one anchor. Returns null if no segment
+     * carries a usable language.
+     */
+    private fun detectedLanguageFromSegments(segments: List<Segment>): String? =
+        segments
+            .mapNotNull { it.language?.lowercase()?.takeIf { l -> l.isNotBlank() && l != "auto" } }
+            .groupingBy { it }
+            .eachCount()
+            .maxByOrNull { it.value }
+            ?.key
 
     private fun languageHint(language: String?): String = when (language?.lowercase()) {
         null, "auto", "" -> "The transcript may be in any language."
