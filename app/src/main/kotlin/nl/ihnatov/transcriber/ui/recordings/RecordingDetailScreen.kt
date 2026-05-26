@@ -123,6 +123,14 @@ fun RecordingDetailScreen(
     var diarize by remember { mutableStateOf(false) }
     val diarReady = remember { container.diarizationRunner.isEmbeddingModelPresent() }
     val embeddingModelName = remember { container.diarizationRunner.embeddingModelDisplayName() }
+    // Installed Gemma models, for the RUN-sheet MODEL picker. Bumped on
+    // selection so the active label refreshes. Short label = E2B / E4B
+    // (extracted from the filename), or the bare filename as a fallback.
+    var gemmaModelTick by remember { mutableIntStateOf(0) }
+    val gemmaModels = remember { container.asrFactory.listModels(AsrBackendKind.Gemma4) }
+    fun shortGemmaLabel(name: String): String =
+        Regex("E\\d+B", RegexOption.IGNORE_CASE).find(name)?.value?.uppercase()
+            ?: name.removeSuffix(".litertlm").removeSuffix(".task").take(12)
     var hybridDiar by remember { mutableStateOf(diarReady) }
     var runOnCharger by remember { mutableStateOf(false) }
     // -1 = "auto" (sherpa clusters and picks); 1+ = explicit speaker
@@ -448,6 +456,22 @@ fun RecordingDetailScreen(
                     diarReady = diarReady,
                     hybridDiar = hybridDiar,
                     embeddingModelName = embeddingModelName,
+                    gemmaModelLabel = run {
+                        gemmaModelTick // read so this recomputes after a cycle
+                        if (gemmaModels.size > 1) {
+                            val active = container.asrFactory.resolveModel(AsrBackendKind.Gemma4)?.name
+                            active?.let { shortGemmaLabel(it) }
+                        } else null
+                    },
+                    onCycleGemmaModel = {
+                        if (gemmaModels.size > 1) {
+                            val active = container.asrFactory.resolveModel(AsrBackendKind.Gemma4)?.name
+                            val idx = gemmaModels.indexOfFirst { it.name == active }
+                            val next = gemmaModels[(idx + 1).mod(gemmaModels.size)]
+                            container.asrFactory.setSelectedModel(AsrBackendKind.Gemma4, next.name)
+                            gemmaModelTick++
+                        }
+                    },
                     runOnCharger = runOnCharger,
                     expectedSpeakers = expectedSpeakers,
                     onCycleBackend = {
@@ -736,6 +760,13 @@ private fun RunOptionsSheetContent(
      * installed.
      */
     embeddingModelName: String?,
+    /**
+     * Short label of the active Gemma model (e.g. "E2B" / "E4B") and a
+     * cycler, used only when the Gemma backend has >1 model installed.
+     * Null label hides the MODEL row (single model = nothing to pick).
+     */
+    gemmaModelLabel: String?,
+    onCycleGemmaModel: () -> Unit,
     runOnCharger: Boolean,
     expectedSpeakers: Int,
     onCycleBackend: () -> Unit,
@@ -769,6 +800,17 @@ private fun RunOptionsSheetContent(
             onClick = onCycleBackend,
             onHelp = { helpFor = RunOptionHelp.ENGINE },
         )
+        // Gemma model picker — only when the Gemma backend has more than
+        // one model installed (E2B + E4B). Tapping cycles the active
+        // model and pins it. Hidden otherwise (nothing to choose).
+        if (backend == AsrBackendKind.Gemma4 && gemmaModelLabel != null) {
+            RunOptionLine(
+                label = "MODEL",
+                value = gemmaModelLabel,
+                onClick = onCycleGemmaModel,
+                onHelp = { helpFor = RunOptionHelp.MODEL },
+            )
+        }
         RunOptionLine(
             label = "LANG",
             value = summarizeLanguages(selectedLangs).uppercase(),
@@ -848,6 +890,13 @@ private enum class RunOptionHelp(val title: String, val body: String) {
             "inline speaker labels and translation. WHISPER (whisper.cpp) is " +
             "faster on long files, more robust on noisy audio, English-translate " +
             "only.",
+    ),
+    MODEL(
+        "MODEL",
+        "Which Gemma model runs the transcription when more than one is " +
+            "installed. E2B (2.6 GB) is faster per chunk; E4B (3.5 GB) is " +
+            "more accurate on dialectal Arabic and Ukrainian but slower. " +
+            "Tap to switch — the choice persists across runs.",
     ),
     LANG(
         "LANG",

@@ -50,6 +50,13 @@ private const val CHUNK_TIMEOUT_MS = 2L * 60_000L
 private const val RETRY_AUDIO_SECONDS = 24
 
 /**
+ * Max sherpa speaker-hint turns inlined into a single chunk's Gemma
+ * user message. Each turn is a "Speaker N at X–Y s" line; too many
+ * bloat the prompt and correlate with the prefill silent-wedge.
+ */
+private const val MAX_HINTS_PER_CHUNK = 6
+
+/**
  * Per-chunk RMS amplitude floor. Chunks below this are pre-skipped —
  * Gemma is never asked to transcribe them. Feeding silent audio to the
  * model is the main trigger of "prompt content echoing into output"
@@ -247,14 +254,43 @@ class TranscriptionRunner(
                         "budget=${budgetMb}MB, sherpa-decode-peak=${expectedPeakMb}MB " +
                         "(raw=${rawFloatMb}MB)")
                     if (expectedPeakMb > budgetMb * 0.7) {
+                        // Too big to decode whole — but instead of skipping
+                        // diarization, run the WINDOWED path. It streams the
+                        // file in bounded windows (~22 MB each) and stitches
+                        // speaker ids across windows, so file length stops
+                        // mattering for memory.
                         send(AsrEvent.Stage(
-                            "Recording too long for hybrid diarization on this " +
-                                "device (~${expectedPeakMb}MB needed, ${budgetMb}MB free). " +
-                                "Using Gemma-only labels.",
-                            0.12f,
+                            "Long recording — diarizing in windows", 0.10f,
                         ))
-                        Log.w(TAG, "skipping sherpa pre-pass: would need " +
-                            "${expectedPeakMb}MB peak, only ${budgetMb}MB heap free")
+                        Log.i(TAG, "using chunked diarization: full decode " +
+                            "would need ${expectedPeakMb}MB peak, only ${budgetMb}MB free")
+                        val chunkedResult = runCatching {
+                            diarizer.runChunked(
+                                file = File(audioPath),
+                                numClusters = expectedSpeakers,
+                                durationSec = recording.durationSeconds,
+                                onProgress = { fraction ->
+                                    val pct = (fraction * 100f).toInt().coerceIn(0, 99)
+                                    trySend(AsrEvent.Stage(
+                                        "Identifying speakers · $pct%",
+                                        (0.10f + 0.04f * fraction).coerceAtMost(0.14f),
+                                    ))
+                                },
+                            ).getOrThrow()
+                        }
+                        sherpaSegmentsFromPrepass = chunkedResult.getOrNull()
+                        if (sherpaSegmentsFromPrepass == null) {
+                            send(AsrEvent.Stage(
+                                "Windowed clustering failed; using Gemma-only labels: " +
+                                    (chunkedResult.exceptionOrNull()?.message ?: "unknown"),
+                                0.13f,
+                            ))
+                        } else {
+                            send(AsrEvent.Stage(
+                                "Speaker clustering complete (${sherpaSegmentsFromPrepass.size} turns, windowed)",
+                                0.14f,
+                            ))
+                        }
                     } else {
                         send(AsrEvent.Stage("Decoding for speaker clustering", 0.10f))
                         val sherpaResult = runCatching {
@@ -448,11 +484,17 @@ class TranscriptionRunner(
                                 merged.add(h)
                             }
                         }
-                        // Hard cap as a final safety net. 12 turns per
-                        // 28-sec chunk is already an unusually fast back-
-                        // and-forth; more than that and the hints add more
-                        // confusion than they remove.
-                        val capped = if (merged.size > 12) merged.take(12) else merged
+                        // Hard cap as a final safety net. Lowered 12 → 6:
+                        // a long hint block bloats the user-message prompt
+                        // (each turn is a "Speaker N at X–Y s" line), and
+                        // large prompts correlate strongly with the Gemma
+                        // prefill silent-wedge (a ~1320-char prompt is right
+                        // at the edge). 6 turns per 28-sec chunk is already
+                        // a fast back-and-forth; beyond that the hints add
+                        // prompt weight + wedge risk for little labelling
+                        // gain.
+                        val capped = if (merged.size > MAX_HINTS_PER_CHUNK)
+                            merged.take(MAX_HINTS_PER_CHUNK) else merged
                         capped.takeIf { it.isNotEmpty() }
                     }
                     // Hard per-chunk timeout. Gemma 4 audio inference is

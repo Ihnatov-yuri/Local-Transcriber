@@ -71,7 +71,7 @@ class DiarizationRunner(
     suspend fun run(
         samples: FloatArray,
         numClusters: Int = -1,
-        threshold: Float = 0.5f,
+        threshold: Float = DEFAULT_CLUSTER_THRESHOLD,
         onProgress: ((fraction: Float) -> Unit)? = null,
     ): Result<List<SpeakerSegment>> = withContext(Dispatchers.Default) {
         val embeddingFile = embeddingModelFile()
@@ -139,9 +139,13 @@ class DiarizationRunner(
                 val segs: Array<OfflineSpeakerDiarizationSegment> =
                     diar.process(samples)
                 runCatching { diar.release() }
-                Result.success(
-                    segs.map { SpeakerSegment(start = it.start, end = it.end, speakerId = it.speaker) }
-                )
+                val mapped = segs.map {
+                    SpeakerSegment(start = it.start, end = it.end, speakerId = it.speaker)
+                }
+                // Auto mode only: collapse over-segmentation. Forced-count
+                // mode (numClusters>0) already controls the speaker count.
+                val out = if (numClusters <= 0) consolidateSpeakers(mapped) else mapped
+                Result.success(out)
             } finally {
                 progressTimer?.cancel()
                 cancelWatcher.cancel()
@@ -153,6 +157,265 @@ class DiarizationRunner(
             Log.e(TAG, "diarization failed", t)
             Result.failure(t)
         }
+    }
+
+    /**
+     * Windowed diarization for files too large to decode whole. Streams the
+     * audio in overlapping windows (default 5-min content + 45-sec overlap),
+     * diarizes each window independently, and stitches each window's LOCAL
+     * speaker ids into globally-consistent ids by matching who speaks in the
+     * overlap zone shared with the previous window.
+     *
+     * Why this exists: sherpa's `process()` needs the WHOLE audio buffer in
+     * heap at once (its API takes a FloatArray, not a stream). A 1-hour file
+     * is ~220 MB raw + codec overhead, which blows the heap budget — so the
+     * caller used to skip diarization entirely on long files. Here memory is
+     * bounded by one window (~22 MB) regardless of total length.
+     *
+     * Stitching is embedding-free on purpose: it uses only the already-
+     * working `process()` JNI. Sherpa's standalone SpeakerEmbeddingExtractor
+     * would give cleaner global matching but adds two more JNI-bound classes
+     * to vendor (and the processWithCallback crash showed how fragile that
+     * binding is). Temporal-overlap stitching is robust as long as each
+     * speaker says SOMETHING in the 45-sec overlap zone; a speaker silent
+     * for a full overlap window gets a duplicate id (rare, acceptable —
+     * mergeable later by a manual rename).
+     *
+     * @param windowSec content seconds per window (excludes overlap).
+     * @param overlapSec lookback shared with the previous window, for
+     *                   speaker-id stitching.
+     */
+    suspend fun runChunked(
+        file: File,
+        windowSec: Double = 300.0,
+        overlapSec: Double = 45.0,
+        /**
+         * -1 = auto-cluster per window via [threshold]; >0 = force this
+         * many speakers per window. Forcing is the deterministic fix for
+         * the over-segmentation we see on Arabic / multilingual audio
+         * (CAM++ splits one voice into many at the auto threshold). Only
+         * pass a forced count when the user actually knows it — a window
+         * containing fewer than N speakers will be over-split if forced.
+         */
+        numClusters: Int = -1,
+        threshold: Float = DEFAULT_CLUSTER_THRESHOLD,
+        durationSec: Double = 0.0,
+        onProgress: ((fraction: Float) -> Unit)? = null,
+    ): Result<List<SpeakerSegment>> = withContext(Dispatchers.Default) {
+        val embeddingFile = embeddingModelFile()
+            ?: return@withContext Result.failure(missingEmbeddingException())
+        Log.i(TAG, "chunked diarization: model=${embeddingModelDisplayName() ?: "?"} " +
+            "window=${windowSec}s overlap=${overlapSec}s threshold=$threshold " +
+            "clusters=${if (numClusters > 0) numClusters.toString() else "auto"}")
+        val segFile = ensureSegmentationModelOnDisk()
+        val windowSamples = (windowSec * nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR).toInt()
+        val overlapSamples = (overlapSec * nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR).toInt()
+
+        try {
+            val config = OfflineSpeakerDiarizationConfig(
+                segmentation = OfflineSpeakerSegmentationModelConfig(
+                    pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(segFile.absolutePath),
+                    numThreads = 2,
+                ),
+                embedding = SpeakerEmbeddingExtractorConfig(
+                    model = embeddingFile.absolutePath,
+                    numThreads = 2,
+                ),
+                // Auto (numClusters=-1) lets the global speaker count emerge
+                // from cross-window stitching; a forced count (numClusters>0)
+                // pins N speakers per window — the deterministic fix for
+                // over-segmentation when the user knows the speaker count.
+                clustering = FastClusteringConfig(numClusters = numClusters, threshold = threshold),
+                minDurationOn = 0.2f,
+                minDurationOff = 0.5f,
+            )
+            val diar = OfflineSpeakerDiarization(assetManager = null, config = config)
+            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                try { awaitCancellation() } finally { runCatching { diar.release() } }
+            }
+            try {
+                val globals = mutableListOf<SpeakerSegment>()
+                var nextGlobalId = 0
+                var windowIdx = 0
+                nl.ihnatov.transcriber.audio.AudioDecoder.decodeChunked(
+                    file,
+                    chunkSamples = windowSamples,
+                    overlapSamples = overlapSamples,
+                ).collect { chunk ->
+                    val winStart = chunk.startSeconds
+                    val ov = chunk.overlapSeconds          // 0 for the first window
+                    val newContentStart = winStart + ov    // emit only segments at/after this
+                    val local = diar.process(chunk.samples)
+                        .map { SpeakerSegment(
+                            start = (winStart + it.start).toFloat(),
+                            end = (winStart + it.end).toFloat(),
+                            speakerId = it.speaker,
+                        ) }
+                    if (windowIdx == 0 || ov <= 0.0) {
+                        // First window: local ids become global ids directly.
+                        val remap = HashMap<Int, Int>()
+                        for (s in local) {
+                            val g = remap.getOrPut(s.speakerId) { nextGlobalId++ }
+                            globals.add(s.copy(speakerId = g))
+                        }
+                    } else {
+                        val mapping = stitchLocalToGlobal(
+                            local = local,
+                            globals = globals,
+                            overlapStart = winStart.toFloat(),
+                            overlapEnd = newContentStart.toFloat(),
+                            allocNewId = { nextGlobalId++ },
+                        )
+                        // Emit only NEW-content segments (the overlap zone was
+                        // already emitted by the previous window).
+                        for (s in local) {
+                            if (s.start >= newContentStart.toFloat() - 0.001f) {
+                                val g = mapping[s.speakerId] ?: nextGlobalId++
+                                globals.add(s.copy(speakerId = g))
+                            }
+                        }
+                    }
+                    windowIdx++
+                    if (durationSec > 0) {
+                        onProgress?.invoke((chunk.startSeconds / durationSec).toFloat().coerceIn(0f, 1f))
+                    } else {
+                        onProgress?.invoke(0f)
+                    }
+                    Log.i(TAG, "  window $windowIdx @ ${"%.0f".format(winStart)}s → " +
+                        "${local.size} local segs, $nextGlobalId global speakers so far")
+                }
+                runCatching { diar.release() }
+                val sorted = globals.sortedBy { it.start }
+                // Auto mode only: collapse over-segmentation (the windowed
+                // path is especially prone to it — every window can spawn
+                // spurious speakers that the overlap stitch can't merge).
+                val out = if (numClusters <= 0) consolidateSpeakers(sorted) else sorted
+                Log.i(TAG, "chunked diarization complete: ${globals.size} raw → " +
+                    "${out.map { it.speakerId }.distinct().size} speakers " +
+                    "(was $nextGlobalId) across $windowIdx windows")
+                Result.success(out)
+            } finally {
+                cancelWatcher.cancel()
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            Log.i(TAG, "chunked diarization cancelled: ${ce.message}")
+            throw ce
+        } catch (t: Throwable) {
+            Log.e(TAG, "chunked diarization failed", t)
+            Result.failure(t)
+        }
+    }
+
+    /**
+     * Collapse over-segmentation in AUTO clustering. CAM++ on Arabic /
+     * Ukrainian / multilingual speech routinely fractures one voice into
+     * many spurious speakers (observed: 43 "speakers" in a ~38-min
+     * 2-3 person conversation). Those spurious speakers almost always
+     * have tiny total talk-time — a few 1-2 second segments — while
+     * the real speakers dominate.
+     *
+     * Heuristic: a speaker is "real" if its total duration is at least
+     * [MIN_SPEAKER_SECONDS] AND at least [MINOR_SPEAKER_FRACTION] of the
+     * largest speaker's total. Everything else is reassigned to the
+     * temporally-nearest real speaker (the real speaker whose segment is
+     * closest in time to the spurious one). Speaker ids are then
+     * renumbered 0..K-1 in first-appearance order.
+     *
+     * No-op when there are ≤2 speakers (nothing to collapse) or no
+     * speaker clears the "real" bar (degenerate — keep original rather
+     * than merge everything into one).
+     */
+    private fun consolidateSpeakers(segs: List<SpeakerSegment>): List<SpeakerSegment> {
+        if (segs.isEmpty()) return segs
+        val totalBySpeaker = segs.groupBy { it.speakerId }
+            .mapValues { (_, v) -> v.sumOf { (it.end - it.start).toDouble() } }
+        if (totalBySpeaker.size <= 2) return segs
+        val maxDur = totalBySpeaker.values.maxOrNull() ?: 0.0
+        val floor = maxOf(MIN_SPEAKER_SECONDS, MINOR_SPEAKER_FRACTION * maxDur)
+        val realSpeakers = totalBySpeaker.filter { it.value >= floor }.keys
+        if (realSpeakers.isEmpty() || realSpeakers.size == totalBySpeaker.size) return segs
+
+        // Sorted real-speaker segments for nearest-time lookup.
+        val realSegs = segs.filter { it.speakerId in realSpeakers }.sortedBy { it.start }
+        if (realSegs.isEmpty()) return segs
+        fun nearestRealSpeaker(s: SpeakerSegment): Int {
+            val mid = (s.start + s.end) / 2f
+            var best = realSegs.first().speakerId
+            var bestGap = Float.MAX_VALUE
+            for (r in realSegs) {
+                val gap = when {
+                    mid < r.start -> r.start - mid
+                    mid > r.end -> mid - r.end
+                    else -> 0f
+                }
+                if (gap < bestGap) { bestGap = gap; best = r.speakerId }
+            }
+            return best
+        }
+        val reassigned = segs.map { s ->
+            if (s.speakerId in realSpeakers) s
+            else s.copy(speakerId = nearestRealSpeaker(s))
+        }
+        // Renumber to contiguous 0..K-1 in first-appearance order.
+        val order = LinkedHashMap<Int, Int>()
+        for (s in reassigned.sortedBy { it.start }) {
+            if (s.speakerId !in order) order[s.speakerId] = order.size
+        }
+        val result = reassigned.map { it.copy(speakerId = order[it.speakerId] ?: 0) }
+        Log.i(TAG, "consolidateSpeakers: ${totalBySpeaker.size} → ${order.size} " +
+            "(floor=${"%.1f".format(floor)}s, dropped ${totalBySpeaker.size - realSpeakers.size} minor)")
+        return result
+    }
+
+    /**
+     * Map a window's local speaker ids to global ids by temporal overlap in
+     * the shared zone [overlapStart, overlapEnd). For each local speaker we
+     * find the previously-emitted global speaker it overlaps most with in
+     * that zone and bind them; ties and double-binds are resolved greedily
+     * (highest-overlap pair first). Local speakers with no meaningful
+     * overlap-zone presence get a fresh global id from [allocNewId].
+     */
+    private fun stitchLocalToGlobal(
+        local: List<SpeakerSegment>,
+        globals: List<SpeakerSegment>,
+        overlapStart: Float,
+        overlapEnd: Float,
+        allocNewId: () -> Int,
+    ): Map<Int, Int> {
+        fun overlapDur(s1: Float, e1: Float, s2: Float, e2: Float): Float =
+            (minOf(e1, e2) - maxOf(s1, s2)).coerceAtLeast(0f)
+
+        // Per (localId, globalId) total overlapping duration inside the zone.
+        val pair = HashMap<Pair<Int, Int>, Float>()
+        val localIds = local.map { it.speakerId }.toMutableSet()
+        for (ls in local) {
+            val lsS = maxOf(ls.start, overlapStart); val lsE = minOf(ls.end, overlapEnd)
+            if (lsE <= lsS) continue
+            for (gs in globals) {
+                if (gs.end <= overlapStart || gs.start >= overlapEnd) continue
+                val d = overlapDur(lsS, lsE, gs.start, gs.end)
+                if (d > 0f) {
+                    val k = ls.speakerId to gs.speakerId
+                    pair[k] = (pair[k] ?: 0f) + d
+                }
+            }
+        }
+        // Greedy: bind highest-overlap pairs first, one global per local.
+        val result = HashMap<Int, Int>()
+        val usedGlobals = HashSet<Int>()
+        val sorted = pair.entries.sortedByDescending { it.value }
+        val MIN_OVERLAP = 0.3f
+        for (e in sorted) {
+            val (lId, gId) = e.key
+            if (e.value < MIN_OVERLAP) break
+            if (result.containsKey(lId) || gId in usedGlobals) continue
+            result[lId] = gId
+            usedGlobals.add(gId)
+            localIds.remove(lId)
+        }
+        // Any local speaker not matched in the zone is genuinely new.
+        for (lId in localIds) result[lId] = allocNewId()
+        return result
     }
 
     /**
@@ -249,6 +512,34 @@ class DiarizationRunner(
 
     companion object {
         private const val TAG = "DiarizationRunner"
+
+        /**
+         * Cosine-similarity threshold for FastClustering. Higher = merge
+         * more aggressively (fewer speakers); lower = split more (more
+         * speakers). sherpa's stock default is 0.5, tuned for English
+         * VoxCeleb. On Arabic / Ukrainian / multilingual speech, intra-
+         * speaker embedding variance exceeds inter-speaker at 0.5, so one
+         * voice fractures into many (observed: 16 speakers in a 5-min
+         * window of a 2-3 person conversation). 0.7 merges those back
+         * without collapsing genuinely distinct voices in testing. Tune
+         * here if a clean English meeting starts under-segmenting.
+         */
+        const val DEFAULT_CLUSTER_THRESHOLD = 0.7f
+
+        /**
+         * A speaker must talk at least this many seconds total to survive
+         * auto-mode consolidation. Below this it's treated as spurious
+         * over-segmentation and merged into the nearest real speaker.
+         */
+        private const val MIN_SPEAKER_SECONDS = 6.0
+
+        /**
+         * …and at least this fraction of the most-talkative speaker's
+         * total. Guards against keeping a dozen speakers who each clear
+         * the absolute floor but are tiny relative to the real
+         * participants.
+         */
+        private const val MINOR_SPEAKER_FRACTION = 0.08
     }
 }
 

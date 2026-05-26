@@ -71,6 +71,18 @@ class LiveTranscriber(
     @Volatile private var stopped = false
 
     /**
+     * Tail of the previous live chunk's transcript, carried forward as
+     * Gemma continuation context. The file path already does this; the
+     * live path used to start every chunk cold, so on short ambiguous
+     * chunks Gemma's language detection wobbled (a half-second of
+     * Ukrainian could get read as Russian/Polish without prior context).
+     * Feeding the last ~200 chars anchors language + named entities
+     * across the chunk boundary. Guarded by the mutex (only touched
+     * inside processOneChunk).
+     */
+    private var previousContext: String? = null
+
+    /**
      * Pick the right on-disk model for the chosen backend.
      *
      * - Whisper: prefer a "*tiny*" file specifically. Larger Whisper models
@@ -136,6 +148,7 @@ class LiveTranscriber(
                                 sampleRate = WavRecorder.SAMPLE_RATE,
                                 languages = languages,
                                 translateTo = null,    // live = always source language
+                                previousContext = previousContext,
                             ),
                         )
                     ).filter { it.text.isNotBlank() }
@@ -164,6 +177,13 @@ class LiveTranscriber(
                             )
                         )
                     }
+                }
+                // Carry this chunk's tail forward as continuation context
+                // for the next chunk (Gemma only; Whisper ignores it).
+                // Anchors language + named entities across the boundary.
+                val combined = rawSegs.joinToString(" ") { it.text.trim() }.trim()
+                if (combined.isNotEmpty()) {
+                    previousContext = combined.takeLast(200)
                 }
             }
             res.onFailure {
