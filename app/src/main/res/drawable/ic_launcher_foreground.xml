@@ -1,16 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Simple mic glyph centered in the 108dp safe zone. -->
+<!-- Editorial brand mark: a bold ink "T" (transcriber) with the orange
+     accent dot trailing it, mirroring the in-app "transcriber ●" wordmark.
+     Ink = InkLight #16130F, accent = #FF4726. Glyph sits inside the
+     center 66dp safe zone so the launcher mask never clips it. The
+     monochrome themed-icon layer reuses this; the T+dot silhouette still
+     reads when system-tinted to one colour. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group android:translateX="30" android:translateY="22">
-        <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M24,2c-4.4,0 -8,3.6 -8,8v22c0,4.4 3.6,8 8,8s8,-3.6 8,-8V10C32,5.6 28.4,2 24,2z" />
-        <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M38,32c0,7.7 -6.3,14 -14,14s-14,-6.3 -14,-14H4c0,9.6 7.1,17.5 16.4,18.8V58h7.2v-7.2C36.9,49.5 44,41.6 44,32H38z" />
-    </group>
+    <!-- lowercase "t": crossbar + stem with a short foot, so it reads as
+         a "t" rather than a "+". Stem extends well below the crossbar
+         and kicks right at the foot. -->
+    <!-- crossbar -->
+    <path
+        android:fillColor="#16130F"
+        android:pathData="M34,40 h31 v10 h-31 z" />
+    <!-- stem + foot (one shape) -->
+    <path
+        android:fillColor="#16130F"
+        android:pathData="M44,28 h11 v40 c0,4 2.5,6.5 6.5,6.5 h4 v9 h-5 c-9,0 -16.5,-5 -16.5,-15.5 z" />
+    <!-- orange accent dot, trailing to the lower-right -->
+    <path
+        android:fillColor="#FF4726"
+        android:pathData="M74,72 m-6.5,0 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0 z" />
 </vector>
