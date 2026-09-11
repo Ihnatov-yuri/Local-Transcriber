@@ -366,7 +366,7 @@ private fun Pill(
  * Section divider for the Settings vertical scroll. Small uppercase label
  * with subdued colour and ~16dp top padding so cards in the previous
  * section get visual breathing room. Cheaper than wrapping each section in
- * a Card-with-header (which makes Settings feel like a Russian doll).
+ * a Card-with-header (which nests containers and adds visual clutter).
  */
 @Composable
 private fun SectionHeader(text: String) {

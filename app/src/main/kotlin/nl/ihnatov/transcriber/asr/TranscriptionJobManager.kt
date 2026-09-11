@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import nl.ihnatov.transcriber.data.PendingTask
 import nl.ihnatov.transcriber.data.PendingTaskDao
 import nl.ihnatov.transcriber.data.RecordingRepository
@@ -79,6 +80,7 @@ class TranscriptionJobManager(
 
     /** What's currently running. null when idle. */
     private var runningId: Long? = null
+    private var runningParams: Params? = null
     private var currentJob: Job? = null
 
     init {
@@ -175,6 +177,7 @@ class TranscriptionJobManager(
 
     private fun startInternal(recordingId: Long, params: Params) {
         runningId = recordingId
+        runningParams = params
         updateStatus(recordingId) {
             JobStatus(running = true, stageLabel = "Starting", progress = 0f)
         }
@@ -220,6 +223,7 @@ class TranscriptionJobManager(
             } finally {
                 if (runningId == recordingId) {
                     runningId = null
+                    runningParams = null
                     val curr = _statuses.value[recordingId]
                     if (curr != null && curr.running) {
                         updateStatus(recordingId) { it.copy(running = false) }
@@ -292,6 +296,27 @@ class TranscriptionJobManager(
                 }
             }
         }
+    }
+
+    /**
+     * Called from [TranscriptionService.onTimeout] when the OS is about to
+     * force-stop the foreground service (only reachable on the
+     * mediaProcessing/dataSync fallback types — specialUse has no enforced
+     * timeout). Starting a job deletes its `pending_tasks` row (see
+     * [start]), so without this the in-flight task would be silently lost
+     * instead of resuming on next launch. Runs blocking: onTimeout only
+     * grants a short grace window before the process is killed outright,
+     * so a fire-and-forget coroutine could easily lose the race.
+     */
+    fun checkpointRunning() {
+        val id = runningId ?: return
+        val params = runningParams ?: return
+        runBlocking {
+            runCatching {
+                pendingTasks.upsert(params.toEntity(id, waitForCharger = false))
+            }.onFailure { Log.e(TAG, "checkpoint failed for $id", it) }
+        }
+        Log.w(TAG, "checkpointed running recording=$id ahead of FGS timeout kill")
     }
 
     /** Called by PowerConnectedReceiver when AC plugs in. */

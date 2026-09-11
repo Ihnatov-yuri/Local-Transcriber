@@ -186,6 +186,24 @@ class TranscriptionRunner(
             return@channelFlow
         }
 
+        if (backend == AsrBackendKind.Gemma4 && modelFile.name.contains("E4B", ignoreCase = true)) {
+            val budget = MemoryGuard.estimateBudget(context)
+            if (budget.estimatedBudgetBytes < MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES) {
+                val have = MemoryGuard.gibString(budget.estimatedBudgetBytes)
+                val need = MemoryGuard.gibString(MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES)
+                val why = if (budget.isLimiterEstimate) {
+                    " (Android's background memory limiter caps this app around ${have} GB)"
+                } else {
+                    " (only ${have} GB free right now)"
+                }
+                send(AsrEvent.Failed(
+                    "Gemma 4 E4B needs about $need GB of memory headroom$why. " +
+                        "Try Gemma 4 E2B instead, or close other apps and retry."
+                ))
+                return@channelFlow
+            }
+        }
+
         val asr = factory.create(backend)
         send(AsrEvent.Stage("Loading model", 0.05f))
         val loadRes = asr.load(modelFile.absolutePath)

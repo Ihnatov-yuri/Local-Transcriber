@@ -4,7 +4,7 @@ Standalone open-source Android transcription app. Records or imports audio (WAV 
 
 **Status: feature-complete v1.** Recording, file import, transcription (Whisper or Gemma 4 — Gemma is the default), diarization (sherpa-onnx OR Gemma prompt-based), auto-titling, inline segment editing, four post-processing presets (Summary / Context-aware rewrite / Clean / Translate-polish), custom vocabulary, tone styles, snippets, multi-select constrained-auto language picker (Arabic / Ukrainian / English / Dutch), live transcription, and a Settings page with Gemma 4 compute knobs (GPU/CPU, context window, CPU threads).
 
-Sibling research and planning docs live in the [Transcriber](../Transcriber) Mac-app repo under `android-plan/`.
+The current roadmap — a research-backed plan to bring this app to parity with the Mac app — lives at [docs/PLAN-2026-09.md](docs/PLAN-2026-09.md). Superseded planning notes are in [NEXT_STEPS.md](NEXT_STEPS.md).
 
 ---
 
@@ -28,7 +28,7 @@ Editorial "ink-on-paper" design — paper background, single orange accent, mono
 
 - **Android Studio Iguana** (or newer) — Hedgehog onward also works.
 - **JDK 17 or 21** — bundled with recent Android Studio installs.
-- **Android NDK 27.2.12479018** — installable from the SDK Manager. Needed for whisper.cpp's native build.
+- **Android NDK 30.0.16248370** (r30 LTS) — installable from the SDK Manager, or auto-installed on first Gradle sync if licenses are pre-accepted. Needed for whisper.cpp's native build.
 - **CMake 3.22.1** — also via the SDK Manager.
 - **A device with API 29+** (Android 10) and a working microphone. Real device strongly preferred — the emulator's mic + GPU acceleration are flaky and Gemma 4's `~2.6 GB` weights load slowly on emulators.
 
@@ -40,7 +40,12 @@ Editorial "ink-on-paper" design — paper background, single orange accent, mono
 # 1. From the repo root: pull whisper.cpp into app/src/main/cpp/whisper.cpp/.
 ./scripts/fetch-whisper-cpp.sh
 
-# 2. Open in Android Studio — it will prompt to install matching NDK + CMake.
+# 2. Pull the official sherpa-onnx Android AAR into app/libs/ (ASR engines +
+#    diarization). Neither of these native deps is vendored in git — see
+#    app/libs/README.md.
+./scripts/fetch-sherpa-onnx.sh
+
+# 3. Open in Android Studio — it will prompt to install matching NDK + CMake.
 #    Or build from the CLI:
 export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 export ANDROID_HOME="$HOME/Library/Android/sdk"
@@ -248,7 +253,7 @@ Then add a `signingConfigs` block to `app/build.gradle.kts`. Don't commit the ke
 
 | Symptom | Fix |
 |---|---|
-| `Android 16 KB Alignment` warning | All native libs are 16 KB-aligned (we substitute Microsoft's onnxruntime for bihe0832's transitive copy). If you see this warning, do a clean build (`./gradlew clean :app:assembleDebug`). |
+| `Android 16 KB Alignment` warning | All native libs are 16 KB-aligned — verified via `llvm-readelf -l` on every `.so` in the APK, including the official sherpa-onnx AAR's bundled `libonnxruntime.so`. If you see this warning, do a clean build (`./gradlew clean :app:assembleDebug`). |
 | `No connected devices!` on `installDebug` | Reconnect USB or re-pair wireless ADB. The APK from a successful `assembleDebug` is already at `app/build/outputs/apk/debug/app-debug.apk`. |
 | `Run uninterrupted` card red on Settings | Tap **Allow background execution** — Samsung kills long jobs otherwise. |
 | MP3 import OOMs | Should not happen anymore on Gemma path (streaming decode). For Whisper, switch the recording's engine to Gemma 4. |
