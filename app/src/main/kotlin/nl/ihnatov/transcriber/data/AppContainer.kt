@@ -81,7 +81,7 @@ class AppContainer(private val appContext: Context) {
     val diarizationRunner: DiarizationRunner by lazy { DiarizationRunner(appContext, uiPrefs) }
 
     val transcriptionRunner: TranscriptionRunner by lazy {
-        TranscriptionRunner(appContext, repository, asrFactory, diarizationRunner)
+        TranscriptionRunner(appContext, repository, asrFactory, diarizationRunner, uiPrefs)
     }
 
     /**

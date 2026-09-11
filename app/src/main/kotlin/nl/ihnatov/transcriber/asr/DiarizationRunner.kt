@@ -8,6 +8,7 @@ import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationConfig
 import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationSegment
 import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationModelConfig
 import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import java.io.File
 import java.io.FileOutputStream
@@ -25,7 +26,7 @@ import kotlinx.coroutines.withContext
  *
  * Two model files are required:
  *   - segmentation.onnx (pyannote 3.0) — bundled in app/src/main/assets/, ~5.7 MB.
- *   - embedding.onnx (3D-Speaker CAM++ VoxCeleb) — downloaded via Settings, ~28 MB.
+ *   - embedding.onnx (3D-Speaker CAM++ VoxCeleb, or WeSpeaker) — downloaded via Settings.
  *
  * On first use we extract the bundled segmentation model to `filesDir/diar/`
  * because sherpa-onnx's `newFromFile` API takes filesystem paths, not asset
@@ -45,23 +46,21 @@ class DiarizationRunner(
     private val uiPrefs: UiPrefs? = null,
 ) {
 
-    init {
-        // sherpa-onnx 8.5.1's bundled `com.bihe0832.android:lib-onnx`
-        // ships its own libonnxruntime.so that exports `OrtGetApiBase`
-        // exactly the way libsherpa-onnx-jni.so expects. No explicit
-        // preload needed — sherpa's class-init does the right thing on
-        // its own when we don't substitute the ORT lib. Previous
-        // commits attempted preloads (System.loadLibrary("onnxruntime")
-        // and OrtEnvironment.getEnvironment()) to compensate for the
-        // Microsoft-ORT substitution; both are removed now that we're
-        // back on the bundled lib-onnx (see build.gradle.kts).
-    }
-
-    data class SpeakerSegment(val start: Float, val end: Float, val speakerId: Int)
+    data class SpeakerSegment(
+        val start: Float,
+        val end: Float,
+        val speakerId: Int,
+        /** sherpa-onnx 1.13.8+ per-segment confidence, 0..1. 1f when unavailable. */
+        val confidence: Float = 1f,
+    )
 
     /**
      * Run diarization on a 16 kHz mono float buffer. Returns a list of
      * (start, end, speaker_id) tuples, or fails with [missingEmbedding] etc.
+     *
+     * A single `process()` call already sees the whole file, so speaker ids
+     * come out globally consistent with no stitching needed — unlike
+     * [runChunked], which has to reconcile ids across independent windows.
      *
      * @param numClusters  -1 = auto-detect via clustering threshold; >0 = force
      *                     this exact speaker count (when caller already knows).
@@ -72,6 +71,8 @@ class DiarizationRunner(
         samples: FloatArray,
         numClusters: Int = -1,
         threshold: Float = DEFAULT_CLUSTER_THRESHOLD,
+        minDurationOn: Float = DEFAULT_MIN_DURATION_ON,
+        minDurationOff: Float = DEFAULT_MIN_DURATION_OFF,
         onProgress: ((fraction: Float) -> Unit)? = null,
     ): Result<List<SpeakerSegment>> = withContext(Dispatchers.Default) {
         val embeddingFile = embeddingModelFile()
@@ -92,16 +93,16 @@ class DiarizationRunner(
                     numThreads = 2,
                 ),
                 clustering = FastClusteringConfig(numClusters = numClusters, threshold = threshold),
-                minDurationOn = 0.2f,
-                minDurationOff = 0.5f,
+                minDurationOn = minDurationOn,
+                minDurationOff = minDurationOff,
             )
             val diar = OfflineSpeakerDiarization(assetManager = null, config = config)
             // Cancellation watcher. Sherpa's blocking native `process(samples)`
             // doesn't respond to Kotlin coroutine cancellation — the call
             // sits on the JNI thread for minutes. Instead of routing
             // through `processWithCallback` (which crashes with a JNI
-            // method-lookup error on capturing Kotlin lambdas — sherpa-onnx
-            // 8.5.1's binding to `Function3.invoke(IIJ)Integer;` is broken
+            // method-lookup error on capturing Kotlin lambdas — sherpa-onnx's
+            // binding to `Function3.invoke(IIJ)Integer;` is broken
             // for synthetic lambdas that R8/D8 produces), we run a sibling
             // coroutine that calls `diar.release()` the moment the parent
             // coroutine is cancelled. The native processing then errors
@@ -140,12 +141,12 @@ class DiarizationRunner(
                     diar.process(samples)
                 runCatching { diar.release() }
                 val mapped = segs.map {
-                    SpeakerSegment(start = it.start, end = it.end, speakerId = it.speaker)
+                    SpeakerSegment(start = it.start, end = it.end, speakerId = it.speaker, confidence = it.confidence)
                 }
                 // Auto mode only: collapse over-segmentation. Forced-count
                 // mode (numClusters>0) already controls the speaker count.
-                val out = if (numClusters <= 0) consolidateSpeakers(mapped) else mapped
-                Result.success(out)
+                val consolidated = if (numClusters <= 0) consolidateSpeakers(mapped) else mapped
+                Result.success(renumberByFirstAppearance(consolidated))
             } finally {
                 progressTimer?.cancel()
                 cancelWatcher.cancel()
@@ -162,45 +163,52 @@ class DiarizationRunner(
     /**
      * Windowed diarization for files too large to decode whole. Streams the
      * audio in overlapping windows (default 5-min content + 45-sec overlap),
-     * diarizes each window independently, and stitches each window's LOCAL
-     * speaker ids into globally-consistent ids by matching who speaks in the
-     * overlap zone shared with the previous window.
+     * diarizes each window independently for memory, then reconciles
+     * identity globally: one canonical embedding per (window, local
+     * speaker) — extracted from that speaker's longest segment in the
+     * window, via a standalone [SpeakerEmbeddingExtractor] — pooled and run
+     * through ONE agglomerative clustering pass ([SpeakerClustering]) over
+     * the whole file. That's a few dozen vectors even for an hour-long
+     * recording, so the pass is fast despite the audio being long.
      *
-     * Why this exists: sherpa's `process()` needs the WHOLE audio buffer in
-     * heap at once (its API takes a FloatArray, not a stream). A 1-hour file
-     * is ~220 MB raw + codec overhead, which blows the heap budget — so the
-     * caller used to skip diarization entirely on long files. Here memory is
-     * bounded by one window (~22 MB) regardless of total length.
+     * This replaces the previous temporal-overlap-only stitching, which
+     * could only reconcile identity between ADJACENT windows and produced
+     * a duplicate id for any speaker silent through a whole overlap zone.
      *
-     * Stitching is embedding-free on purpose: it uses only the already-
-     * working `process()` JNI. Sherpa's standalone SpeakerEmbeddingExtractor
-     * would give cleaner global matching but adds two more JNI-bound classes
-     * to vendor (and the processWithCallback crash showed how fragile that
-     * binding is). Temporal-overlap stitching is robust as long as each
-     * speaker says SOMETHING in the 45-sec overlap zone; a speaker silent
-     * for a full overlap window gets a duplicate id (rare, acceptable —
-     * mergeable later by a manual rename).
+     * Loading a second, standalone embedding extractor alongside
+     * [OfflineSpeakerDiarization]'s own internal one means the embedding
+     * model sits in memory twice (once per user-facing API surface sherpa
+     * exposes — the all-in-one class doesn't expose its internal
+     * embeddings). Models here are 28-95 MB, not the multi-GB range that
+     * needed [MemoryGuard], so the doubled footprint is an acceptable
+     * trade for genuinely global identity.
      *
      * @param windowSec content seconds per window (excludes overlap).
-     * @param overlapSec lookback shared with the previous window, for
-     *                   speaker-id stitching.
+     * @param overlapSec lookback shared with the previous window. No longer
+     *   used for stitching (that's embedding-based now), but still shapes
+     *   how much of each window's start is "recap" content the segmentation
+     *   model has context for.
      */
     suspend fun runChunked(
         file: File,
         windowSec: Double = 300.0,
         overlapSec: Double = 45.0,
         /**
-         * -1 = auto-cluster per window via [threshold]; >0 = force this
-         * many speakers per window. Forcing is the deterministic fix for
-         * the over-segmentation we see on Arabic / multilingual audio
-         * (CAM++ splits one voice into many at the auto threshold). Only
-         * pass a forced count when the user actually knows it — a window
-         * containing fewer than N speakers will be over-split if forced.
+         * -1 = auto-cluster; >0 = force this many speakers GLOBALLY across
+         * the whole file (bound to the RUN sheet's "Expected speakers").
+         * Per-window local clustering always runs in auto mode — over-
+         * segmenting within a window is harmless now, since the global
+         * pass merges same-speaker clusters back together regardless of
+         * which window they came from.
          */
         numClusters: Int = -1,
         threshold: Float = DEFAULT_CLUSTER_THRESHOLD,
+        minDurationOn: Float = DEFAULT_MIN_DURATION_ON,
+        minDurationOff: Float = DEFAULT_MIN_DURATION_OFF,
         durationSec: Double = 0.0,
         onProgress: ((fraction: Float) -> Unit)? = null,
+        /** Fired at most once, if the final speaker count looks like over-segmentation. */
+        onOverSegmented: (() -> Unit)? = null,
     ): Result<List<SpeakerSegment>> = withContext(Dispatchers.Default) {
         val embeddingFile = embeddingModelFile()
             ?: return@withContext Result.failure(missingEmbeddingException())
@@ -210,6 +218,7 @@ class DiarizationRunner(
         val segFile = ensureSegmentationModelOnDisk()
         val windowSamples = (windowSec * nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR).toInt()
         val overlapSamples = (overlapSec * nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR).toInt()
+        val sampleRate = nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR
 
         try {
             val config = OfflineSpeakerDiarizationConfig(
@@ -221,58 +230,62 @@ class DiarizationRunner(
                     model = embeddingFile.absolutePath,
                     numThreads = 2,
                 ),
-                // Auto (numClusters=-1) lets the global speaker count emerge
-                // from cross-window stitching; a forced count (numClusters>0)
-                // pins N speakers per window — the deterministic fix for
-                // over-segmentation when the user knows the speaker count.
-                clustering = FastClusteringConfig(numClusters = numClusters, threshold = threshold),
-                minDurationOn = 0.2f,
-                minDurationOff = 0.5f,
+                // Always auto per-window — see the numClusters kdoc above.
+                clustering = FastClusteringConfig(numClusters = -1, threshold = threshold),
+                minDurationOn = minDurationOn,
+                minDurationOff = minDurationOff,
             )
             val diar = OfflineSpeakerDiarization(assetManager = null, config = config)
+            val extractor = SpeakerEmbeddingExtractor(
+                assetManager = null,
+                config = SpeakerEmbeddingExtractorConfig(model = embeddingFile.absolutePath, numThreads = 2),
+            )
             val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                try { awaitCancellation() } finally { runCatching { diar.release() } }
+                try {
+                    awaitCancellation()
+                } finally {
+                    runCatching { diar.release() }
+                    runCatching { extractor.release() }
+                }
             }
             try {
-                val globals = mutableListOf<SpeakerSegment>()
-                var nextGlobalId = 0
+                // One entry per (window, local speaker id) that actually
+                // produced a usable embedding.
+                data class LocalCluster(val windowIdx: Int, val localId: Int, val embedding: FloatArray)
+                val clusters = mutableListOf<LocalCluster>()
+                // Raw per-window segments, absolute file time, keyed by
+                // (windowIdx, localId) so they can be remapped once global
+                // labels are known. Local speakers with no usable embedding
+                // go straight into `unmergeable` with their own final id.
+                data class PendingSegment(val windowIdx: Int, val localId: Int, val start: Float, val end: Float, val confidence: Float)
+                val pending = mutableListOf<PendingSegment>()
                 var windowIdx = 0
+                var nextFallbackId = -1 // counts down; never collides with cluster-label ids (>=0)
+                val unmergeableIds = HashMap<Pair<Int, Int>, Int>()
+
                 nl.ihnatov.transcriber.audio.AudioDecoder.decodeChunked(
                     file,
                     chunkSamples = windowSamples,
                     overlapSamples = overlapSamples,
                 ).collect { chunk ->
                     val winStart = chunk.startSeconds
-                    val ov = chunk.overlapSeconds          // 0 for the first window
-                    val newContentStart = winStart + ov    // emit only segments at/after this
-                    val local = diar.process(chunk.samples)
-                        .map { SpeakerSegment(
-                            start = (winStart + it.start).toFloat(),
-                            end = (winStart + it.end).toFloat(),
-                            speakerId = it.speaker,
-                        ) }
-                    if (windowIdx == 0 || ov <= 0.0) {
-                        // First window: local ids become global ids directly.
-                        val remap = HashMap<Int, Int>()
-                        for (s in local) {
-                            val g = remap.getOrPut(s.speakerId) { nextGlobalId++ }
-                            globals.add(s.copy(speakerId = g))
+                    val localSegs = diar.process(chunk.samples)
+                    val byLocalId = localSegs.groupBy { it.speaker }
+                    for ((localId, segs) in byLocalId) {
+                        for (s in segs) {
+                            pending.add(PendingSegment(
+                                windowIdx = windowIdx,
+                                localId = localId,
+                                start = (winStart + s.start).toFloat(),
+                                end = (winStart + s.end).toFloat(),
+                                confidence = s.confidence,
+                            ))
                         }
-                    } else {
-                        val mapping = stitchLocalToGlobal(
-                            local = local,
-                            globals = globals,
-                            overlapStart = winStart.toFloat(),
-                            overlapEnd = newContentStart.toFloat(),
-                            allocNewId = { nextGlobalId++ },
-                        )
-                        // Emit only NEW-content segments (the overlap zone was
-                        // already emitted by the previous window).
-                        for (s in local) {
-                            if (s.start >= newContentStart.toFloat() - 0.001f) {
-                                val g = mapping[s.speakerId] ?: nextGlobalId++
-                                globals.add(s.copy(speakerId = g))
-                            }
+                        val embedding = extractCanonicalEmbedding(extractor, chunk.samples, segs, sampleRate)
+                        if (embedding != null) {
+                            clusters.add(LocalCluster(windowIdx, localId, embedding))
+                        } else {
+                            unmergeableIds[windowIdx to localId] = nextFallbackId--
                         }
                     }
                     windowIdx++
@@ -282,17 +295,49 @@ class DiarizationRunner(
                         onProgress?.invoke(0f)
                     }
                     Log.i(TAG, "  window $windowIdx @ ${"%.0f".format(winStart)}s → " +
-                        "${local.size} local segs, $nextGlobalId global speakers so far")
+                        "${byLocalId.size} local speakers (${clusters.size} embedded so far)")
                 }
                 runCatching { diar.release() }
-                val sorted = globals.sortedBy { it.start }
-                // Auto mode only: collapse over-segmentation (the windowed
-                // path is especially prone to it — every window can spawn
-                // spurious speakers that the overlap stitch can't merge).
-                val out = if (numClusters <= 0) consolidateSpeakers(sorted) else sorted
-                Log.i(TAG, "chunked diarization complete: ${globals.size} raw → " +
-                    "${out.map { it.speakerId }.distinct().size} speakers " +
-                    "(was $nextGlobalId) across $windowIdx windows")
+                runCatching { extractor.release() }
+
+                val labels = if (clusters.isNotEmpty()) {
+                    SpeakerClustering.cluster(
+                        embeddings = clusters.map { it.embedding },
+                        numClusters = numClusters,
+                        distanceThreshold = 1f - threshold,
+                    )
+                } else IntArray(0)
+                val globalIdByKey = HashMap<Pair<Int, Int>, Int>()
+                for ((i, c) in clusters.withIndex()) {
+                    globalIdByKey[c.windowIdx to c.localId] = labels[i]
+                }
+                // Fallback (unmergeable) ids come after every real cluster
+                // label so they don't collide; they were never going to be
+                // merged with anything anyway.
+                val labelCount = (labels.maxOrNull() ?: -1) + 1
+                var nextAfterClusters = labelCount
+                val fallbackRemap = HashMap<Int, Int>()
+                for (negId in unmergeableIds.values.toSortedSet(compareByDescending { it })) {
+                    fallbackRemap[negId] = nextAfterClusters++
+                }
+
+                val globals = pending.map { p ->
+                    val key = p.windowIdx to p.localId
+                    val g = globalIdByKey[key] ?: fallbackRemap[unmergeableIds[key]] ?: 0
+                    SpeakerSegment(start = p.start, end = p.end, speakerId = g, confidence = p.confidence)
+                }.sortedBy { it.start }
+
+                // Auto mode only: collapse any remaining over-segmentation
+                // (a genuinely spurious cluster the embedding pass didn't
+                // merge, e.g. a two-word aside that got its own cluster).
+                val consolidated = if (numClusters <= 0) consolidateSpeakers(globals) else globals
+                val out = renumberByFirstAppearance(consolidated)
+                val speakerCount = out.map { it.speakerId }.distinct().size
+                Log.i(TAG, "chunked diarization complete: ${globals.size} raw segs → " +
+                    "$speakerCount speakers across $windowIdx windows")
+                if (numClusters <= 0 && speakerCount > OVER_SEGMENTATION_WARNING_THRESHOLD) {
+                    onOverSegmented?.invoke()
+                }
                 Result.success(out)
             } finally {
                 cancelWatcher.cancel()
@@ -303,6 +348,43 @@ class DiarizationRunner(
         } catch (t: Throwable) {
             Log.e(TAG, "chunked diarization failed", t)
             Result.failure(t)
+        }
+    }
+
+    /**
+     * Canonical embedding for one local speaker in one window: feed the
+     * speaker's single longest segment (capped at [MAX_EMBEDDING_SECONDS])
+     * through [extractor]. A longer, cleaner slice gives a more robust
+     * vector than averaging many short ones, and matches the "longest
+     * segment as canonical vector" approach noted for this exact problem
+     * in NEXT_STEPS.md before this rewrite existed.
+     *
+     * Returns null if the extractor isn't ready on that slice (segment too
+     * short for the model's minimum window) — callers give such speakers
+     * their own un-mergeable id rather than dropping them.
+     */
+    private fun extractCanonicalEmbedding(
+        extractor: SpeakerEmbeddingExtractor,
+        windowSamples: FloatArray,
+        localSegs: List<OfflineSpeakerDiarizationSegment>,
+        sampleRate: Int,
+    ): FloatArray? {
+        val longest = localSegs.maxByOrNull { it.end - it.start } ?: return null
+        val startIdx = (longest.start * sampleRate).toInt().coerceIn(0, windowSamples.size)
+        val maxEndIdx = (startIdx + MAX_EMBEDDING_SECONDS * sampleRate).toInt().coerceAtMost(windowSamples.size)
+        val endIdx = (longest.end * sampleRate).toInt().coerceIn(startIdx, maxEndIdx)
+        if (endIdx - startIdx < sampleRate / 4) return null // under 250ms — not enough signal
+        val slice = windowSamples.copyOfRange(startIdx, endIdx)
+        val stream = extractor.createStream()
+        return try {
+            stream.acceptWaveform(slice, sampleRate)
+            stream.inputFinished()
+            if (!extractor.isReady(stream)) null else extractor.compute(stream)
+        } catch (t: Throwable) {
+            Log.w(TAG, "embedding extraction failed for a ${endIdx - startIdx} sample slice", t)
+            null
+        } finally {
+            runCatching { stream.release() }
         }
     }
 
@@ -318,8 +400,7 @@ class DiarizationRunner(
      * [MIN_SPEAKER_SECONDS] AND at least [MINOR_SPEAKER_FRACTION] of the
      * largest speaker's total. Everything else is reassigned to the
      * temporally-nearest real speaker (the real speaker whose segment is
-     * closest in time to the spurious one). Speaker ids are then
-     * renumbered 0..K-1 in first-appearance order.
+     * closest in time to the spurious one).
      *
      * No-op when there are ≤2 speakers (nothing to collapse) or no
      * speaker clears the "real" bar (degenerate — keep original rather
@@ -356,87 +437,37 @@ class DiarizationRunner(
             if (s.speakerId in realSpeakers) s
             else s.copy(speakerId = nearestRealSpeaker(s))
         }
-        // Renumber to contiguous 0..K-1 in first-appearance order.
-        val order = LinkedHashMap<Int, Int>()
-        for (s in reassigned.sortedBy { it.start }) {
-            if (s.speakerId !in order) order[s.speakerId] = order.size
-        }
-        val result = reassigned.map { it.copy(speakerId = order[it.speakerId] ?: 0) }
-        Log.i(TAG, "consolidateSpeakers: ${totalBySpeaker.size} → ${order.size} " +
+        Log.i(TAG, "consolidateSpeakers: ${totalBySpeaker.size} → ${realSpeakers.size} " +
             "(floor=${"%.1f".format(floor)}s, dropped ${totalBySpeaker.size - realSpeakers.size} minor)")
-        return result
-    }
-
-    /**
-     * Map a window's local speaker ids to global ids by temporal overlap in
-     * the shared zone [overlapStart, overlapEnd). For each local speaker we
-     * find the previously-emitted global speaker it overlaps most with in
-     * that zone and bind them; ties and double-binds are resolved greedily
-     * (highest-overlap pair first). Local speakers with no meaningful
-     * overlap-zone presence get a fresh global id from [allocNewId].
-     */
-    private fun stitchLocalToGlobal(
-        local: List<SpeakerSegment>,
-        globals: List<SpeakerSegment>,
-        overlapStart: Float,
-        overlapEnd: Float,
-        allocNewId: () -> Int,
-    ): Map<Int, Int> {
-        fun overlapDur(s1: Float, e1: Float, s2: Float, e2: Float): Float =
-            (minOf(e1, e2) - maxOf(s1, s2)).coerceAtLeast(0f)
-
-        // Per (localId, globalId) total overlapping duration inside the zone.
-        val pair = HashMap<Pair<Int, Int>, Float>()
-        val localIds = local.map { it.speakerId }.toMutableSet()
-        for (ls in local) {
-            val lsS = maxOf(ls.start, overlapStart); val lsE = minOf(ls.end, overlapEnd)
-            if (lsE <= lsS) continue
-            for (gs in globals) {
-                if (gs.end <= overlapStart || gs.start >= overlapEnd) continue
-                val d = overlapDur(lsS, lsE, gs.start, gs.end)
-                if (d > 0f) {
-                    val k = ls.speakerId to gs.speakerId
-                    pair[k] = (pair[k] ?: 0f) + d
-                }
-            }
-        }
-        // Greedy: bind highest-overlap pairs first, one global per local.
-        val result = HashMap<Int, Int>()
-        val usedGlobals = HashSet<Int>()
-        val sorted = pair.entries.sortedByDescending { it.value }
-        val MIN_OVERLAP = 0.3f
-        for (e in sorted) {
-            val (lId, gId) = e.key
-            if (e.value < MIN_OVERLAP) break
-            if (result.containsKey(lId) || gId in usedGlobals) continue
-            result[lId] = gId
-            usedGlobals.add(gId)
-            localIds.remove(lId)
-        }
-        // Any local speaker not matched in the zone is genuinely new.
-        for (lId in localIds) result[lId] = allocNewId()
-        return result
+        return reassigned
     }
 
     /**
      * Resolve the best installed embedding model. Order of preference:
      *   1. WeSpeaker ResNet221-LM (`embedding-wespeaker.onnx`, ~95 MB) —
      *      ~25–30% lower EER than CAM++, recommended for mis-attribution
-     *      cases.
+     *      cases, including non-English audio.
      *   2. 3D-Speaker CAM++ multilingual zh+en (`embedding-multilingual.onnx`,
      *      ~28 MB) — same size as the compact model, modestly better on
      *      code-switched audio.
      *   3. 3D-Speaker CAM++ VoxCeleb English (`embedding.onnx`, ~28 MB) —
      *      compact baseline.
      *
+     * The 2026-09 plan's catalog addition — WeSpeaker SimAM-ResNet34
+     * trained on VoxBlink2, the best documented result on non-English
+     * cross-lingual speech (2026 TidyVoice challenge) — turned out not to
+     * exist as a published ONNX export anywhere: sherpa-onnx's
+     * `speaker-recongition-models` release has no VoxBlink2/SimAM variant
+     * (checked directly via `gh release view`), only the WeSpeaker
+     * VoxCeleb/CN-Celeb ones already listed above. WeSpeaker publishes the
+     * PyTorch checkpoint, but exporting + wiring a new architecture
+     * through sherpa's fixed WeSpeaker loader is real native-adjacent work,
+     * not a catalog entry — out of scope here. WeSpeaker ResNet221-LM
+     * stays the recommended default per the plan's own fallback for this
+     * exact case.
+     *
      * Users can have multiple installed simultaneously; the highest-
      * preference one wins. Returning null means none are installed.
-     */
-    /**
-     * Friendly display name for the currently-active embedding model, or
-     * null if none is installed. UI shows this on the HYBRID row of the
-     * RUN options sheet so the user can see which embedding is in use
-     * (priority cascade: WeSpeaker > multilingual > compact-English).
      */
     fun embeddingModelDisplayName(): String? =
         displayNameFor(embeddingModelFile()?.name)
@@ -460,12 +491,7 @@ class DiarizationRunner(
             val f = File(modelsDir, pref)
             if (f.exists() && f.length() > 0L) return f
         }
-        val candidates = listOf(
-            "embedding-wespeaker.onnx",
-            "embedding-multilingual.onnx",
-            "embedding.onnx",
-        )
-        for (name in candidates) {
+        for (name in EMBEDDING_MODEL_CANDIDATES) {
             val f = File(modelsDir, name)
             if (f.exists() && f.length() > 0L) return f
         }
@@ -480,12 +506,7 @@ class DiarizationRunner(
      */
     fun installedEmbeddingFilenames(): List<String> {
         val modelsDir = File(context.filesDir, "models")
-        val candidates = listOf(
-            "embedding-wespeaker.onnx",
-            "embedding-multilingual.onnx",
-            "embedding.onnx",
-        )
-        return candidates.filter {
+        return EMBEDDING_MODEL_CANDIDATES.filter {
             val f = File(modelsDir, it)
             f.exists() && f.length() > 0L
         }
@@ -513,18 +534,60 @@ class DiarizationRunner(
     companion object {
         private const val TAG = "DiarizationRunner"
 
+        private val EMBEDDING_MODEL_CANDIDATES = listOf(
+            "embedding-wespeaker.onnx",
+            "embedding-multilingual.onnx",
+            "embedding.onnx",
+        )
+
         /**
          * Cosine-similarity threshold for FastClustering. Higher = merge
          * more aggressively (fewer speakers); lower = split more (more
          * speakers). sherpa's stock default is 0.5, tuned for English
          * VoxCeleb. On Arabic / Ukrainian / multilingual speech, intra-
          * speaker embedding variance exceeds inter-speaker at 0.5, so one
-         * voice fractures into many (observed: 16 speakers in a 5-min
-         * window of a 2-3 person conversation). 0.7 merges those back
-         * without collapsing genuinely distinct voices in testing. Tune
-         * here if a clean English meeting starts under-segmenting.
+         * voice fractures into many spurious speakers. 0.7 merges those
+         * back without collapsing genuinely distinct voices in testing.
+         *
+         * User-overridable in Settings; see [defaultClusterThreshold] for
+         * the language-aware default when the user hasn't set one.
          */
         const val DEFAULT_CLUSTER_THRESHOLD = 0.7f
+        const val DEFAULT_MIN_DURATION_ON = 0.2f
+        const val DEFAULT_MIN_DURATION_OFF = 0.5f
+
+        /** Global speaker count above which we surface an "over-segmented?" hint in auto mode. */
+        const val OVER_SEGMENTATION_WARNING_THRESHOLD = 6
+
+        /** Cap on how much of a speaker's longest segment we feed the embedding extractor. */
+        private const val MAX_EMBEDDING_SECONDS = 8.0
+
+        /**
+         * Language-aware default threshold: 0.5 (sherpa's stock English-
+         * tuned default) when the selected language set is English-only,
+         * 0.7 everywhere else — auto/empty, multilingual, or any other
+         * single language. Only used when the user hasn't set an explicit
+         * override in Settings.
+         */
+        fun defaultClusterThreshold(languages: List<String>): Float =
+            if (languages.map { it.lowercase() } == listOf("en")) 0.5f else DEFAULT_CLUSTER_THRESHOLD
+
+        /**
+         * Renumber speaker ids to 0..K-1 in order of first appearance —
+         * clustering-internal ids are otherwise meaningless labels that can
+         * come out in any order. Applied unconditionally at the end of both
+         * [run] and [runChunked] so downstream numbering ("SPEAKER_00",
+         * "SPEAKER_01"...) is deterministic for the same audio regardless
+         * of which path produced it.
+         */
+        fun renumberByFirstAppearance(segs: List<SpeakerSegment>): List<SpeakerSegment> {
+            if (segs.isEmpty()) return segs
+            val order = LinkedHashMap<Int, Int>()
+            for (s in segs.sortedBy { it.start }) {
+                if (s.speakerId !in order) order[s.speakerId] = order.size
+            }
+            return segs.map { it.copy(speakerId = order[it.speakerId] ?: 0) }
+        }
 
         /**
          * A speaker must talk at least this many seconds total to survive
@@ -636,3 +699,60 @@ fun coalesceBackchannels(
     }
     return result.toList()
 }
+
+/** Pure-filler words that carry no content on their own (a breath that tripped VAD). */
+private val FILLER_ONLY_WORDS = setOf("uh", "um", "mm", "mmm", "mhm", "mmhmm", "hmm", "erm", "hm")
+
+/**
+ * Drop segments whose text is nothing but filler words (and no digits —
+ * "1, 2, 3" isn't filler even if short). Ported from the Mac app's
+ * pre-coalesce cleanup in `TranscriptionRunner.swift`: these exist only
+ * because a breath or mouth click tripped VAD, and coalescing them in
+ * would otherwise stitch two real turns together with a meaningless
+ * word in between.
+ */
+fun dropPureFillerSegments(
+    assigned: List<Pair<RawSegment, Int?>>,
+): List<Pair<RawSegment, Int?>> = assigned.filterNot { (seg, _) ->
+    val hasDigits = seg.text.any { it.isDigit() }
+    if (hasDigits) return@filterNot false
+    val tokens = seg.text.lowercase().split(Regex("[^\\p{L}]+")).filter { it.isNotEmpty() }
+    tokens.isEmpty() || tokens.all { it in FILLER_ONLY_WORDS }
+}
+
+/**
+ * Merge adjacent same-speaker segments into one continuous turn — the
+ * chunk/window boundaries used during transcription are an implementation
+ * detail, not conversational structure. Ports `Transcriberr/ASR/
+ * TranscriptionRunner.swift`'s `coalesceBySpeaker` verbatim (default gap
+ * 30s — "smooth blocks"; Settings can tune it down to ~2s for "fine
+ * Samsung-style turns"). Run [dropPureFillerSegments] first, same as the
+ * Mac pipeline, so a stray "um" between two turns doesn't itself become
+ * the coalescing anchor.
+ *
+ * @param gapSec speakers separated by less than this many seconds of
+ *   silence merge into one segment.
+ */
+fun coalesceTurns(
+    assigned: List<Pair<RawSegment, Int?>>,
+    gapSec: Double = DEFAULT_TURN_COALESCE_GAP_SEC,
+): List<Pair<RawSegment, Int?>> {
+    val sorted = assigned.sortedBy { it.first.startSeconds }
+    val out = mutableListOf<Pair<RawSegment, Int?>>()
+    for ((seg, speakerId) in sorted) {
+        val last = out.lastOrNull()
+        if (last != null && last.second == speakerId && seg.startSeconds - last.first.endSeconds < gapSec) {
+            val merged = last.first.copy(
+                endSeconds = maxOf(last.first.endSeconds, seg.endSeconds),
+                text = last.first.text + " " + seg.text,
+            )
+            out[out.size - 1] = merged to speakerId
+        } else {
+            out.add(seg to speakerId)
+        }
+    }
+    return out
+}
+
+/** Default turn-coalescing gap, ported from the Mac app's `ui.turnCoalesceGapSeconds` default. */
+const val DEFAULT_TURN_COALESCE_GAP_SEC = 30.0

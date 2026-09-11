@@ -110,6 +110,7 @@ class TranscriptionRunner(
     private val repository: RecordingRepository,
     private val factory: AsrFactory,
     private val diarizer: DiarizationRunner,
+    private val uiPrefs: UiPrefs? = null,
 ) {
 
     fun run(
@@ -169,6 +170,15 @@ class TranscriptionRunner(
             ))
             return@channelFlow
         }
+
+        // Diarization tuning: Settings override wins, else the language-
+        // aware / Mac-ported default. See DiarizationRunner.DEFAULT_* and
+        // UiPrefs' diar_* / turn_coalesce_gap_sec keys.
+        val clusterThreshold = uiPrefs?.clusterThreshold?.value
+            ?: DiarizationRunner.defaultClusterThreshold(languages)
+        val minDurationOn = uiPrefs?.minDurationOnSec?.value ?: DiarizationRunner.DEFAULT_MIN_DURATION_ON
+        val minDurationOff = uiPrefs?.minDurationOffSec?.value ?: DiarizationRunner.DEFAULT_MIN_DURATION_OFF
+        val turnCoalesceGapSec = (uiPrefs?.turnCoalesceGapSec?.value ?: DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()).toDouble()
 
         val modelFile = factory.resolveModel(backend)
         if (modelFile == null) {
@@ -286,12 +296,22 @@ class TranscriptionRunner(
                             diarizer.runChunked(
                                 file = File(audioPath),
                                 numClusters = expectedSpeakers,
+                                threshold = clusterThreshold,
+                                minDurationOn = minDurationOn,
+                                minDurationOff = minDurationOff,
                                 durationSec = recording.durationSeconds,
                                 onProgress = { fraction ->
                                     val pct = (fraction * 100f).toInt().coerceIn(0, 99)
                                     trySend(AsrEvent.Stage(
                                         "Identifying speakers · $pct%",
                                         (0.10f + 0.04f * fraction).coerceAtMost(0.14f),
+                                    ))
+                                },
+                                onOverSegmented = {
+                                    trySend(AsrEvent.Stage(
+                                        "Lots of speakers detected — if you know how many, " +
+                                            "set Expected Speakers in the RUN sheet",
+                                        0.14f,
                                     ))
                                 },
                             ).getOrThrow()
@@ -325,6 +345,9 @@ class TranscriptionRunner(
                             diarizer.run(
                                 samples = full.samples,
                                 numClusters = expectedSpeakers,
+                                threshold = clusterThreshold,
+                                minDurationOn = minDurationOn,
+                                minDurationOff = minDurationOff,
                                 onProgress = { fraction ->
                                     val seconds = (fraction / 0.01f).toInt()
                                     // Bar clamped to the sherpa-reserved
@@ -361,6 +384,38 @@ class TranscriptionRunner(
                             send(AsrEvent.Stage(
                                 "Speaker clustering complete (${sherpaSegmentsFromPrepass.size} turns)",
                                 0.14f,
+                            ))
+                        }
+                    }
+                }
+            }
+
+            // Best-effort Gemma cleanup pass over the sherpa clustering:
+            // ask whether any of the clusters it found are actually the
+            // same speaker. Never blocks or fails the run — see
+            // Gemma4Backend.suggestSpeakerMergeMap's own doc comment.
+            val prepassClusters = sherpaSegmentsFromPrepass
+            val prepassGemma = gemma
+            if (prepassGemma != null && prepassClusters != null) {
+                val summaries = prepassClusters.groupBy { it.speakerId }.map { (id, segs) ->
+                    ClusterSummary(
+                        id = id,
+                        durationSeconds = segs.sumOf { (it.end - it.start).toDouble() },
+                        confidence = segs.map { it.confidence }.average().toFloat(),
+                    )
+                }
+                if (summaries.size >= 2) {
+                    val mergePairs = runCatching { prepassGemma.suggestSpeakerMergeMap(summaries) }.getOrDefault(emptyList())
+                    if (mergePairs.isNotEmpty()) {
+                        val mapping = applyMergeMap(summaries.map { it.id }.toSet(), mergePairs)
+                        val merged = prepassClusters.map { it.copy(speakerId = mapping[it.speakerId] ?: it.speakerId) }
+                        val renumbered = DiarizationRunner.renumberByFirstAppearance(merged)
+                        sherpaSegmentsFromPrepass = renumbered
+                        val mergedCount = summaries.size - renumbered.map { it.speakerId }.distinct().size
+                        if (mergedCount > 0) {
+                            send(AsrEvent.Stage(
+                                "Gemma merged $mergedCount over-split speaker cluster(s)",
+                                0.145f,
                             ))
                         }
                     }
@@ -809,20 +864,34 @@ class TranscriptionRunner(
                             } else {
                                 out.map { it to null }
                             }
+                        // Strip Gemma's inline "Speaker N:" marker from the
+                        // TEXT (independent of where the speaker id itself
+                        // came from — sherpa or the marker) before any
+                        // text-merging step below, so a turn merge never
+                        // leaves a stray marker stitched mid-sentence.
+                        val markerFreeRaw = if (useGemmaDiar) {
+                            perChunkAssignedRaw.map { (raw, spkId) ->
+                                raw.copy(text = stripGemmaSpeakerMarker(raw.text).first) to spkId
+                            }
+                        } else perChunkAssignedRaw
                         // Merge short isolated backchannels ("yeah", "mhm")
-                        // into the surrounding speaker's turn. Cheap, runs
-                        // on each incremental save so the UI shows the
-                        // cleaned-up attribution as Gemma streams chunks.
-                        val perChunkAssigned = coalesceBackchannels(perChunkAssignedRaw)
+                        // into the surrounding speaker's turn and drop pure-
+                        // filler noise. Cheap, runs on each incremental save
+                        // so the UI shows the cleaned-up attribution as
+                        // Gemma streams chunks. General turn coalescing
+                        // (same-speaker merge across a tunable gap) runs
+                        // further down, AFTER dedupChunkBoundaries — it
+                        // would otherwise merge two chunks' segments into
+                        // one BEFORE the boundary-seam dedup pass gets a
+                        // chance to see them as separate, letting a
+                        // duplicated recap phrase slip through un-trimmed.
+                        val perChunkAssigned = dropPureFillerSegments(coalesceBackchannels(markerFreeRaw))
                         val partialRows = perChunkAssigned.map { (raw, spkId) ->
-                            val cleanText = if (useGemmaDiar)
-                                stripGemmaSpeakerMarker(raw.text).first
-                            else raw.text
                             Segment(
                                 recordingId = recordingId,
                                 startSeconds = raw.startSeconds,
                                 endSeconds = raw.endSeconds,
-                                text = cleanText.trim(),
+                                text = raw.text.trim(),
                                 language = translateTo ?: primaryLanguage,
                                 speaker = spkId?.let { "SPEAKER_%02d".format(it) },
                             )
@@ -837,7 +906,11 @@ class TranscriptionRunner(
                             partialRows,
                             chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
                         )
-                        val rowsWithNames = applyInferredSpeakerNames(dedupedPartial)
+                        // De-chunk: the ~28s chunk windows are an implementation
+                        // detail — the transcript should read as speaker TURNS.
+                        // Ports the Mac app's coalesceBySpeaker (default 30s gap).
+                        val coalescedPartial = coalesceTurnSegments(dedupedPartial, turnCoalesceGapSec)
+                        val rowsWithNames = applyInferredSpeakerNames(coalescedPartial)
                         repository.replaceSegments(recordingId, rowsWithNames)
                     }
                     // The streaming onPartialText callback already emitted
@@ -947,6 +1020,9 @@ class TranscriptionRunner(
             val diarRes = diarizer.run(
                 samples = mono,
                 numClusters = expectedSpeakers,
+                threshold = clusterThreshold,
+                minDurationOn = minDurationOn,
+                minDurationOff = minDurationOff,
             )
             if (diarRes.isFailure) {
                 // Don't fail the whole run — transcription succeeded. Surface a
@@ -962,12 +1038,12 @@ class TranscriptionRunner(
         } else {
             rawSegments.map { it to null }
         }
-        // Backchannel coalescing on the FINAL assignment. The incremental
-        // chunk-loop already coalesces per-batch, but only the full-file
-        // pass has both the left AND right neighbour of every interior
-        // segment available, so this catches a few that the partial pass
-        // couldn't sandwich-detect at chunk boundaries.
-        val assigned = coalesceBackchannels(assignedRaw)
+        // Backchannel coalescing + filler-drop on the FINAL assignment. The
+        // incremental chunk-loop already runs both per-batch, but only the
+        // full-file pass has both the left AND right neighbour of every
+        // interior segment available, so this catches a few the partial
+        // pass couldn't sandwich-detect at chunk boundaries.
+        val assigned = dropPureFillerSegments(coalesceBackchannels(assignedRaw))
 
         send(AsrEvent.Stage("Saving", 0.97f))
         // Effective output language per segment. If we translated, that's
@@ -993,7 +1069,12 @@ class TranscriptionRunner(
             rows,
             chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
         )
-        val rowsWithNames = applyInferredSpeakerNames(dedupedRows)
+        // De-chunk: merge same-speaker turns across the tunable gap, same
+        // as the incremental path — this final pass also coalesces
+        // whatever the per-chunk passes couldn't (e.g. Whisper's single
+        // full-file run never went through the incremental path at all).
+        val coalescedRows = coalesceTurnSegments(dedupedRows, turnCoalesceGapSec)
+        val rowsWithNames = applyInferredSpeakerNames(coalescedRows)
         repository.replaceSegments(recordingId, rowsWithNames)
         // The Recording row keeps a boolean "was translated?" — the actual
         // target lives in Segment.language. Avoids a Room migration while
@@ -1197,16 +1278,49 @@ private fun stripGemmaSpeakerMarker(text: String): Pair<String, Int?> {
 }
 
 /**
+ * [coalesceTurns] for already-persisted-shape [Segment] rows — used here
+ * instead of the [RawSegment] version because turn coalescing has to run
+ * AFTER [dedupChunkBoundaries]: merging two chunks' segments into one
+ * BEFORE the boundary-seam dedup pass would hide the seam from it, letting
+ * a duplicated recap phrase slip through un-trimmed. Same merge rule:
+ * same speaker + gap below [gapSec] → concatenate into one row.
+ */
+internal fun coalesceTurnSegments(rows: List<Segment>, gapSec: Double): List<Segment> {
+    val sorted = rows.sortedBy { it.startSeconds }
+    val out = mutableListOf<Segment>()
+    for (seg in sorted) {
+        val last = out.lastOrNull()
+        if (last != null && last.speaker == seg.speaker && seg.startSeconds - last.endSeconds < gapSec) {
+            out[out.size - 1] = last.copy(
+                endSeconds = maxOf(last.endSeconds, seg.endSeconds),
+                text = last.text + " " + seg.text,
+            )
+        } else {
+            out.add(seg)
+        }
+    }
+    return out
+}
+
+/**
  * Scan transcript text for self-introduction phrases ("Hi, I'm Ahmed",
- * "My name is Sara", "This is Yuri speaking") and propagate the detected
- * name to every segment with the same speaker key. First match wins per
+ * "My name is Sara", "This is Yuri speaking", plus Ukrainian/Dutch/Arabic
+ * equivalents — see [findIntroducedName]) and propagate the detected name
+ * to every segment with the same speaker key. First match wins per
  * speaker — once a key gets a name, subsequent intros for that key are
  * ignored (real conversations have one canonical name per voice).
+ *
+ * Also applies the addressee rule, ported from the Mac app
+ * (`Transcriberr/ASR/DiarizationRunner.swift` `inferSpeakerNames`): in a
+ * TWO-person conversation, greeting someone by name ("Hi, Lana") implies
+ * the OTHER speaker's name — the one inference self-introductions alone
+ * can't make.
  *
  * Conservative by design: a false positive ("I'm tired") would be visible
  * in the UI and require manual cleanup, so we only match capitalized
  * names following a small set of high-precision lead-ins, and skip a
- * stoplist of common words that look like names after "I'm".
+ * stoplist of common words that look like names after "I'm". Arabic has
+ * no letter case, so its stoplist carries more of the precision burden.
  *
  * Runs on the full row set on every chunk save so a name found in chunk N
  * back-fills earlier rows for the same speaker as soon as it's discovered.
@@ -1220,6 +1334,21 @@ internal fun applyInferredSpeakerNames(rows: List<Segment>): List<Segment> {
         val cand = findIntroducedName(seg.text) ?: continue
         inferred[key] = cand
     }
+
+    val keys = rows.mapNotNull { it.speaker }.distinct()
+    if (keys.size == 2) {
+        val (a, b) = keys
+        for (seg in rows) {
+            val key = seg.speaker ?: continue
+            val other = if (key == a) b else a
+            if (other in inferred) continue
+            val m = GREETING_NAME_PATTERN.find(seg.text) ?: continue
+            val cand = m.groupValues[1].trim()
+            if (isStoplistedName(cand) || cand == inferred[key]) continue
+            inferred[other] = cand
+        }
+    }
+
     if (inferred.isEmpty()) return rows
     return rows.map { seg ->
         val key = seg.speaker
@@ -1244,6 +1373,38 @@ private val SPEAKER_NAME_STOPLIST = setOf(
     "telling", "the", "a", "an", "not", "really", "just", "still", "from",
     "in", "on", "at", "with", "about", "also", "afraid", "tired", "hungry",
     "right", "left", "up", "down", "very", "pretty", "kind", "sort",
+    // "Hi, I'm Ahmed" also matches the ADDRESSEE pattern (greeting word +
+    // capitalized token) with "I'm" misread as the greeted name — block it
+    // here rather than special-casing the addressee regex. isStoplistedName
+    // only looks at the first word, so "i'm"/"i" cover "I'm"/"I am" both.
+    "i'm", "i", "im",
+    // Dutch — same role as the English list above, for "Ik ben X" etc.
+    "moe", "hier", "daar", "klaar", "blij", "boos", "bang", "trots",
+    "verdrietig", "zeker", "best", "nu", "nog", "ook", "zo", "sorry",
+)
+
+/** Arabic has no case signal to lean on, so this list is doing more precision work per hit. */
+private val ARABIC_SPEAKER_NAME_STOPLIST = setOf(
+    "متأكد", "متأكدة", "بخير", "هنا", "جاهز", "جاهزة", "آسف", "آسفة",
+    "سعيد", "سعيدة", "متعب", "متعبة", "خايف", "خائف", "عارف", "عارفة",
+)
+
+private fun isStoplistedName(candidate: String): Boolean {
+    val firstWord = candidate.substringBefore(' ').lowercase()
+    return firstWord in SPEAKER_NAME_STOPLIST || candidate in ARABIC_SPEAKER_NAME_STOPLIST
+}
+
+/**
+ * Greeting-by-name pattern for the addressee rule: "Hi/Hello/Привіт/Hoi/
+ * مرحبا NAME". Deliberately separate from [findIntroducedName]'s
+ * self-introduction patterns — this one captures the person being
+ * addressed, not the speaker.
+ */
+private val GREETING_NAME_PATTERN = Regex(
+    "(?:привіт|вітаю|добрий день|здравствуй|привет|hi|hello|hey|hoi|hallo" +
+        "|مرحبا|أهلا|السلام عليكم|صباح الخير|مساء الخير)[,!]?\\s+" +
+        "([A-ZА-ЯІЇЄҐ][a-zа-яіїєґё'’\\-]{1,30}|[؀-ۿ]{2,30})",
+    RegexOption.IGNORE_CASE,
 )
 
 internal fun findIntroducedName(text: String): String? {
@@ -1276,13 +1437,26 @@ internal fun findIntroducedName(text: String): String? {
                 "(?=\\s*[,.]|\\s+(?:and|the|a|an|from|with|at|here|speaking|calling)\\b)",
             RegexOption.IGNORE_CASE,
         ),
+        // Ukrainian: "мене звати / мене звуть NAME" ("my name is").
+        Regex(
+            "(?:мене звати|мене звуть)\\s+([А-ЯІЇЄҐ][а-яіїєґ'’\\-]{1,30})",
+            RegexOption.IGNORE_CASE,
+        ),
+        // Dutch: "Ik ben / Mijn naam is / Dit is NAME".
+        Regex(
+            "\\b(?:ik ben|mijn naam is|dit is)\\s+([A-Z][a-z][a-z'\\-]+(?:\\s+[A-Z][a-z][a-z'\\-]+)?)",
+            RegexOption.IGNORE_CASE,
+        ),
+        // Arabic: "اسمي NAME" (my name is), "أنا NAME" (I am),
+        // "معك NAME" (phone-style "this is" — "you're with NAME"). No case
+        // signal in Arabic script, so the stoplist below does more work.
+        Regex("(?:اسمي|أنا|معك)\\s+([؀-ۿ]{2,30})"),
     )
     for (re in intros) {
         val m = re.find(text) ?: continue
         val cand = m.groupValues[1].trim()
         if (cand.length !in 2..40) continue
-        val firstWord = cand.substringBefore(' ').lowercase()
-        if (firstWord in SPEAKER_NAME_STOPLIST) continue
+        if (isStoplistedName(cand)) continue
         return cand
     }
     return null

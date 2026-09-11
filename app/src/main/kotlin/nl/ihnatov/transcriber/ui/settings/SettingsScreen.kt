@@ -143,6 +143,7 @@ fun SettingsScreen(container: AppContainer) {
             diarizationRunner = container.diarizationRunner,
             uiPrefs = vm.uiPrefs,
         )
+        DiarizationTuningCard(uiPrefs = vm.uiPrefs)
 
         // ── GEMMA 4 ───────────────────────────────────────────────────
         SectionHeader("Gemma 4")
@@ -583,6 +584,119 @@ private fun EmbeddingPickerCard(
                 }
             }
             nl.ihnatov.transcriber.ui.components.HairlineSoft()
+        }
+    }
+}
+
+/**
+ * Diarization tuning knobs added for the 2026-09 global-clustering rewrite:
+ * clustering threshold, turn-coalescing gap, segment-boundary sensitivity.
+ * All three are nullable in [UiPrefs] — "Auto" clears the override and
+ * falls back to [nl.ihnatov.transcriber.asr.DiarizationRunner]'s built-in
+ * defaults (language-aware for threshold).
+ */
+@Composable
+private fun DiarizationTuningCard(uiPrefs: nl.ihnatov.transcriber.asr.UiPrefs) {
+    val threshold by uiPrefs.clusterThreshold.collectAsStateWithLifecycle()
+    val gap by uiPrefs.turnCoalesceGapSec.collectAsStateWithLifecycle()
+    val minOn by uiPrefs.minDurationOnSec.collectAsStateWithLifecycle()
+
+    SettingsSection(
+        title = "DIARIZATION TUNING",
+        subtitle = "How aggressively speaker clustering splits or merges voices, and how chunk-sized turns get stitched back into one continuous conversation.",
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Clustering threshold",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "Higher merges more aggressively (fewer speakers); lower " +
+                    "splits more. Auto uses 0.5 for English-only, 0.7 " +
+                    "otherwise — non-English speech tends to over-split at 0.5.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                AssistChip(onClick = { uiPrefs.setClusterThreshold(null) }, label = { Text("Auto") }, enabled = threshold != null)
+                listOf(0.5f, 0.6f, 0.7f, 0.8f).forEach { t ->
+                    AssistChip(
+                        onClick = { uiPrefs.setClusterThreshold(t) },
+                        label = { Text("%.1f".format(t)) },
+                        enabled = threshold != t,
+                    )
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Speaker turns",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "Same-speaker segments closer together than this merge into " +
+                    "one turn — the chunk boundaries used during transcription " +
+                    "aren't conversational structure. 30s reads as smooth " +
+                    "blocks; 2s keeps fine, Samsung-style turns.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                listOf(2f, 10f, 30f, 60f).forEach { g ->
+                    AssistChip(
+                        onClick = { uiPrefs.setTurnCoalesceGapSec(g) },
+                        label = { Text(if (g == nl.ihnatov.transcriber.asr.DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()) "${g.toInt()}s (default)" else "${g.toInt()}s") },
+                        enabled = (gap ?: nl.ihnatov.transcriber.asr.DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()) != g,
+                    )
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Segment sensitivity",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "How short a voiced/silent stretch can be before the " +
+                    "segmentation model still calls it a real speaker turn. " +
+                    "Fine catches quick back-and-forth; Coarse ignores short interjections.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(null); uiPrefs.setMinDurationOffSec(null) },
+                    label = { Text("Default") },
+                    enabled = minOn != null,
+                )
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(0.1f); uiPrefs.setMinDurationOffSec(0.3f) },
+                    label = { Text("Fine") },
+                    enabled = minOn != 0.1f,
+                )
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(0.3f); uiPrefs.setMinDurationOffSec(0.8f) },
+                    label = { Text("Coarse") },
+                    enabled = minOn != 0.3f,
+                )
+            }
         }
     }
 }
