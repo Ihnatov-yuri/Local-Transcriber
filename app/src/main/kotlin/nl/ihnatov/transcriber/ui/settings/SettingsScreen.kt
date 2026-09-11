@@ -177,7 +177,7 @@ fun SettingsScreen(container: AppContainer) {
             title = { Text("Delete model?") },
             text = {
                 Text(
-                    "${f.name} (${f.length() / 1024 / 1024} MB) will be removed " +
+                    "${f.name} (${fileOrDirSizeBytes(f) / 1024 / 1024} MB) will be removed " +
                         "from this device. You can re-download it later from this " +
                         "screen.",
                 )
@@ -238,7 +238,13 @@ private fun DownloadRow(
             }
             // Action area on the right
             when {
-                status is SettingsViewModel.DownloadStatus.Running -> {
+                status is SettingsViewModel.DownloadStatus.Running ||
+                    status is SettingsViewModel.DownloadStatus.Extracting -> {
+                    // Cancel during Extracting is best-effort: the archive
+                    // reader only checks for cancellation between tar
+                    // entries, not mid-copy of one (there are just 2-3
+                    // entries per model), so tapping cancel here can take
+                    // a little longer to land than during Running.
                     IconButton(onClick = onCancel) {
                         Icon(Icons.Outlined.Close, contentDescription = "Cancel")
                     }
@@ -278,7 +284,8 @@ private fun DownloadRow(
         // overwrites in place via the partial→rename path in AsrFactory,
         // so the existing model selection survives.
         if (needsUpdate && entry.updateReason != null &&
-            status !is SettingsViewModel.DownloadStatus.Running
+            status !is SettingsViewModel.DownloadStatus.Running &&
+            status !is SettingsViewModel.DownloadStatus.Extracting
         ) {
             Text(
                 entry.updateReason,
@@ -299,6 +306,10 @@ private fun DownloadRow(
                 } else {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
+            }
+            SettingsViewModel.DownloadStatus.Extracting -> {
+                Text("Extracting…", style = MaterialTheme.typography.bodySmall)
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
             is SettingsViewModel.DownloadStatus.Failed -> {
                 Text(
@@ -475,10 +486,10 @@ private fun InstalledModelsCard(
             // E2B + E4B, or two Whisper sizes). With a single model per
             // backend there's nothing to choose, so no radio is shown.
             val byKind = remember(installedFiles, selectionTick) {
-                installedFiles.groupBy { factory.kindForFile(it) }
+                installedFiles.groupBy { factory.kindForFile(it) ?: factory.kindForDirectory(it) }
             }
             installedFiles.forEach { f ->
-                val kind = factory.kindForFile(f)
+                val kind = factory.kindForFile(f) ?: factory.kindForDirectory(f)
                 val groupSize = kind?.let { byKind[it]?.size } ?: 1
                 val selectable = kind != null && groupSize > 1
                 // resolveModel reflects the current pin (or biggest-first
@@ -731,7 +742,7 @@ private fun ModelRow(
             Text(file.name, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
             Text(
                 buildString {
-                    append("%d MB".format(file.length() / 1024 / 1024))
+                    append("%d MB".format(fileOrDirSizeBytes(file) / 1024 / 1024))
                     if (showRadio && active) append(" · active")
                 },
                 style = MaterialTheme.typography.bodySmall,
@@ -1550,6 +1561,10 @@ private fun GemmaComputeCard(settings: GemmaSettingsStore) {
         }
     }
 }
+
+/** [File.length] is meaningless for a directory (the sherpa-onnx engines) — sum its contents instead. */
+private fun fileOrDirSizeBytes(file: File): Long =
+    if (file.isDirectory) file.listFiles()?.sumOf { it.length() } ?: 0L else file.length()
 
 private fun formatTokens(n: Int): String = when {
     n >= 1024 && n % 1024 == 0 -> "${n / 1024}K"

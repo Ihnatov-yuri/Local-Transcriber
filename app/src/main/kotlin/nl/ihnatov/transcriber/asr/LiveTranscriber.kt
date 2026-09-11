@@ -96,6 +96,14 @@ class LiveTranscriber(
             factory.modelsDir().listFiles()
                 ?.firstOrNull { it.isFile && it.name.contains("tiny", ignoreCase = true) }
         AsrBackendKind.Gemma4 -> factory.resolveModel(AsrBackendKind.Gemma4)
+        // Live/Record-screen transcription for these three isn't wired yet:
+        // Parakeet/Omnilingual are offline (file) engines only so far, and
+        // NemotronStream needs its own OnlineRecognizer-based loop here
+        // instead of this chunk-and-prompt one — see the 2026-09 plan's
+        // Phase 2 (not done in this pass; RecordScreen doesn't offer these
+        // as live engine choices, so this branch shouldn't be reachable
+        // today, but the `when` must stay exhaustive).
+        AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual, AsrBackendKind.NemotronStream -> null
     }
 
     fun start(recorder: WavRecorder) {

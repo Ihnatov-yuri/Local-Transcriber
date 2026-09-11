@@ -70,6 +70,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import nl.ihnatov.transcriber.asr.AsrBackendKind
 import nl.ihnatov.transcriber.asr.TranscriptExporter
+import nl.ihnatov.transcriber.asr.defaultEngineFor
 import nl.ihnatov.transcriber.audio.AudioPlayerController
 import nl.ihnatov.transcriber.audio.WaveformLoader
 import nl.ihnatov.transcriber.data.AppContainer
@@ -119,7 +120,27 @@ fun RecordingDetailScreen(
     val lastLangs by container.uiPrefs.lastLanguages.collectAsStateWithLifecycle()
     var selectedLangs by remember { mutableStateOf(lastLangs) }
     var translateTo by remember { mutableStateOf<String?>(null) }
-    var backend by remember { mutableStateOf(container.defaultBackend()) }
+    // "Auto" engine policy: Parakeet by default, Omnilingual once Arabic is
+    // selected — see AsrBackend.defaultEngineFor. Tracks the language pick
+    // automatically until the user taps ENGINE to override it explicitly;
+    // after that we stop overwriting their choice.
+    var backend by remember { mutableStateOf(defaultEngineFor(lastLangs)) }
+    var backendManuallySet by remember { mutableStateOf(false) }
+    LaunchedEffect(selectedLangs) {
+        if (!backendManuallySet) backend = defaultEngineFor(selectedLangs)
+    }
+    // File-transcription engine cycle. NemotronStream isn't offered here —
+    // it's a streaming-only engine driven by LiveTranscriber on the Record
+    // screen, not something that transcribes an already-recorded file.
+    val cycleBackend = {
+        backendManuallySet = true
+        val order = listOf(
+            AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual,
+            AsrBackendKind.Gemma4, AsrBackendKind.WhisperCpp,
+        )
+        val idx = order.indexOf(backend).let { if (it < 0) 0 else it }
+        backend = order[(idx + 1) % order.size]
+    }
     var diarize by remember { mutableStateOf(false) }
     val diarReady = remember { container.diarizationRunner.isEmbeddingModelPresent() }
     val embeddingModelName = remember { container.diarizationRunner.embeddingModelDisplayName() }
@@ -280,11 +301,7 @@ fun RecordingDetailScreen(
                     hybridDiar = hybridDiar,
                     runOnCharger = runOnCharger,
                     installedModelsEmpty = installedModels.isEmpty(),
-                    onCycleBackend = {
-                        backend = if (backend == AsrBackendKind.Gemma4)
-                            AsrBackendKind.WhisperCpp
-                        else AsrBackendKind.Gemma4
-                    },
+                    onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
                         val cycle = listOf<String?>(null, "en", "ar", "uk", "nl")
@@ -474,11 +491,7 @@ fun RecordingDetailScreen(
                     },
                     runOnCharger = runOnCharger,
                     expectedSpeakers = expectedSpeakers,
-                    onCycleBackend = {
-                        backend = if (backend == AsrBackendKind.Gemma4)
-                            AsrBackendKind.WhisperCpp
-                        else AsrBackendKind.Gemma4
-                    },
+                    onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
                         val cycle = listOf<String?>(null, "en", "ar", "uk", "nl")
@@ -647,7 +660,7 @@ private fun RunStrip(
             Mono("RUN ${if (expanded) "▾" else "▸"}", color = ink)
             Spacer(Modifier.width(10.dp))
             val summary = buildString {
-                append(if (backend == AsrBackendKind.Gemma4) "GEMMA 4" else "WHISPER")
+                append(runSheetEngineLabel(backend))
                 append(" · ")
                 append(summarizeLanguages(selectedLangs).uppercase())
                 translateTo?.let { append(" → ").append(it.uppercase()) }
@@ -796,7 +809,7 @@ private fun RunOptionsSheetContent(
         Spacer(Modifier.height(6.dp))
         RunOptionLine(
             label = "ENGINE",
-            value = if (backend == AsrBackendKind.Gemma4) "GEMMA 4" else "WHISPER",
+            value = runSheetEngineLabel(backend),
             onClick = onCycleBackend,
             onHelp = { helpFor = RunOptionHelp.ENGINE },
         )
@@ -1447,6 +1460,15 @@ private fun EditorialPlayer(
 }
 
 // ─── Helpers + dialogs (carried over) ────────────────────────────────
+
+private fun runSheetEngineLabel(kind: AsrBackendKind): String = when (kind) {
+    AsrBackendKind.Gemma4 -> "GEMMA 4"
+    AsrBackendKind.WhisperCpp -> "WHISPER"
+    AsrBackendKind.Parakeet -> "PARAKEET"
+    AsrBackendKind.Omnilingual -> "OMNILINGUAL"
+    // Streaming-only — not a file-transcription choice on this screen.
+    AsrBackendKind.NemotronStream -> "NEMOTRON"
+}
 
 private fun summarizeLanguages(set: Set<String>): String {
     if (set.isEmpty()) return "Auto"

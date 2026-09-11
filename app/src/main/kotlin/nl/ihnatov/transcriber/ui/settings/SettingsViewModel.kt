@@ -26,6 +26,8 @@ class SettingsViewModel(
     sealed interface DownloadStatus {
         data object Idle : DownloadStatus
         data class Running(val bytesRead: Long, val totalBytes: Long?) : DownloadStatus
+        /** Archive models only: download finished, decompressing — no percentage available, see ModelDownloader.Progress.Extracting. */
+        data object Extracting : DownloadStatus
         data class Done(val file: File) : DownloadStatus
         data class Failed(val reason: String) : DownloadStatus
     }
@@ -49,7 +51,7 @@ class SettingsViewModel(
 
     fun download(entry: CatalogEntry) {
         val current = _state.value.downloads[entry.id]
-        if (current is DownloadStatus.Running) return   // already running
+        if (current is DownloadStatus.Running || current is DownloadStatus.Extracting) return   // already running
         downloadJobs[entry.id]?.cancel()
         downloadJobs[entry.id] = viewModelScope.launch {
             container.modelDownloader.download(entry).collect { progress ->
@@ -57,6 +59,7 @@ class SettingsViewModel(
                     ModelDownloader.Progress.Starting -> DownloadStatus.Running(0, null)
                     is ModelDownloader.Progress.Streaming ->
                         DownloadStatus.Running(progress.bytesRead, progress.totalBytes)
+                    ModelDownloader.Progress.Extracting -> DownloadStatus.Extracting
                     is ModelDownloader.Progress.Done -> DownloadStatus.Done(progress.file)
                     is ModelDownloader.Progress.Failed -> DownloadStatus.Failed(progress.reason)
                 }
@@ -121,10 +124,13 @@ class SettingsViewModel(
         runCatching {
             container.asrFactory.modelsDir().listFiles()
                 ?.toList()
-                // Skip *.partial files — those are mid-flight imports/downloads,
-                // not finished installations. Showing them would let the user
-                // try to "use" or delete a half-copied model.
-                ?.filter { it.isFile && !it.name.endsWith(".partial") }
+                // Skip *.partial (mid-download) and *.extracting (mid-archive-
+                // extract) — those are unfinished installs, not usable models.
+                // Directories are the sherpa-onnx engines (Parakeet/Omnilingual/
+                // Nemotron); flat files are everything else.
+                ?.filter {
+                    !it.name.endsWith(".partial") && !it.name.endsWith(".extracting")
+                }
                 ?.sortedBy { it.name }
                 ?: emptyList()
         }.getOrDefault(emptyList())

@@ -534,6 +534,10 @@ private fun RecordFooter(
 private fun engineLabel(kind: AsrBackendKind): String = when (kind) {
     AsrBackendKind.Gemma4 -> "Gemma 4 E2B"
     AsrBackendKind.WhisperCpp -> "Whisper tiny"
+    // Not offered as a live/Record-screen engine choice yet — see LiveTranscriber.pickModel.
+    AsrBackendKind.Parakeet -> "Parakeet"
+    AsrBackendKind.Omnilingual -> "Omnilingual"
+    AsrBackendKind.NemotronStream -> "Nemotron 3.5"
 }
 
 private fun languagesSummary(picks: Set<String>): String = when {

@@ -37,6 +37,11 @@ class AsrFactory(
     fun create(kind: AsrBackendKind): AsrBackend = when (kind) {
         AsrBackendKind.WhisperCpp -> WhisperCppBackend()
         AsrBackendKind.Gemma4 -> Gemma4Backend(context, promptStore, gemmaSettings)
+        AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual -> SherpaOfflineBackend(kind)
+        AsrBackendKind.NemotronStream -> throw UnsupportedOperationException(
+            "NemotronStream is a streaming-only engine, driven directly by LiveTranscriber — " +
+                "there's no offline AsrBackend for it."
+        )
     }
 
     fun modelsDir(): File {
@@ -45,14 +50,52 @@ class AsrFactory(
         return dir
     }
 
-    /** All installed model files matching the backend's expected extensions, biggest first. */
+    /** True for engines whose model is a directory of files (encoder/decoder/joiner + tokens, or model + tokens). */
+    fun isDirectoryBased(kind: AsrBackendKind): Boolean = kind in DIRECTORY_BASED_KINDS
+
+    /**
+     * All installed models for [kind], biggest first. Flat-file backends
+     * (Whisper, Gemma) match by extension under [modelsDir] directly;
+     * directory-based backends (Parakeet, Omnilingual, Nemotron) match
+     * catalog entries of that [kind] whose extracted directory exists and
+     * looks complete — these are catalog/downloader-only for now, no SAF
+     * import (importing a whole multi-file directory through a
+     * single-file picker doesn't map cleanly, unlike one Whisper .bin).
+     */
     fun listModels(kind: AsrBackendKind): List<File> {
+        if (isDirectoryBased(kind)) {
+            return ModelCatalog.entries
+                .filter { it.kind == kind && it.role == ModelRole.Asr }
+                .map { File(modelsDir(), it.filename) }
+                .filter { it.isDirectory && isCompleteModelDir(it, kind) }
+                .sortedByDescending { dirSizeBytes(it) }
+        }
         val exts = extensionsFor(kind)
         return modelsDir()
             .listFiles()
             ?.filter { it.isFile && it.extension.lowercase() in exts }
             ?.sortedByDescending { it.length() }
             ?: emptyList()
+    }
+
+    /** Sum of file sizes under a directory (one level — these model dirs are always flat). */
+    private fun dirSizeBytes(dir: File): Long = dir.listFiles()?.sumOf { it.length() } ?: 0L
+
+    private fun isCompleteModelDir(dir: File, kind: AsrBackendKind): Boolean {
+        val files = dir.listFiles() ?: return false
+        val hasTokens = files.any { it.name == "tokens.txt" }
+        if (!hasTokens) return false
+        return when (kind) {
+            // Both transducers: Parakeet (offline) and Nemotron 3.5 (online
+            // streaming) — the sherpa-onnx package ships the same
+            // encoder/decoder/joiner shape for either.
+            AsrBackendKind.Parakeet, AsrBackendKind.NemotronStream -> listOf("encoder", "decoder", "joiner").all { prefix ->
+                files.any { it.isFile && it.name.startsWith(prefix) && it.extension == "onnx" }
+            }
+            AsrBackendKind.Omnilingual ->
+                files.any { it.isFile && it.name.startsWith("model") && it.extension == "onnx" }
+            else -> false
+        }
     }
 
     /**
@@ -137,7 +180,10 @@ class AsrFactory(
     }
 
     fun deleteModel(file: File): Boolean {
-        val deleted = file.delete()
+        // Directory-based sherpa models (Parakeet/Omnilingual/Nemotron):
+        // File.delete() only removes EMPTY directories, so a populated
+        // model directory would silently fail to delete without this.
+        val deleted = if (file.isDirectory) file.deleteRecursively() else file.delete()
         // If the user deleted their selected model, clear the pin so resolve()
         // falls back cleanly. `entries` is the Kotlin 2.x replacement for the
         // deprecated `.values()` array.
@@ -150,24 +196,41 @@ class AsrFactory(
     fun expectedExtensionsHint(kind: AsrBackendKind): String = when (kind) {
         AsrBackendKind.WhisperCpp -> ".bin (ggml-tiny.bin, ggml-small.bin, ggml-large-v3-turbo-q5_0.bin)"
         AsrBackendKind.Gemma4 -> ".litertlm or .task (gemma-4-E2B-it.litertlm)"
+        AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual, AsrBackendKind.NemotronStream ->
+            "a downloaded model folder (Settings → Download) — not something you import manually"
     }
 
     private fun extensionsFor(kind: AsrBackendKind): Set<String> = when (kind) {
         AsrBackendKind.WhisperCpp -> setOf("bin", "ggml")
         AsrBackendKind.Gemma4 -> setOf("litertlm", "task")
+        AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual, AsrBackendKind.NemotronStream -> emptySet()
     }
 
     /**
      * Which backend a model file belongs to, inferred from its extension.
-     * Returns null for files that match no known backend. Used by the
-     * Settings "Installed" UI to group models and offer an active-model
-     * picker per backend (so a user with both Gemma E2B and E4B — or two
-     * Whisper sizes — can choose which one transcription uses).
+     * Returns null for files that match no known backend (including
+     * directory-based models — those are identified by [kindForDirectory]
+     * instead, since a directory has no extension to switch on). Used by
+     * the Settings "Installed" UI to group models and offer an active-
+     * model picker per backend (so a user with both Gemma E2B and E4B —
+     * or two Whisper sizes — can choose which one transcription uses).
      */
     fun kindForFile(file: File): AsrBackendKind? {
         val ext = file.extension.lowercase()
-        return AsrBackendKind.entries.firstOrNull { ext in extensionsFor(it) }
+        return AsrBackendKind.entries.firstOrNull { ext.isNotEmpty() && ext in extensionsFor(it) }
     }
 
+    /** Which directory-based backend [dir] belongs to, by matching it against a catalog entry, or null. */
+    fun kindForDirectory(dir: File): AsrBackendKind? =
+        ModelCatalog.entries.firstOrNull { it.role == ModelRole.Asr && File(modelsDir(), it.filename) == dir }?.kind
+
     private fun selectionKey(kind: AsrBackendKind): String = "selected_model_${kind.name}"
+
+    companion object {
+        private val DIRECTORY_BASED_KINDS = setOf(
+            AsrBackendKind.Parakeet,
+            AsrBackendKind.Omnilingual,
+            AsrBackendKind.NemotronStream,
+        )
+    }
 }
