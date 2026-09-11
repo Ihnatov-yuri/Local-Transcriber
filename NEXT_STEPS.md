@@ -1,5 +1,7 @@
 # What's next
 
+> **September 2026:** the current roadmap is [docs/PLAN-2026-09.md](docs/PLAN-2026-09.md). Item A below (chunked diarization) shipped in `e98ce6d`; the rest is folded into that plan.
+
 Live planning doc — features that didn't fit the current sprint, sorted by ROI.
 Everything above the line in [README.md](README.md) is shipped.
 
