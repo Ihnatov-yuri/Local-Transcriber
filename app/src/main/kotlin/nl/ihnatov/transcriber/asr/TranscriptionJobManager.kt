@@ -52,6 +52,16 @@ class TranscriptionJobManager(
         val waitingForCharger: Boolean = false,
         /** Task is queued behind another job (not charger-parked). */
         val queued: Boolean = false,
+        /**
+         * Stop was requested but the coroutine hasn't unwound yet.
+         * Coroutine cancellation is cooperative and only checked at
+         * suspension points — a chunk already in flight (especially a
+         * single-shot whisper.cpp call, which has none) keeps running
+         * until it returns. This distinguishes "asked to stop, still
+         * finishing the in-flight step" from a plain running job so the
+         * UI can say so instead of looking unresponsive.
+         */
+        val stopping: Boolean = false,
         val stageLabel: String = "",
         val progress: Float = 0f,
         val error: String? = null,
@@ -232,7 +242,13 @@ class TranscriptionJobManager(
             } catch (t: CancellationException) {
                 // User pressed Stop. Don't paint an error — paint "Cancelled".
                 updateStatus(recordingId) {
-                    it.copy(running = false, stageLabel = "Cancelled", progress = 0f, error = null)
+                    it.copy(
+                        running = false,
+                        stopping = false,
+                        stageLabel = "Cancelled",
+                        progress = 0f,
+                        error = null,
+                    )
                 }
                 throw t
             } catch (t: Throwable) {
@@ -303,6 +319,13 @@ class TranscriptionJobManager(
      */
     fun cancel(recordingId: Long) {
         if (runningId == recordingId) {
+            // Paint "Stopping…" immediately — cancellation is cooperative
+            // and the in-flight step (a whisper.cpp chunk call has no
+            // suspension points at all) may take a while to actually
+            // unwind. Without this the UI keeps showing the last
+            // stageLabel/progress, unchanged, and looks stuck rather than
+            // working on it.
+            updateStatus(recordingId) { it.copy(stopping = true) }
             currentJob?.cancel()
             // Job's finally block clears running + status + drains next.
             return

@@ -127,6 +127,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.commons.compress)
+    implementation(libs.commonmark)
+    implementation(libs.commonmark.ext.gfm.tables)
 
     // Gemma 4 audio backend (LiteRT-LM Engine + Conversation with AudioBytes)
     implementation(libs.litertlm.android)

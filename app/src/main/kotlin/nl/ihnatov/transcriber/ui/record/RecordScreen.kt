@@ -330,6 +330,7 @@ private fun LastHeardBlock(
             RecordViewModel.LiveStatus.Idle -> "LAST HEARD"
             RecordViewModel.LiveStatus.Loading -> "LAST HEARD · LOADING MODEL"
             RecordViewModel.LiveStatus.Running -> "LAST HEARD · LIVE"
+            RecordViewModel.LiveStatus.Stopping -> "LAST HEARD · STOPPING…"
             RecordViewModel.LiveStatus.ModelMissing -> "LIVE NEEDS GGML-TINY.BIN"
             is RecordViewModel.LiveStatus.Failed -> "LIVE FAILED: ${liveStatus.reason}".take(64)
         }

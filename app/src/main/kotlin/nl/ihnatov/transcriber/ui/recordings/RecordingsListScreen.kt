@@ -41,6 +41,7 @@ import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.launch
+import nl.ihnatov.transcriber.asr.TranscriptionJobManager
 import nl.ihnatov.transcriber.data.AppContainer
 import nl.ihnatov.transcriber.data.Recording
 import nl.ihnatov.transcriber.ui.components.BigNumber
@@ -95,6 +96,7 @@ fun RecordingsListScreen(
         }
     }.collectAsStateWithLifecycle(initialValue = emptyList())
     androidx.compose.runtime.LaunchedEffect(query) { source.value = query }
+    val jobStatuses by container.transcriptionJobManager.statuses.collectAsStateWithLifecycle()
 
     val scope = rememberCoroutineScope()
     val importLauncher = rememberLauncherForActivityResult(
@@ -161,7 +163,11 @@ fun RecordingsListScreen(
                     LazyColumn(Modifier.fillMaxSize()) {
                         items(recordings, key = { it.id }) { rec ->
                             HairlineSoft()
-                            RecordingRow(rec, onClick = { onOpen(rec.id) })
+                            RecordingRow(
+                                rec,
+                                job = jobStatuses[rec.id],
+                                onClick = { onOpen(rec.id) },
+                            )
                         }
                     }
                 }
@@ -334,7 +340,7 @@ private fun EmptyState(query: String) {
 }
 
 @Composable
-private fun RecordingRow(rec: Recording, onClick: () -> Unit) {
+private fun RecordingRow(rec: Recording, job: TranscriptionJobManager.JobStatus?, onClick: () -> Unit) {
     val ink = MaterialTheme.colorScheme.onBackground
     val isToday = isToday(rec.createdAtMillis)
     Row(
@@ -409,6 +415,26 @@ private fun RecordingRow(rec: Recording, onClick: () -> Unit) {
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
+            }
+            // Job-state line — only while there's open work for this
+            // recording (queued, charger-parked, or actively running).
+            // Reuses TranscriptionJobManager.statuses, the same per-
+            // recording status map the Detail screen's RUN strip already
+            // reads, so a job started from one screen shows up correctly
+            // on both without a second source of truth.
+            if (job != null && job.active) {
+                Spacer(Modifier.height(3.dp))
+                Mono(
+                    when {
+                        job.stopping -> "STOPPING…"
+                        job.waitingForCharger -> "WAITING FOR CHARGER"
+                        job.queued -> "QUEUED"
+                        job.stageLabel.isNotBlank() -> job.stageLabel.uppercase()
+                        else -> "TRANSCRIBING"
+                    },
+                    color = Accent,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
         Spacer(Modifier.width(Spacing.m))

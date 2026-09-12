@@ -31,11 +31,7 @@ class RecordingRepository(
     fun search(query: String): Flow<List<Recording>> {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return observeAll()
-        val escaped = trimmed
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        return recordings.search("%$escaped%")
+        return recordings.search("%${escapeLikePattern(trimmed)}%")
     }
 
     fun observe(id: Long): Flow<Recording?> = recordings.observe(id)
@@ -264,3 +260,17 @@ class RecordingRepository(
         return dir
     }
 }
+
+/**
+ * Escape SQL LIKE's two wildcards (`%`, `_`) and our own escape character
+ * (`\`) inside a raw search term, so a literal search for e.g. "100%"
+ * matches only that substring instead of "everything" (`%` unescaped is
+ * LIKE's own any-sequence wildcard). Callers wrap the result in their own
+ * leading/trailing `%` for a substring match; the query itself must use
+ * `ESCAPE '\'` for this to take effect (see [RecordingDao.search]).
+ */
+internal fun escapeLikePattern(raw: String): String =
+    raw
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")

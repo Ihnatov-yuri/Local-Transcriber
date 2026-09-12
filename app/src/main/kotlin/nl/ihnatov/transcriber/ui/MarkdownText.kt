@@ -1,13 +1,23 @@
 package nl.ihnatov.transcriber.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -15,182 +25,225 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.commonmark.ext.gfm.tables.TableBlock
+import org.commonmark.ext.gfm.tables.TableBody
+import org.commonmark.ext.gfm.tables.TableHead
+import org.commonmark.ext.gfm.tables.TablesExtension
+import org.commonmark.node.BlockQuote
+import org.commonmark.node.BulletList
+import org.commonmark.node.Code
+import org.commonmark.node.Emphasis
+import org.commonmark.node.FencedCodeBlock
+import org.commonmark.node.HardLineBreak
+import org.commonmark.node.Heading
+import org.commonmark.node.IndentedCodeBlock
+import org.commonmark.node.Link
+import org.commonmark.node.ListItem
+import org.commonmark.node.Node
+import org.commonmark.node.OrderedList
+import org.commonmark.node.Paragraph
+import org.commonmark.node.SoftLineBreak
+import org.commonmark.node.StrongEmphasis
+import org.commonmark.node.ThematicBreak
+import org.commonmark.parser.Parser
+import org.commonmark.node.Text as MdText
 
 /**
- * Minimal markdown renderer for Gemma post-processing outputs. Handles:
- *
- *   - `#`, `##`, `###` headings (3 levels)
- *   - Bullet lists (lines beginning with `-` or `*`)
- *   - Numbered lists (lines beginning with `<digits>. `)
- *   - Inline `**bold**`, `*italic*`, and `` `code` ``
- *   - Plain paragraphs separated by blank lines
- *
- * Deliberately not a full CommonMark implementation — adding a third-party
- * markdown library would balloon the APK for a feature only used in three
- * preset outputs. Edge cases the model rarely emits (tables, blockquotes,
- * fenced code blocks, links) get printed as plain text which is fine
- * given the prompts ask for prose + bullets only.
- *
- * Why I rolled this rather than pulling in commonmark-android or
- * compose-richtext: ~2 MB APK saved, no transitive dep churn, and the
- * preset prompts constrain Gemma's output to a tiny subset of markdown
- * anyway. Swap in a real renderer if/when we surface user-written markdown.
+ * CommonMark renderer for Gemma post-processing outputs (Phase 5 of the
+ * 2026-09 plan — replaces a hand-rolled subset parser that had no path for
+ * tables, fenced code, or blockquotes; Minutes/Summary outputs hit all
+ * three often enough that the gap was worth closing). Parses with
+ * commonmark-java plus the GFM tables extension, then walks the resulting
+ * AST straight into Compose — no intermediate custom block model, since
+ * commonmark's own `Node` hierarchy already is one.
  */
+
+private val markdownParser: Parser =
+    Parser.builder().extensions(listOf(TablesExtension.create())).build()
+
 @Composable
 fun MarkdownText(
     markdown: String,
     modifier: Modifier = Modifier,
 ) {
-    val blocks = parseBlocks(markdown)
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+    val document = remember(markdown) { markdownParser.parse(markdown) }
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        RenderChildren(document)
+    }
+}
+
+@Composable
+private fun RenderChildren(parent: Node) {
+    var child = parent.firstChild
+    while (child != null) {
+        RenderBlock(child)
+        child = child.next
+    }
+}
+
+@Composable
+private fun RenderBlock(node: Node) {
+    when (node) {
+        is Heading -> Text(
+            text = renderInlines(node),
+            fontSize = when (node.level) { 1 -> 22.sp; 2 -> 19.sp; 3 -> 17.sp; else -> 15.sp },
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        is Paragraph -> Text(
+            text = renderInlines(node),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        is BulletList -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            var item = node.firstChild
+            while (item != null) {
+                if (item is ListItem) {
+                    Row(modifier = Modifier.padding(start = 4.dp)) {
+                        Text("•  ", style = MaterialTheme.typography.bodyMedium)
+                        Column { RenderChildren(item) }
+                    }
+                }
+                item = item.next
+            }
+        }
+        is OrderedList -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            var idx = node.markerStartNumber ?: 1
+            var item = node.firstChild
+            while (item != null) {
+                if (item is ListItem) {
+                    Row(modifier = Modifier.padding(start = 4.dp)) {
+                        Text("$idx.  ", style = MaterialTheme.typography.bodyMedium)
+                        Column { RenderChildren(item) }
+                    }
+                    idx++
+                }
+                item = item.next
+            }
+        }
+        is BlockQuote -> Row(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                Modifier
+                    .fillMaxHeight()
+                    .width(3.dp)
+                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)),
+            ) {}
+            Column(
+                modifier = Modifier.padding(start = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                RenderChildren(node)
+            }
+        }
+        is FencedCodeBlock -> MarkdownCodeBlock(node.literal)
+        is IndentedCodeBlock -> MarkdownCodeBlock(node.literal)
+        is ThematicBreak -> Box(
+            Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)),
+        )
+        is TableBlock -> MarkdownTable(node)
+        // Unknown/unhandled block (e.g. an HTML block the model emitted) —
+        // recurse into its children rather than silently dropping content.
+        else -> RenderChildren(node)
+    }
+}
+
+@Composable
+private fun MarkdownCodeBlock(code: String) {
+    val scroll = rememberScrollState()
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+            .padding(8.dp),
     ) {
-        for (block in blocks) {
-            when (block) {
-                is MdBlock.Heading -> Text(
-                    text = renderInlines(block.text),
-                    fontSize = when (block.level) { 1 -> 22.sp; 2 -> 19.sp; else -> 17.sp },
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                is MdBlock.Paragraph -> Text(
-                    text = renderInlines(block.text),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                is MdBlock.BulletList -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    for (item in block.items) {
-                        Row(modifier = Modifier.padding(start = 4.dp)) {
-                            Text("•  ", style = MaterialTheme.typography.bodyMedium)
-                            Text(
-                                renderInlines(item),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                }
-                is MdBlock.NumberedList -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    for ((idx, item) in block.items.withIndex()) {
-                        Row(modifier = Modifier.padding(start = 4.dp)) {
-                            Text("${idx + 1}.  ", style = MaterialTheme.typography.bodyMedium)
-                            Text(
-                                renderInlines(item),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                }
-            }
-        }
+        Text(
+            text = code.trimEnd('\n'),
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            modifier = Modifier.horizontalScroll(scroll),
+        )
     }
-}
-
-private sealed interface MdBlock {
-    data class Heading(val level: Int, val text: String) : MdBlock
-    data class Paragraph(val text: String) : MdBlock
-    data class BulletList(val items: List<String>) : MdBlock
-    data class NumberedList(val items: List<String>) : MdBlock
-}
-
-/** Line-by-line block parser. Hand-rolled because the input is small. */
-private fun parseBlocks(markdown: String): List<MdBlock> {
-    val lines = markdown.lines()
-    val out = mutableListOf<MdBlock>()
-    val paragraph = StringBuilder()
-    var bullets: MutableList<String>? = null
-    var numbers: MutableList<String>? = null
-
-    fun flushParagraph() {
-        val text = paragraph.toString().trim()
-        if (text.isNotEmpty()) out += MdBlock.Paragraph(text)
-        paragraph.clear()
-    }
-    fun flushBullets() {
-        bullets?.takeIf { it.isNotEmpty() }?.let { out += MdBlock.BulletList(it.toList()) }
-        bullets = null
-    }
-    fun flushNumbers() {
-        numbers?.takeIf { it.isNotEmpty() }?.let { out += MdBlock.NumberedList(it.toList()) }
-        numbers = null
-    }
-    fun flushAll() { flushParagraph(); flushBullets(); flushNumbers() }
-
-    val numberedRe = Regex("^\\s*(\\d+)\\.\\s+(.+)$")
-
-    for (raw in lines) {
-        val line = raw.trimEnd()
-        when {
-            line.isEmpty() -> flushAll()
-            line.startsWith("### ") -> { flushAll(); out += MdBlock.Heading(3, line.removePrefix("### ").trim()) }
-            line.startsWith("## ")  -> { flushAll(); out += MdBlock.Heading(2, line.removePrefix("## ").trim()) }
-            line.startsWith("# ")   -> { flushAll(); out += MdBlock.Heading(1, line.removePrefix("# ").trim()) }
-            line.trimStart().startsWith("- ") || line.trimStart().startsWith("* ") -> {
-                flushParagraph(); flushNumbers()
-                val item = line.trimStart().removePrefix("- ").removePrefix("* ")
-                (bullets ?: mutableListOf<String>().also { bullets = it }) += item
-            }
-            numberedRe.containsMatchIn(line) -> {
-                flushParagraph(); flushBullets()
-                val match = numberedRe.find(line)!!
-                (numbers ?: mutableListOf<String>().also { numbers = it }) += match.groupValues[2]
-            }
-            else -> {
-                flushBullets(); flushNumbers()
-                if (paragraph.isNotEmpty()) paragraph.append(' ')
-                paragraph.append(line.trim())
-            }
-        }
-    }
-    flushAll()
-    return out
 }
 
 /**
- * Parse inline markup into an AnnotatedString. Tokenizer state machine handles
- * `**bold**`, `*italic*`, and `` `code` `` without trying to be clever about
- * nesting (which Gemma doesn't emit in our prompts).
+ * Simple even-width grid — Compose has no table primitive, and matching
+ * column widths to content would need a two-pass measurement that's not
+ * worth it for model-generated tables (a handful of short cells, not a
+ * data grid).
  */
-private fun renderInlines(text: String): AnnotatedString = buildAnnotatedString {
-    var i = 0
-    val n = text.length
-    while (i < n) {
-        val c = text[i]
-        when {
-            c == '*' && i + 1 < n && text[i + 1] == '*' -> {
-                val end = text.indexOf("**", startIndex = i + 2)
-                if (end == -1) { append(c); i++ }
-                else {
-                    withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) {
-                        append(text, i + 2, end)
+@Composable
+private fun MarkdownTable(table: TableBlock) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        var section = table.firstChild
+        while (section != null) {
+            val isHeader = section is TableHead
+            if (section is TableHead || section is TableBody) {
+                var row = section.firstChild
+                while (row != null) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        var cell = row.firstChild
+                        while (cell != null) {
+                            Text(
+                                text = renderInlines(cell),
+                                style = if (isHeader) {
+                                    MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                                } else {
+                                    MaterialTheme.typography.bodyMedium
+                                },
+                                modifier = Modifier.weight(1f).padding(4.dp),
+                            )
+                            cell = cell.next
+                        }
                     }
-                    i = end + 2
+                    if (isHeader) HorizontalDivider()
+                    row = row.next
                 }
             }
-            c == '*' -> {
-                val end = text.indexOf('*', startIndex = i + 1)
-                if (end == -1) { append(c); i++ }
-                else {
-                    withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                        append(text, i + 1, end)
-                    }
-                    i = end + 1
-                }
-            }
-            c == '`' -> {
-                val end = text.indexOf('`', startIndex = i + 1)
-                if (end == -1) { append(c); i++ }
-                else {
-                    withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
-                        append(text, i + 1, end)
-                    }
-                    i = end + 1
-                }
-            }
-            else -> { append(c); i++ }
+            section = section.next
         }
+    }
+}
+
+/**
+ * Walk [parent]'s inline children into an AnnotatedString — `**bold**`,
+ * `*italic*`, `` `code` ``, links (underlined; not clickable — these are
+ * generated-text outputs, not a browsing surface), and line breaks.
+ */
+private fun renderInlines(parent: Node): AnnotatedString = buildAnnotatedString {
+    appendInlineChildren(parent)
+}
+
+private fun AnnotatedString.Builder.appendInlineChildren(parent: Node) {
+    var child = parent.firstChild
+    while (child != null) {
+        appendInlineNode(child)
+        child = child.next
+    }
+}
+
+private fun AnnotatedString.Builder.appendInlineNode(node: Node) {
+    when (node) {
+        is MdText -> append(node.literal)
+        is StrongEmphasis -> withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) {
+            appendInlineChildren(node)
+        }
+        is Emphasis -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+            appendInlineChildren(node)
+        }
+        is Code -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+            append(node.literal)
+        }
+        is Link -> withStyle(SpanStyle(textDecoration = TextDecoration.Underline)) {
+            appendInlineChildren(node)
+        }
+        is SoftLineBreak -> append(' ')
+        is HardLineBreak -> append('\n')
+        else -> appendInlineChildren(node)
     }
 }
 

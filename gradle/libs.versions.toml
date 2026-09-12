@@ -19,6 +19,7 @@ litertlm = "0.17.0"
 serializationJson = "1.11.0"
 documentfile = "1.0.1"
 commonsCompress = "1.28.0"
+commonmark = "0.30.0"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
 espresso = "3.6.1"
@@ -60,6 +61,13 @@ kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serializa
 # the JDK's java.util.zip has no bzip2 codec. Pure Java, no native code, no
 # transitive deps needed for just the tar + bzip2 readers we use.
 commons-compress = { module = "org.apache.commons:commons-compress", version.ref = "commonsCompress" }
+
+# Real CommonMark parsing (tables via the GFM extension, fenced code,
+# blockquotes) for post-processing outputs — replaces the hand-rolled
+# MarkdownText parser (Phase 5 of the 2026-09 plan). Pure Java, no
+# transitive deps beyond each other.
+commonmark = { module = "org.commonmark:commonmark", version.ref = "commonmark" }
+commonmark-ext-gfm-tables = { module = "org.commonmark:commonmark-ext-gfm-tables", version.ref = "commonmark" }
 
 # LiteRT-LM Android — Google's runtime for Gemma 4 .litertlm audio models.
 # Lives on Google Maven (already in settings.gradle.kts via google()), not Central.

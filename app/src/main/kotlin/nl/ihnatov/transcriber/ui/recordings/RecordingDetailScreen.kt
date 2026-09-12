@@ -453,7 +453,12 @@ fun RecordingDetailScreen(
                         onShare = {
                             val rec = ui.recording ?: return@OutputBody
                             val intent = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
+                                // Real markdown content (see MarkdownText.kt) —
+                                // apps that understand the type (Obsidian,
+                                // most note apps, Gmail's compose) get to
+                                // treat it as such instead of literal
+                                // asterisks and pound signs.
+                                type = "text/markdown"
                                 putExtra(Intent.EXTRA_SUBJECT, "${rec.title} — ${tab.doc.title}")
                                 putExtra(Intent.EXTRA_TEXT, tab.doc.markdown)
                             }
@@ -781,17 +786,22 @@ private fun RunStrip(
         }
         val active = job.running || job.waitingForCharger || job.queued
         if (active) {
-            // Inverse "Stop" / status row.
+            // Inverse "Stop" / status row. Not clickable while already
+            // stopping — cancellation is cooperative (see JobStatus.
+            // stopping's doc comment) so a second tap can't speed
+            // anything up, and leaving the tap affordance up would read
+            // as "my first tap didn't register."
             Column(
                 Modifier
                     .fillMaxWidth()
                     .background(ink)
-                    .clickable(onClick = onCancel)
+                    .let { if (job.stopping) it else it.clickable(onClick = onCancel) }
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Mono(
                     when {
+                        job.stopping -> "STOPPING…"
                         job.waitingForCharger -> "WAITING FOR CHARGER — TAP TO CANCEL"
                         job.queued -> "QUEUED — TAP TO CANCEL"
                         else -> "TRANSCRIBING — TAP TO STOP"
@@ -1514,7 +1524,16 @@ private fun OutputBody(
                 modifier = Modifier.clickable(onClick = onDelete).padding(6.dp),
             )
         }
-        MarkdownText(markdown = doc.markdown, modifier = Modifier.fillMaxWidth())
+        // Was missing a scroll modifier entirely — any output longer than
+        // one screen (a real Minutes/Summary easily is) had no way to see
+        // the rest. Caught live-testing the commonmark rewrite; unrelated
+        // to it but a real, user-visible gap worth closing here rather
+        // than filing away.
+        val outputScroll = rememberScrollState()
+        MarkdownText(
+            markdown = doc.markdown,
+            modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(outputScroll),
+        )
     }
 }
 

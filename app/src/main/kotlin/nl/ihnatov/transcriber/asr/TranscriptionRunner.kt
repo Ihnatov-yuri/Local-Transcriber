@@ -105,6 +105,18 @@ private const val CHUNK_ALIGN_MIN_SILENCE_MS = 250
 /** RMS threshold below which we consider a 25 ms window silent (~ -46 dBFS). */
 private const val CHUNK_ALIGN_RMS_THRESHOLD = 0.005f
 
+/**
+ * Target chunk length for Whisper's VAD-aligned long-file chunking (Phase
+ * 5's OOM fix). Bigger than Gemma's [Gemma4Backend.CHUNK_SECONDS] on
+ * purpose — whisper.cpp has none of Gemma's prompt-length/wedge pressure,
+ * so fewer, larger chunks mean less per-call overhead while still bounding
+ * peak memory far below a multi-hour file's full-buffer size.
+ */
+private const val WHISPER_CHUNK_TARGET_SECONDS = 60.0
+
+/** Below this, a single full-buffer decode+transcribe (today's shape) has no real OOM risk — not worth the chunking overhead. */
+private const val WHISPER_CHUNK_THRESHOLD_SECONDS = 90.0
+
 class TranscriptionRunner(
     private val context: Context,
     private val repository: RecordingRepository,
@@ -990,15 +1002,7 @@ class TranscriptionRunner(
             // Gemma did the diarization inline; we don't run sherpa-onnx.
             mono = FloatArray(0)
         } else {
-            // Whisper path — full-buffer decode (whisper.cpp wants the whole clip).
-            val decoded = runCatching { AudioDecoder.decode(File(audioPath)) }
-                .getOrElse {
-                    send(AsrEvent.Failed("Failed to decode $audioPath: ${it.message}"))
-                    asr.release()
-                    return@channelFlow
-                }
-            mono = decoded.samples
-            send(AsrEvent.Stage("Transcribing", 0.2f))
+            // Whisper path.
             // Whisper.cpp's JNI API takes a single language. For constrained
             // auto with Whisper we'd need to add detect+filter logic — for now
             // multi-select degrades to full auto (null) when more than one is
@@ -1009,19 +1013,134 @@ class TranscriptionRunner(
             // English when they asked for Arabic. The UI will warn about this
             // mismatch up front.
             val whisperTranslate = translateTo == "en"
-            val tx = asr.transcribe(
-                samples = mono,
-                sampleRate = decoded.sampleRate,
-                language = primaryLanguage,
-                translate = whisperTranslate,
-                progress = null,
-            )
-            if (tx.isFailure) {
-                asr.release()
-                send(AsrEvent.Failed(tx.exceptionOrNull()?.message ?: "transcription failed"))
-                return@channelFlow
+            val audioFile = File(audioPath)
+            if (recording.durationSeconds <= WHISPER_CHUNK_THRESHOLD_SECONDS) {
+                // Short file — single-shot full-buffer decode+transcribe,
+                // same shape this app has always used. The decoded buffer
+                // doubles as `mono` for diarization below.
+                val decoded = runCatching { AudioDecoder.decode(audioFile) }
+                    .getOrElse {
+                        send(AsrEvent.Failed("Failed to decode $audioPath: ${it.message}"))
+                        asr.release()
+                        return@channelFlow
+                    }
+                mono = decoded.samples
+                send(AsrEvent.Stage("Transcribing", 0.2f))
+                val tx = asr.transcribe(
+                    samples = mono,
+                    sampleRate = decoded.sampleRate,
+                    language = primaryLanguage,
+                    translate = whisperTranslate,
+                    progress = null,
+                )
+                if (tx.isFailure) {
+                    asr.release()
+                    send(AsrEvent.Failed(tx.exceptionOrNull()?.message ?: "transcription failed"))
+                    return@channelFlow
+                }
+                rawSegments = tx.getOrThrow()
+            } else {
+                // Long file — stream-decode and chunk at VAD cut points
+                // instead of loading the whole clip into one FloatArray
+                // (doubled again by jni_whisper.cpp's own native-side
+                // copy) — that full-buffer load was the actual OOM driver
+                // on multi-hour audio. whisper.cpp's C API needs the whole
+                // buffer PER CALL, but nothing stops calling it once per
+                // chunk and stitching with a time offset, same shape as
+                // SherpaOfflineBackend already does for Parakeet/
+                // Omnilingual. Reuses the exact scanSilences/
+                // computeCutPoints/decodeAtCutPoints pipeline the Gemma
+                // branch above already exercises.
+                send(AsrEvent.Stage("Scanning for sentence boundaries", 0.12f))
+                val silences = runCatching {
+                    AudioDecoder.scanSilences(
+                        audioFile,
+                        minSilenceMs = CHUNK_ALIGN_MIN_SILENCE_MS,
+                        rmsThreshold = CHUNK_ALIGN_RMS_THRESHOLD,
+                    )
+                }.getOrElse {
+                    Log.w(TAG, "silence scan failed; falling back to fixed-time chunks", it)
+                    emptyList()
+                }
+                val cutPoints = AudioDecoder.computeCutPoints(
+                    silences = silences,
+                    durationSec = recording.durationSeconds,
+                    targetChunkSec = WHISPER_CHUNK_TARGET_SECONDS,
+                    flexSec = CHUNK_ALIGN_FLEX_SECONDS,
+                )
+                val expectedWhisperChunks = cutPoints.size + 1
+                val whisperOverlapSamples = CHUNK_OVERLAP_SECONDS * AudioDecoder.TARGET_SR
+                val out = mutableListOf<RawSegment>()
+                var chunkIdx = 0
+                try {
+                    AudioDecoder.decodeAtCutPoints(
+                        audioFile,
+                        cutPoints = cutPoints,
+                        hardCutOverlapSamples = whisperOverlapSamples,
+                        silenceCutOverlapSamples = 0,
+                    ).collect { chunk ->
+                        send(AsrEvent.Stage(
+                            "Transcribing ${chunkIdx + 1}/$expectedWhisperChunks",
+                            (0.15f + 0.75f * chunkIdx / expectedWhisperChunks).coerceAtMost(0.95f),
+                        ))
+                        val tx = asr.transcribe(
+                            samples = chunk.samples,
+                            sampleRate = chunk.sampleRate,
+                            language = primaryLanguage,
+                            translate = whisperTranslate,
+                            progress = null,
+                        )
+                        if (tx.isFailure) {
+                            throw TranscriptionBailout(AsrEvent.Failed(
+                                "Chunk ${chunkIdx + 1} failed: " +
+                                    (tx.exceptionOrNull()?.message ?: "unknown")
+                            ))
+                        }
+                        val offset = chunk.startSeconds
+                        for (seg in tx.getOrThrow()) {
+                            out += RawSegment(
+                                startSeconds = seg.startSeconds + offset,
+                                endSeconds = seg.endSeconds + offset,
+                                text = seg.text,
+                                words = seg.words?.map { w ->
+                                    w.copy(start = w.start + offset, end = w.end + offset)
+                                },
+                            )
+                        }
+                        // Unlike Gemma, whisper.cpp has no "skip the recap"
+                        // prompting — it transcribes the whole chunk
+                        // including the overlap, so a hard-cut chunk
+                        // boundary genuinely produces duplicate text at the
+                        // seam. Register it for dedupChunkBoundaries below
+                        // (same "only hard cuts need dedup" rule as the
+                        // Gemma branch — silence-aligned cuts carry zero
+                        // overlap, nothing to dedup).
+                        if (chunkIdx > 0 && chunk.overlapSamples > 0) {
+                            chunkBoundaryStartSeconds.add(chunk.startSeconds)
+                        }
+                        chunkIdx++
+                    }
+                } catch (b: TranscriptionBailout) {
+                    asr.release()
+                    send(b.failure)
+                    return@channelFlow
+                } catch (t: Throwable) {
+                    asr.release()
+                    send(AsrEvent.Failed("Failed to decode/transcribe $audioPath: ${t.message}"))
+                    return@channelFlow
+                }
+                rawSegments = out
+                // Diarization (if requested) still needs the full waveform
+                // resident — a pre-existing, separate constraint (same
+                // shape as Gemma's own non-hybrid diarization path),
+                // unrelated to this chunking fix. Decoding twice only
+                // happens in this long-file + diarize combination.
+                mono = if (diarize) {
+                    runCatching { AudioDecoder.decode(audioFile).samples }.getOrElse { FloatArray(0) }
+                } else {
+                    FloatArray(0)
+                }
             }
-            rawSegments = tx.getOrThrow()
         }
 
         // Optional diarization. Three flavours:
@@ -1655,16 +1774,27 @@ internal fun dedupChunkBoundaries(
         if (dropCount > 0) {
             val trimmed = currTokens.drop(dropCount).joinToString(" ").trim()
             if (trimmed.isEmpty()) {
-                android.util.Log.d(
-                    TAG, "dedup: dropped fully-duplicate segment ($dropCount tokens) " +
-                        "at ${curr.startSeconds}s"
-                )
+                // runCatching: this function is exercised directly by plain
+                // JVM unit tests (no Android framework, no Robolectric) —
+                // android.util.Log's real implementation is native and
+                // throws when unmocked outside an instrumented run. A
+                // logging call must never be able to crash the dedup pass
+                // either way, so swallow-on-failure is correct in
+                // production too, not just a test workaround.
+                runCatching {
+                    android.util.Log.d(
+                        TAG, "dedup: dropped fully-duplicate segment ($dropCount tokens) " +
+                            "at ${curr.startSeconds}s"
+                    )
+                }
                 continue
             }
-            android.util.Log.d(
-                TAG, "dedup: trimmed $dropCount overlapping tokens from segment " +
-                    "at ${curr.startSeconds}s"
-            )
+            runCatching {
+                android.util.Log.d(
+                    TAG, "dedup: trimmed $dropCount overlapping tokens from segment " +
+                        "at ${curr.startSeconds}s"
+                )
+            }
             out.add(curr.copy(text = trimmed))
         } else {
             out.add(curr)
