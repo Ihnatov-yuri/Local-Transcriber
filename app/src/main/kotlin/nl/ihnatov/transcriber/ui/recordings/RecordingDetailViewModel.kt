@@ -129,6 +129,12 @@ class RecordingDetailViewModel(
          * [TranscriptionRunner.run]'s docs for the policy details.
          */
         hybridDiarize: Boolean = false,
+        /** Super mode (Phase 3): run [superPairA] + [superPairB] and vote-merge instead of just [backend]. */
+        superMode: Boolean = false,
+        superPairA: AsrBackendKind? = null,
+        superPairB: AsrBackendKind? = null,
+        /** Constrained-JSON arbitration second pass on low-agreement Super chunks. */
+        maxQuality: Boolean = false,
     ) {
         val rec = ui.value.recording ?: return
         container.transcriptionJobManager.start(
@@ -140,6 +146,10 @@ class RecordingDetailViewModel(
                 diarize = diarize,
                 expectedSpeakers = expectedSpeakers,
                 hybridDiarize = hybridDiarize,
+                superMode = superMode,
+                superPairA = superPairA,
+                superPairB = superPairB,
+                maxQuality = maxQuality,
             ),
             runOnCharger = runOnCharger,
         )

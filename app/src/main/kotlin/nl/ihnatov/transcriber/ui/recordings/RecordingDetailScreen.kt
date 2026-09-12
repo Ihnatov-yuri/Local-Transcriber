@@ -129,6 +129,15 @@ fun RecordingDetailScreen(
     LaunchedEffect(selectedLangs) {
         if (!backendManuallySet) backend = defaultEngineFor(selectedLangs)
     }
+    // Super mode (Phase 3): run two engines and vote-merge instead of just
+    // `backend`. Pair is a small curated list, not two free pickers — most
+    // combinations aren't meaningful (e.g. Parakeet+Parakeet), and these
+    // two mirror the plan's own default/Arabic split.
+    var superMode by remember { mutableStateOf(false) }
+    var superPairIdx by remember { mutableIntStateOf(0) }
+    val superPair = SUPER_PAIR_PRESETS[superPairIdx]
+    var maxQuality by remember { mutableStateOf(false) }
+
     // File-transcription engine cycle. NemotronStream isn't offered here —
     // it's a streaming-only engine driven by LiveTranscriber on the Record
     // screen, not something that transcribes an already-recorded file.
@@ -183,6 +192,10 @@ fun RecordingDetailScreen(
                 diarize = diarize,
                 expectedSpeakers = expectedSpeakers,
                 hybridDiarize = hybridDiar && diarize && backend == AsrBackendKind.Gemma4 && diarReady,
+                superMode = superMode,
+                superPairA = superPair.first,
+                superPairB = superPair.second,
+                maxQuality = maxQuality,
             )
         }
     }
@@ -301,6 +314,8 @@ fun RecordingDetailScreen(
                     hybridDiar = hybridDiar,
                     runOnCharger = runOnCharger,
                     installedModelsEmpty = installedModels.isEmpty(),
+                    superMode = superMode,
+                    superPairLabel = superPairLabel(superPair),
                     onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
@@ -333,6 +348,10 @@ fun RecordingDetailScreen(
                             runOnCharger = runOnCharger,
                             hybridDiarize = hybridDiar && diarize &&
                                 backend == AsrBackendKind.Gemma4 && diarReady,
+                            superMode = superMode,
+                            superPairA = superPair.first,
+                            superPairB = superPair.second,
+                            maxQuality = maxQuality,
                         )
                     },
                     onCancel = { vm.cancelTranscription() },
@@ -508,6 +527,12 @@ fun RecordingDetailScreen(
                             else -> expectedSpeakers + 1
                         }
                     },
+                    superMode = superMode,
+                    onToggleSuper = { superMode = !superMode },
+                    superPairLabel = superPairLabel(superPair),
+                    onCyclePair = { superPairIdx = (superPairIdx + 1) % SUPER_PAIR_PRESETS.size },
+                    maxQuality = maxQuality,
+                    onToggleMaxQuality = { maxQuality = !maxQuality },
                 )
             }
         }
@@ -635,6 +660,8 @@ private fun RunStrip(
     hybridDiar: Boolean,
     runOnCharger: Boolean,
     installedModelsEmpty: Boolean,
+    superMode: Boolean,
+    superPairLabel: String,
     onCycleBackend: () -> Unit,
     onPickLanguages: () -> Unit,
     onCycleTranslate: () -> Unit,
@@ -660,7 +687,7 @@ private fun RunStrip(
             Mono("RUN ${if (expanded) "▾" else "▸"}", color = ink)
             Spacer(Modifier.width(10.dp))
             val summary = buildString {
-                append(runSheetEngineLabel(backend))
+                append(if (superMode) "SUPER · $superPairLabel" else runSheetEngineLabel(backend))
                 append(" · ")
                 append(summarizeLanguages(selectedLangs).uppercase())
                 translateTo?.let { append(" → ").append(it.uppercase()) }
@@ -789,6 +816,12 @@ private fun RunOptionsSheetContent(
     onToggleHybrid: () -> Unit,
     onToggleCharger: () -> Unit,
     onCycleSpeakers: () -> Unit,
+    superMode: Boolean,
+    onToggleSuper: () -> Unit,
+    superPairLabel: String,
+    onCyclePair: () -> Unit,
+    maxQuality: Boolean,
+    onToggleMaxQuality: () -> Unit,
 ) {
     // Which row's help dialog is currently shown. Null = none. Per-row
     // help is opened by tapping the (?) chip at the right end of each
@@ -808,21 +841,42 @@ private fun RunOptionsSheetContent(
         )
         Spacer(Modifier.height(6.dp))
         RunOptionLine(
-            label = "ENGINE",
-            value = runSheetEngineLabel(backend),
-            onClick = onCycleBackend,
-            onHelp = { helpFor = RunOptionHelp.ENGINE },
+            label = "SUPER",
+            value = if (superMode) "ON" else "OFF",
+            onClick = onToggleSuper,
+            onHelp = { helpFor = RunOptionHelp.SUPER },
         )
-        // Gemma model picker — only when the Gemma backend has more than
-        // one model installed (E2B + E4B). Tapping cycles the active
-        // model and pins it. Hidden otherwise (nothing to choose).
-        if (backend == AsrBackendKind.Gemma4 && gemmaModelLabel != null) {
+        if (superMode) {
             RunOptionLine(
-                label = "MODEL",
-                value = gemmaModelLabel,
-                onClick = onCycleGemmaModel,
-                onHelp = { helpFor = RunOptionHelp.MODEL },
+                label = "PAIR",
+                value = superPairLabel,
+                onClick = onCyclePair,
+                onHelp = { helpFor = RunOptionHelp.PAIR },
             )
+            RunOptionLine(
+                label = "MAX QUALITY",
+                value = if (maxQuality) "ON" else "OFF",
+                onClick = onToggleMaxQuality,
+                onHelp = { helpFor = RunOptionHelp.MAX_QUALITY },
+            )
+        } else {
+            RunOptionLine(
+                label = "ENGINE",
+                value = runSheetEngineLabel(backend),
+                onClick = onCycleBackend,
+                onHelp = { helpFor = RunOptionHelp.ENGINE },
+            )
+            // Gemma model picker — only when the Gemma backend has more than
+            // one model installed (E2B + E4B). Tapping cycles the active
+            // model and pins it. Hidden otherwise (nothing to choose).
+            if (backend == AsrBackendKind.Gemma4 && gemmaModelLabel != null) {
+                RunOptionLine(
+                    label = "MODEL",
+                    value = gemmaModelLabel,
+                    onClick = onCycleGemmaModel,
+                    onHelp = { helpFor = RunOptionHelp.MODEL },
+                )
+            }
         }
         RunOptionLine(
             label = "LANG",
@@ -953,6 +1007,26 @@ private enum class RunOptionHelp(val title: String, val body: String) {
         "WAIT parks the job in the queue until you plug the phone into power. " +
             "NOW starts immediately. Gemma 4 is heavy — long files on battery " +
             "will warm the device and drain quickly.",
+    ),
+    SUPER(
+        "SUPER",
+        "Run two engines on every chunk and vote-merge the result instead of " +
+            "trusting one. Keeps what both agree on, picks the more plausible " +
+            "reading where they differ. Roughly 2× the compute of a single " +
+            "engine — for when accuracy matters more than speed.",
+    ),
+    PAIR(
+        "PAIR",
+        "Which two engines Super mode runs. PARAKEET + WHISPER for most " +
+            "recordings; OMNILINGUAL + GEMMA 4 when Arabic is in the mix — " +
+            "Omnilingual reads Gulf Arabic, Gemma covers what it misses.",
+    ),
+    MAX_QUALITY(
+        "MAX QUALITY",
+        "On top of the vote, send the chunks where the two engines disagreed " +
+            "most to Gemma for a second look — a constrained choice between " +
+            "the two readings, never free text, so it can't invent content. " +
+            "Slower; only worth it on recordings you'll rely on.",
     ),
 }
 
@@ -1460,6 +1534,15 @@ private fun EditorialPlayer(
 }
 
 // ─── Helpers + dialogs (carried over) ────────────────────────────────
+
+/** Curated Super-mode pairs — see the plan's engine matrix (section 3): Parakeet+Whisper by default, Omnilingual+Gemma 4 for Arabic. */
+private val SUPER_PAIR_PRESETS = listOf(
+    AsrBackendKind.Parakeet to AsrBackendKind.WhisperCpp,
+    AsrBackendKind.Omnilingual to AsrBackendKind.Gemma4,
+)
+
+private fun superPairLabel(pair: Pair<AsrBackendKind, AsrBackendKind>): String =
+    "${runSheetEngineLabel(pair.first)} + ${runSheetEngineLabel(pair.second)}"
 
 private fun runSheetEngineLabel(kind: AsrBackendKind): String = when (kind) {
     AsrBackendKind.Gemma4 -> "GEMMA 4"

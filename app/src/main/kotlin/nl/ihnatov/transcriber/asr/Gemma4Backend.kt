@@ -790,6 +790,61 @@ class Gemma4Backend(
     }
 
     /**
+     * Super mode's arbitration second pass: given a list of A/B disputes
+     * (see [RoverMerge.Dispute]) from one low-agreement chunk, asks Gemma
+     * to pick a side for each rather than write free text — see
+     * [ARBITRATION_JSON_SCHEMA]'s doc comment for why. Returns one 0/1
+     * choice per dispute in the same order, or null on any failure
+     * (caller falls back to the vote-only merge; this is a quality
+     * refinement, never a dependency).
+     */
+    suspend fun arbitrateDisputes(
+        disputes: List<RoverMerge.Dispute>,
+        labelA: String,
+        labelB: String,
+    ): List<Int>? = withContext(Dispatchers.Default) {
+        if (disputes.isEmpty()) return@withContext null
+        mutex.withLock {
+            val e = engine ?: return@withLock null
+            var conv: Conversation? = null
+            try {
+                conv = e.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(Content.Text(ARBITRATION_SYSTEM_PROMPT)),
+                        samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.1),
+                        enableResponseFormat = true,
+                    )
+                )
+                val userMessage = disputes.withIndex().joinToString(
+                    "\n",
+                    prefix = "Disputes ($labelA=0 vs $labelB=1):\n",
+                ) { (i, d) -> "$i: [0] ${d.optionA}  [1] ${d.optionB}" }
+                val acc = StringBuilder()
+                try {
+                    conv.sendMessageAsync(
+                        Contents.of(Content.Text(userMessage)),
+                        emptyMap(),
+                        responseFormat = ResponseFormat.json(ARBITRATION_JSON_SCHEMA),
+                    ).collect { msg ->
+                        acc.append(msg.contents.contents.filterIsInstance<Content.Text>().joinToString("") { it.text })
+                    }
+                } catch (ce: CancellationException) {
+                    runCatching { conv.cancelProcess() }
+                    throw ce
+                }
+                parseArbitrationResponse(acc.toString(), disputes.size)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "arbitration failed, caller falls back to vote-only merge", t)
+                null
+            } finally {
+                runCatching { conv?.close() }
+            }
+        }
+    }
+
+    /**
      * Role + hard rules. Stays in the systemInstruction channel; the user
      * message at run-time is just "Transcribe." or "Translate." so the model
      * has nothing to echo back.

@@ -144,6 +144,12 @@ class TranscriptionRunner(
          * isn't Gemma.
          */
         hybridDiarize: Boolean = false,
+        /** Super mode (Phase 3): run [superPairA] + [superPairB] and vote-merge instead of just [backend]. */
+        superMode: Boolean = false,
+        superPairA: AsrBackendKind? = null,
+        superPairB: AsrBackendKind? = null,
+        /** Constrained-JSON arbitration second pass on low-agreement Super chunks. Meaningless unless [superMode]. */
+        maxQuality: Boolean = false,
     ): Flow<AsrEvent> = channelFlow {
         // Why channelFlow not flow {}: the chunk loop launches a sibling
         // "poller" coroutine that surfaces Gemma's per-token partial text
@@ -180,47 +186,74 @@ class TranscriptionRunner(
         val minDurationOff = uiPrefs?.minDurationOffSec?.value ?: DiarizationRunner.DEFAULT_MIN_DURATION_OFF
         val turnCoalesceGapSec = (uiPrefs?.turnCoalesceGapSec?.value ?: DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()).toDouble()
 
-        val modelFile = factory.resolveModel(backend)
-        if (modelFile == null) {
-            val dir = factory.modelsDir()
-            val expected = factory.expectedExtensionsHint(backend)
-            val existing = runCatching { dir.listFiles()?.map { it.name } ?: emptyList() }
-                .getOrDefault(emptyList())
-            val listing = if (existing.isEmpty()) "(empty)" else existing.joinToString(", ")
-            send(AsrEvent.Failed(
-                "No model file for ${backend.name}.\n" +
-                    "Expected: $expected\n" +
-                    "Found in ${dir.absolutePath}: $listing\n" +
-                    "Use Settings → Import model to add one."
-            ))
-            return@channelFlow
+        // Gemma 4 E4B needs the memory guard whether it's the sole backend
+        // or one half of a Super pair — check by NAME so it applies to
+        // whichever Gemma variant AsrFactory would actually resolve.
+        suspend fun checkGemmaE4BMemory(): AsrEvent.Failed? {
+            val gemmaModel = factory.resolveModel(AsrBackendKind.Gemma4) ?: return null
+            if (!gemmaModel.name.contains("E4B", ignoreCase = true)) return null
+            val budget = MemoryGuard.estimateBudget(context)
+            if (budget.estimatedBudgetBytes >= MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES) return null
+            val have = MemoryGuard.gibString(budget.estimatedBudgetBytes)
+            val need = MemoryGuard.gibString(MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES)
+            val why = if (budget.isLimiterEstimate) {
+                " (Android's background memory limiter caps this app around ${have} GB)"
+            } else {
+                " (only ${have} GB free right now)"
+            }
+            return AsrEvent.Failed(
+                "Gemma 4 E4B needs about $need GB of memory headroom$why. " +
+                    "Try Gemma 4 E2B instead, or close other apps and retry."
+            )
         }
 
-        if (backend == AsrBackendKind.Gemma4 && modelFile.name.contains("E4B", ignoreCase = true)) {
-            val budget = MemoryGuard.estimateBudget(context)
-            if (budget.estimatedBudgetBytes < MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES) {
-                val have = MemoryGuard.gibString(budget.estimatedBudgetBytes)
-                val need = MemoryGuard.gibString(MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES)
-                val why = if (budget.isLimiterEstimate) {
-                    " (Android's background memory limiter caps this app around ${have} GB)"
-                } else {
-                    " (only ${have} GB free right now)"
-                }
+        val modelFile: File
+        val asr: AsrBackend
+        if (superMode && superPairA != null && superPairB != null && superPairA != superPairB) {
+            if ((superPairA == AsrBackendKind.Gemma4 || superPairB == AsrBackendKind.Gemma4)) {
+                checkGemmaE4BMemory()?.let { send(it); return@channelFlow }
+            }
+            // No single model FILE for Super mode — EnsembleBackend resolves
+            // each sub-engine's own model internally. This placeholder path
+            // is never read from disk, only used for logging/display
+            // (transcribedWithModel) the same way a real model's name is.
+            modelFile = File(factory.modelsDir(), "super-${superPairA.name.lowercase()}-${superPairB.name.lowercase()}")
+            asr = EnsembleBackend(superPairA, superPairB, factory, arbitrationEnabled = maxQuality)
+            send(AsrEvent.Stage("Loading Super mode engines", 0.05f))
+            val loadRes = asr.load(modelFile.absolutePath)
+            if (loadRes.isFailure) {
+                send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "Super mode engines failed to load"))
+                asr.release()
+                return@channelFlow
+            }
+        } else {
+            val resolved = factory.resolveModel(backend)
+            if (resolved == null) {
+                val dir = factory.modelsDir()
+                val expected = factory.expectedExtensionsHint(backend)
+                val existing = runCatching { dir.listFiles()?.map { it.name } ?: emptyList() }
+                    .getOrDefault(emptyList())
+                val listing = if (existing.isEmpty()) "(empty)" else existing.joinToString(", ")
                 send(AsrEvent.Failed(
-                    "Gemma 4 E4B needs about $need GB of memory headroom$why. " +
-                        "Try Gemma 4 E2B instead, or close other apps and retry."
+                    "No model file for ${backend.name}.\n" +
+                        "Expected: $expected\n" +
+                        "Found in ${dir.absolutePath}: $listing\n" +
+                        "Use Settings → Import model to add one."
                 ))
                 return@channelFlow
             }
-        }
-
-        val asr = factory.create(backend)
-        send(AsrEvent.Stage("Loading model", 0.05f))
-        val loadRes = asr.load(modelFile.absolutePath)
-        if (loadRes.isFailure) {
-            send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "model load failed"))
-            asr.release()
-            return@channelFlow
+            modelFile = resolved
+            if (backend == AsrBackendKind.Gemma4) {
+                checkGemmaE4BMemory()?.let { send(it); return@channelFlow }
+            }
+            asr = factory.create(backend)
+            send(AsrEvent.Stage("Loading model", 0.05f))
+            val loadRes = asr.load(modelFile.absolutePath)
+            if (loadRes.isFailure) {
+                send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "model load failed"))
+                asr.release()
+                return@channelFlow
+            }
         }
 
         send(AsrEvent.Stage("Reading audio", 0.1f))

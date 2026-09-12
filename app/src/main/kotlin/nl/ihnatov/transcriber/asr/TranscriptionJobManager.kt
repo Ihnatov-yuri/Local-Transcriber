@@ -73,6 +73,22 @@ class TranscriptionJobManager(
          * diarize=true and backend=Gemma4. Silently ignored otherwise.
          */
         val hybridDiarize: Boolean = false,
+        /**
+         * Super mode (Phase 3 of the 2026-09 plan): run [superPairA] and
+         * [superPairB] together and vote-merge instead of just [backend].
+         * Deliberately NOT persisted to the `pending_tasks` Room row (see
+         * [toEntity]) — adding columns there means a schema version bump,
+         * and the plan's own Phase 4 migration is numbered "3 to 4"
+         * assuming no schema churn before it. A charger-parked or FIFO-
+         * queued task that survives a process death replays as plain
+         * single-engine [backend] instead of Super — a minor, honest
+         * degradation, not data loss.
+         */
+        val superMode: Boolean = false,
+        val superPairA: AsrBackendKind? = null,
+        val superPairB: AsrBackendKind? = null,
+        /** "Max quality" — the constrained-JSON arbitration second pass. Meaningless unless [superMode]. */
+        val maxQuality: Boolean = false,
     )
 
     private val _statuses = MutableStateFlow<Map<Long, JobStatus>>(emptyMap())
@@ -197,6 +213,10 @@ class TranscriptionJobManager(
                     diarize = params.diarize,
                     expectedSpeakers = params.expectedSpeakers,
                     hybridDiarize = params.hybridDiarize,
+                    superMode = params.superMode,
+                    superPairA = params.superPairA,
+                    superPairB = params.superPairB,
+                    maxQuality = params.maxQuality,
                 ).collect { ev ->
                     val curr = _statuses.value[recordingId] ?: JobStatus(running = true)
                     val next = when (ev) {
