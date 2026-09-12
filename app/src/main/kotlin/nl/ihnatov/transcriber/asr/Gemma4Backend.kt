@@ -845,6 +845,54 @@ class Gemma4Backend(
     }
 
     /**
+     * Auto-classify a recording into a [RecordingCategory] from a short
+     * transcript excerpt, via constrained JSON decoding (same mechanism as
+     * [suggestSpeakerMergeMap]/[arbitrateDisputes]). New to the Android
+     * app — see [RecordingCategory]'s doc comment. Never fails the
+     * caller: any timeout, malformed response, or model-unavailable
+     * condition is "no category" (null), not a thrown exception —
+     * classification is a Library-browsing nicety, never a transcription
+     * dependency.
+     */
+    suspend fun suggestCategory(excerpt: String): RecordingCategory? = withContext(Dispatchers.Default) {
+        if (excerpt.isBlank()) return@withContext null
+        mutex.withLock {
+            val e = engine ?: return@withLock null
+            var conv: Conversation? = null
+            try {
+                conv = e.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(Content.Text(CLASSIFY_SYSTEM_PROMPT)),
+                        samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.1),
+                        enableResponseFormat = true,
+                    )
+                )
+                val acc = StringBuilder()
+                try {
+                    conv.sendMessageAsync(
+                        Contents.of(Content.Text("Transcript excerpt:\n$excerpt")),
+                        emptyMap(),
+                        responseFormat = ResponseFormat.json(CLASSIFY_JSON_SCHEMA),
+                    ).collect { msg ->
+                        acc.append(msg.contents.contents.filterIsInstance<Content.Text>().joinToString("") { it.text })
+                    }
+                } catch (ce: CancellationException) {
+                    runCatching { conv.cancelProcess() }
+                    throw ce
+                }
+                parseClassifyResponse(acc.toString())
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "auto-classify failed, skipping", t)
+                null
+            } finally {
+                runCatching { conv?.close() }
+            }
+        }
+    }
+
+    /**
      * Role + hard rules. Stays in the systemInstruction channel; the user
      * message at run-time is just "Transcribe." or "Translate." so the model
      * has nothing to echo back.
@@ -1343,6 +1391,16 @@ class Gemma4Backend(
 
     companion object {
         private const val TAG = "Gemma4Backend"
+
+        /** System prompt for [suggestCategory]. Output shape is enforced by the JSON schema, not this text. */
+        private const val CLASSIFY_SYSTEM_PROMPT =
+            "You are classifying an audio recording from a short excerpt of its transcript. " +
+                "Categories:\n" +
+                "- meeting: multiple people discussing or deciding something together\n" +
+                "- interview: one person asking another a structured series of questions\n" +
+                "- note: a single speaker's own thoughts, log, or reminder to themselves\n" +
+                "- idea: a single speaker brainstorming or pitching a concept\n" +
+                "Pick exactly one. If genuinely ambiguous, prefer note."
 
         /** System prompt for [suggestSpeakerMergeMap]. Output shape is enforced by the JSON schema, not this text. */
         private const val MERGE_MAP_SYSTEM_PROMPT =

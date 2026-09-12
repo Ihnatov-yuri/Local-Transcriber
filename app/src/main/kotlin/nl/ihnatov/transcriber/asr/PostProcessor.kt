@@ -127,7 +127,7 @@ class PostProcessor(
         segments: List<Segment>,
     ): String {
         val langHint = languageHint(language)
-        val vocab = parseVocabulary(promptStore.vocabulary.value)
+        val vocab = promptStore.vocabularyTerms(setOfNotNull(language))
         val vocabSection = if (vocab.isEmpty()) ""
         else "\nVocabulary (spell exactly when these appear): ${vocab.joinToString(", ")}."
         val resolved = template
@@ -164,9 +164,6 @@ class PostProcessor(
         else -> "The transcript is in language code '$language'."
     }
 
-    private fun parseVocabulary(text: String): List<String> =
-        text.split('\n', ',').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-
     /**
      * Build a speaker-labeled plaintext transcript that's compact enough for
      * Gemma's input window. Format:
@@ -184,7 +181,11 @@ class PostProcessor(
             val speaker = seg.speakerName ?: seg.speaker?.replace("SPEAKER_", "Speaker ")
             append('[').append(ts).append("] ")
             if (!speaker.isNullOrBlank()) append(speaker).append(": ")
-            append(seg.text.trim())
+            // Deterministic stutter/phrase-echo collapse runs ahead of every
+            // preset, unconditionally — small local LLMs reliably fail to
+            // strip these themselves no matter how the prompt asks. See
+            // TextDestutter's own doc comment (ported from the Mac app).
+            append(TextDestutter.collapseLine(seg.text.trim()))
             append('\n')
         }
     }

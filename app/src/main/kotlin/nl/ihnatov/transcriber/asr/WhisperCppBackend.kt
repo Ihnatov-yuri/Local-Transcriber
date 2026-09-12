@@ -16,8 +16,12 @@ import kotlinx.coroutines.withContext
  * The native library `libtranscriber_jni.so` is produced by the CMake
  * subproject in app/src/main/cpp/. It bundles whisper.cpp at build time;
  * see scripts/fetch-whisper-cpp.sh in the project README.
+ *
+ * [promptStore] is optional so tests and any other caller that doesn't
+ * care about vocabulary biasing can still construct this directly; real
+ * app wiring (see [AsrFactory]) always passes one.
  */
-class WhisperCppBackend : AsrBackend {
+class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBackend {
 
     override val id: String get() = "whisper.cpp"
 
@@ -63,6 +67,7 @@ class WhisperCppBackend : AsrBackend {
                     sampleRate,
                     language ?: "auto",
                     translate,
+                    promptStore?.whisperPrompt(language) ?: "",
                 )
                 if (raw == null) {
                     Result.failure(IllegalStateException("whisper_full returned null"))
@@ -93,6 +98,7 @@ class WhisperCppBackend : AsrBackend {
         sampleRate: Int,
         language: String,
         translate: Boolean,
+        initialPrompt: String,
     ): Array<RawSegment>?
 
     private external fun nativeRelease(handle: Long)

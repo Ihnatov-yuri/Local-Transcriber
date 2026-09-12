@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import nl.ihnatov.transcriber.asr.PowerConnectedReceiver
+import nl.ihnatov.transcriber.asr.refreshLearnedTerms
 import nl.ihnatov.transcriber.data.AppContainer
 
 class TranscriberApplication : Application() {
@@ -18,6 +19,16 @@ class TranscriberApplication : Application() {
         super.onCreate()
         container = AppContainer(this)
         registerNotificationChannels()
+        // Re-harvest "learned names" from the whole library on every cold
+        // start — cheap (text only, off the main thread) and keeps
+        // Settings → Learned current without the user having to remember
+        // to tap "Rescan". Mirrors the Mac app's launch-time bootstrap().
+        refreshLearnedTerms(
+            scope = container.appScope,
+            repository = container.repository,
+            promptStore = container.promptStore,
+            store = container.learnedNamesStore,
+        )
         // Process-lifetime receiver. Wakes up parked "run on charger"
         // tasks when AC arrives. Parked tasks themselves are persisted in
         // Room (pending_tasks table) so they survive process death — the

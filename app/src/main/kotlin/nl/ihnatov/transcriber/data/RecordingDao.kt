@@ -20,6 +20,10 @@ interface RecordingDao {
     @Query("SELECT * FROM recordings WHERE id = :id")
     suspend fun get(id: Long): Recording?
 
+    /** Snapshot of every recording — for one-shot library-wide scans (e.g. the learned-names harvester), not for display (use [observeAll]). */
+    @Query("SELECT * FROM recordings")
+    suspend fun listAll(): List<Recording>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(recording: Recording): Long
 
@@ -116,4 +120,20 @@ interface OutputDao {
 
     @Query("DELETE FROM outputs WHERE recordingId = :recordingId AND presetId = :presetId")
     suspend fun deleteByPreset(recordingId: Long, presetId: String)
+}
+
+@Dao
+interface TranscriptVersionDao {
+
+    @Query("SELECT * FROM transcript_versions WHERE recordingId = :recordingId ORDER BY createdAtMillis DESC")
+    fun observe(recordingId: Long): Flow<List<TranscriptVersion>>
+
+    @Query("SELECT * FROM transcript_versions WHERE id = :id")
+    suspend fun get(id: Long): TranscriptVersion?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(version: TranscriptVersion): Long
+
+    @Query("DELETE FROM transcript_versions WHERE id = :id")
+    suspend fun delete(id: Long)
 }

@@ -85,6 +85,25 @@ class SettingsViewModel(
     val snippetStore: nl.ihnatov.transcriber.asr.SnippetStore get() = container.snippetStore
     val gemmaSettings: nl.ihnatov.transcriber.asr.GemmaSettingsStore get() = container.gemmaSettings
     val uiPrefs: nl.ihnatov.transcriber.asr.UiPrefs get() = container.uiPrefs
+    val learnedNamesStore: nl.ihnatov.transcriber.asr.LearnedNamesStore get() = container.learnedNamesStore
+
+    /** Re-harvest learned names from the whole library — "Rescan library" in Settings → Learned. */
+    fun rescanLearnedNames() {
+        nl.ihnatov.transcriber.asr.refreshLearnedTerms(
+            scope = viewModelScope,
+            repository = container.repository,
+            promptStore = container.promptStore,
+            store = container.learnedNamesStore,
+        )
+    }
+
+    fun addLearnedTerm(term: nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) {
+        nl.ihnatov.transcriber.asr.addLearnedTerm(container.promptStore, container.learnedNamesStore, term)
+    }
+
+    fun dismissLearnedTerm(term: nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) {
+        container.learnedNamesStore.dismiss(term.key)
+    }
 
     fun deleteFile(file: File) {
         viewModelScope.launch {

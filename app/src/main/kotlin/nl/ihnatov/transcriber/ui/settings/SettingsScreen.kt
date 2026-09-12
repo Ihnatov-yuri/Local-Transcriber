@@ -159,6 +159,12 @@ fun SettingsScreen(container: AppContainer) {
         SectionHeader("Style & vocabulary")
         DomainVocabCard(promptStore = vm.promptStore, uiPrefs = vm.uiPrefs)
         StyleAndVocabCard(promptStore = vm.promptStore)
+        LearnedNamesCard(
+            store = vm.learnedNamesStore,
+            onAdd = vm::addLearnedTerm,
+            onDismiss = vm::dismissLearnedTerm,
+            onRescan = vm::rescanLearnedNames,
+        )
 
         // Footer — was an "Engines" card with two bullet points of value.
         // Replaced with a single subdued line. The architecture detail is in
@@ -1236,6 +1242,53 @@ private fun StyleAndVocabCard(promptStore: PromptStore) {
                 )
             }
 
+            // ---- Per-language vocabulary ----
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "Per-language vocabulary",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    "Extra terms added only when a run includes this language, " +
+                        "on top of the global list above. Auto-detect runs pull " +
+                        "in every language's list.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+                val vocabByLang by promptStore.vocabularyByLanguage.collectAsStateWithLifecycle()
+                var activeLangCode by remember { mutableStateOf("ar") }
+                val langOptions = listOf(
+                    "ar" to "Arabic", "uk" to "Ukrainian", "en" to "English", "nl" to "Dutch",
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    langOptions.forEach { (code, label) ->
+                        val hasTerms = !vocabByLang[code].isNullOrBlank()
+                        AssistChip(
+                            onClick = { activeLangCode = code },
+                            label = { Text(if (hasTerms) "$label •" else label) },
+                            enabled = activeLangCode != code,
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = vocabByLang[activeLangCode] ?: "",
+                    onValueChange = { promptStore.setVocabularyForLanguage(activeLangCode, it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                    placeholder = {
+                        val activeLabel = langOptions.first { it.first == activeLangCode }.second
+                        Text("Terms only used for $activeLabel runs")
+                    },
+                    textStyle = MaterialTheme.typography.bodySmall,
+                )
+            }
+
             // ---- Tone ----
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
@@ -1281,6 +1334,88 @@ private fun StyleAndVocabCard(promptStore: PromptStore) {
             checked = verbatim,
             onChange = promptStore::setVerbatim,
         )
+    }
+}
+
+/**
+ * "Learned" vocabulary suggestions — names/terms
+ * [nl.ihnatov.transcriber.asr.VocabularyHarvester] found recurring across
+ * two or more recordings that aren't in the vocabulary yet. One tap adds a
+ * suggestion to the global vocabulary; the × dismisses it for good. Port
+ * of the Mac app's `UI/Settings/LearnedTermsSection.swift`.
+ */
+@Composable
+private fun LearnedNamesCard(
+    store: nl.ihnatov.transcriber.asr.LearnedNamesStore,
+    onAdd: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onDismiss: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onRescan: () -> Unit,
+) {
+    val terms by store.terms.collectAsStateWithLifecycle()
+    val dismissed by store.dismissedKeys.collectAsStateWithLifecycle()
+    val lastScan by store.lastScanMillis.collectAsStateWithLifecycle()
+    val visible = remember(terms, dismissed) { terms.filter { it.key !in dismissed } }
+
+    SettingsSection(
+        title = "LEARNED",
+        subtitle = "Names that show up in two or more of your recordings but " +
+            "aren't in the vocabulary yet. One tap adds a spelling; the × " +
+            "dismisses it for good.",
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                lastScan?.let {
+                    "Last scanned " + java.text.DateFormat
+                        .getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+                        .format(java.util.Date(it))
+                } ?: "Not scanned yet",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedButton(onClick = onRescan) {
+                Icon(Icons.Outlined.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Rescan library")
+            }
+        }
+        if (visible.isEmpty()) {
+            Text(
+                "No new names yet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+        } else {
+            if (visible.size > 1) {
+                TextButton(onClick = { visible.forEach(onAdd) }) {
+                    Text("Add all ${visible.size}")
+                }
+            }
+            visible.forEach { term ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(term.spelling, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "${term.recordings} recordings · ${term.occurrences}×",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                        )
+                    }
+                    IconButton(onClick = { onAdd(term) }) {
+                        Icon(Icons.Outlined.CheckCircle, contentDescription = "Add to vocabulary")
+                    }
+                    IconButton(onClick = { onDismiss(term) }) {
+                        Icon(Icons.Outlined.Close, contentDescription = "Dismiss")
+                    }
+                }
+            }
+        }
     }
 }
 

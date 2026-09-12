@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -69,6 +70,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import nl.ihnatov.transcriber.asr.AsrBackendKind
+import nl.ihnatov.transcriber.asr.TextDestutter
 import nl.ihnatov.transcriber.asr.TranscriptExporter
 import nl.ihnatov.transcriber.asr.defaultEngineFor
 import nl.ihnatov.transcriber.audio.AudioPlayerController
@@ -174,9 +176,18 @@ fun RecordingDetailScreen(
     var langDialogOpen by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<String?>(null) }
     var renameDraft by remember { mutableStateOf("") }
+    var historySheetOpen by remember { mutableStateOf(false) }
+    var restoreTarget by remember { mutableStateOf<Long?>(null) }
     var fullscreen by remember { mutableStateOf(false) }
     val showTimestamps by container.uiPrefs.showTimestamps.collectAsStateWithLifecycle()
     val proseMode by container.uiPrefs.proseMode.collectAsStateWithLifecycle()
+    // Same toggle PostProcessor.assembleTranscriptForPrompt already applies
+    // before every preset — applying it here too keeps what's ON SCREEN
+    // consistent with what presets read, per the plan's Phase 4 item
+    // ("runs before every preset and on segment display when 'Remove
+    // fillers' is on"). Display-only: the stored segment.text (and its
+    // exported sidecars) are untouched.
+    val removeFillers by container.promptStore.removeFillers.collectAsStateWithLifecycle()
 
     val installedModels = remember(backend) { container.asrFactory.listModels(backend) }
     var autoFired by remember { mutableStateOf(false) }
@@ -251,6 +262,7 @@ fun RecordingDetailScreen(
                 onBack = onBack,
                 rec = ui.recording,
                 hasTranscript = ui.segments.isNotEmpty(),
+                hasHistory = ui.versions.isNotEmpty(),
                 fullscreen = fullscreen,
                 onToggleFullscreen = { fullscreen = !fullscreen },
                 onShare = {
@@ -263,6 +275,7 @@ fun RecordingDetailScreen(
                     }
                     context.startActivity(Intent.createChooser(intent, "Share transcript"))
                 },
+                onShowHistory = { historySheetOpen = true },
                 onDelete = { vm.delete(onBack) },
             )
             Spacer(Modifier.height(10.dp))
@@ -429,6 +442,7 @@ fun RecordingDetailScreen(
                         speakerColors = speakerKeys.mapIndexed { idx, k -> k to speakerColor(idx) }.toMap(),
                         showTimestamps = showTimestamps,
                         proseMode = proseMode,
+                        removeFillers = removeFillers,
                         activeSegmentId = activeSegmentId,
                         onEdit = vm::editSegmentText,
                         onSegmentSeek = { seg -> playerController.seekToSeconds(seg.startSeconds) },
@@ -470,6 +484,52 @@ fun RecordingDetailScreen(
                     selectedLangs = picks
                     container.uiPrefs.setLastLanguages(picks)
                     langDialogOpen = false
+                },
+            )
+        }
+        // Version history — past transcript snapshots, taken automatically
+        // right before each re-run (and before a restore) overwrites the
+        // live transcript. See TranscriptVersion.kt / RecordingRepository.
+        if (historySheetOpen) {
+            val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+            ModalBottomSheet(
+                onDismissRequest = { historySheetOpen = false },
+                sheetState = sheetState,
+                containerColor = MaterialTheme.colorScheme.background,
+            ) {
+                VersionHistorySheet(
+                    versions = ui.versions,
+                    onRestore = { restoreTarget = it },
+                    onDelete = { vm.deleteVersion(it) },
+                )
+            }
+        }
+        restoreTarget?.let { versionId ->
+            val version = ui.versions.firstOrNull { it.id == versionId }
+            AlertDialog(
+                onDismissRequest = { restoreTarget = null },
+                containerColor = MaterialTheme.colorScheme.background,
+                title = { Mono("RESTORE VERSION", color = MaterialTheme.colorScheme.onBackground) },
+                text = {
+                    Text(
+                        "Replace the current transcript with the " +
+                            "${version?.engineLabel ?: "selected"} version from " +
+                            (version?.let { formatStampMono(it.createdAtMillis) } ?: "") +
+                            "? The current transcript is saved to history first, so " +
+                            "this can be undone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f),
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        vm.restoreVersion(versionId)
+                        restoreTarget = null
+                        historySheetOpen = false
+                    }) { Mono("RESTORE") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { restoreTarget = null }) { Mono("CANCEL") }
                 },
             )
         }
@@ -546,9 +606,11 @@ private fun DetailTopRow(
     onBack: () -> Unit,
     @Suppress("UNUSED_PARAMETER") rec: nl.ihnatov.transcriber.data.Recording?,
     hasTranscript: Boolean,
+    hasHistory: Boolean,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     onShare: () -> Unit,
+    onShowHistory: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
@@ -597,6 +659,12 @@ private fun DetailTopRow(
                         onClick = { menuOpen = false; onShare() },
                     )
                 }
+                if (hasHistory) {
+                    DropdownMenuItem(
+                        text = { Mono("HISTORY", color = ink) },
+                        onClick = { menuOpen = false; onShowHistory() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Mono("DELETE RECORDING", color = Accent) },
                     onClick = { menuOpen = false; onDelete() },
@@ -632,6 +700,10 @@ private fun MetadataStrip(
         }
         rec?.sourceLanguage?.let {
             Mono(it.uppercase(), color = ink.copy(alpha = 0.62f))
+            Mono("·", color = ink.copy(alpha = 0.3f))
+        }
+        nl.ihnatov.transcriber.asr.RecordingCategory.fromId(rec?.category)?.let { cat ->
+            Mono(cat.displayName.uppercase(), color = ink.copy(alpha = 0.62f))
             Mono("·", color = ink.copy(alpha = 0.3f))
         }
         if (speakerCount > 0) {
@@ -1282,6 +1354,7 @@ private fun TranscriptBody(
     speakerColors: Map<String, Color> = emptyMap(),
     showTimestamps: Boolean,
     proseMode: Boolean,
+    removeFillers: Boolean,
     activeSegmentId: Long?,
     onEdit: (nl.ihnatov.transcriber.data.Segment, String) -> Unit,
     onSegmentSeek: (nl.ihnatov.transcriber.data.Segment) -> Unit,
@@ -1297,7 +1370,7 @@ private fun TranscriptBody(
         return
     }
     if (proseMode) {
-        ProseBody(segments, speakerColors, showTimestamps)
+        ProseBody(segments, speakerColors, showTimestamps, removeFillers)
         return
     }
     var editingId by remember { mutableStateOf<Long?>(null) }
@@ -1374,8 +1447,11 @@ private fun TranscriptBody(
                                 }) { Mono("SAVE") }
                             }
                         } else {
+                            val displayText = remember(seg.text, removeFillers) {
+                                if (removeFillers) TextDestutter.collapseLine(seg.text) else seg.text
+                            }
                             Text(
-                                seg.text,
+                                displayText,
                                 color = ink,
                                 style = MaterialTheme.typography.bodyLarge,
                             )
@@ -1392,11 +1468,12 @@ private fun ProseBody(
     segments: List<nl.ihnatov.transcriber.data.Segment>,
     speakerColors: Map<String, Color>,
     showTimestamps: Boolean,
+    removeFillers: Boolean,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     val muted = ink.copy(alpha = 0.55f)
-    val body = remember(segments, showTimestamps) {
-        buildAnnotatedProse(segments, showTimestamps, speakerColors, muted)
+    val body = remember(segments, showTimestamps, removeFillers) {
+        buildAnnotatedProse(segments, showTimestamps, speakerColors, muted, removeFillers)
     }
     val scroll = rememberScrollState()
     SelectionContainer {
@@ -1611,6 +1688,78 @@ private fun LanguagesDialog(
     )
 }
 
+@Composable
+private fun VersionHistorySheet(
+    versions: List<nl.ihnatov.transcriber.data.TranscriptVersion>,
+    onRestore: (Long) -> Unit,
+    onDelete: (Long) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Mono("HISTORY", color = ink)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Past transcript versions, saved automatically before each re-run or restore.",
+            style = MaterialTheme.typography.bodySmall,
+            color = ink.copy(alpha = 0.62f),
+        )
+        Spacer(Modifier.height(12.dp))
+        if (versions.isEmpty()) {
+            Text(
+                "No saved versions yet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = ink.copy(alpha = 0.55f),
+            )
+            Spacer(Modifier.height(16.dp))
+        } else {
+            LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                items(versions, key = { it.id }) { version ->
+                    VersionRow(
+                        version = version,
+                        onRestore = { onRestore(version.id) },
+                        onDelete = { onDelete(version.id) },
+                    )
+                    HairlineSoft()
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+@Composable
+private fun VersionRow(
+    version: nl.ihnatov.transcriber.data.TranscriptVersion,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Mono(version.engineLabel.uppercase(), color = ink)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "${formatStampMono(version.createdAtMillis)} · ${version.segmentCount} turns",
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = IbmPlexMono),
+                color = ink.copy(alpha = 0.55f),
+            )
+        }
+        Mono(
+            "RESTORE",
+            color = Accent,
+            modifier = Modifier.clickable(onClick = onRestore).padding(6.dp),
+        )
+        Mono(
+            "DELETE",
+            color = ink.copy(alpha = 0.55f),
+            modifier = Modifier.clickable(onClick = onDelete).padding(6.dp),
+        )
+    }
+}
+
 private fun timestamp(seconds: Double): String {
     val s = seconds.toInt()
     return "%02d:%02d".format(s / 60, s % 60)
@@ -1663,6 +1812,7 @@ private fun buildAnnotatedProse(
     showTimestamps: Boolean,
     speakerColors: Map<String, Color>,
     mutedColor: Color,
+    removeFillers: Boolean,
 ): AnnotatedString {
     val builder = AnnotatedString.Builder()
     var lastSpeakerKey: String? = "__init__"
@@ -1692,7 +1842,8 @@ private fun buildAnnotatedProse(
         } else if (anyEmitted) {
             builder.append(" ")
         }
-        val body = seg.text.trim()
+        val trimmed = seg.text.trim()
+        val body = if (removeFillers) TextDestutter.collapseLine(trimmed) else trimmed
         if (body.isNotEmpty()) {
             builder.append(body)
             anyEmitted = true

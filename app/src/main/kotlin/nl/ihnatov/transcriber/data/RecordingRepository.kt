@@ -15,6 +15,7 @@ class RecordingRepository(
     private val recordings: RecordingDao,
     private val segments: SegmentDao,
     private val outputs: OutputDao,
+    private val versions: TranscriptVersionDao,
 ) {
 
     fun observeAll(): Flow<List<Recording>> = recordings.observeAll()
@@ -130,6 +131,82 @@ class RecordingRepository(
     }
 
     suspend fun updateSegment(segment: Segment) = segments.update(segment)
+
+    /**
+     * Every recording's id paired with its transcript, oldest-first
+     * segment order — the raw material for
+     * [nl.ihnatov.transcriber.asr.VocabularyHarvester.harvest]. Reads the
+     * whole library, so callers should run this off the main thread and
+     * not too often (see `LearnedNames.kt`'s launch-time trigger).
+     */
+    suspend fun allTranscriptsForHarvest(): List<nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem> =
+        withContext(Dispatchers.IO) {
+            recordings.listAll().map { rec ->
+                val text = segments.list(rec.id).sortedBy { it.startSeconds }.joinToString("\n") { it.text }
+                nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem(rec.id, text)
+            }
+        }
+
+    fun observeVersions(recordingId: Long): Flow<List<TranscriptVersion>> = versions.observe(recordingId)
+
+    /** Shared by [snapshotCurrentTranscript] and [restoreVersion]; a no-op when there's nothing to snapshot yet. */
+    private suspend fun snapshotIfNonEmpty(recordingId: Long, engineId: String, engineLabel: String) {
+        val current = segments.list(recordingId)
+        if (current.isEmpty()) return
+        versions.insert(
+            TranscriptVersion(
+                recordingId = recordingId,
+                engineId = engineId,
+                engineLabel = engineLabel,
+                createdAtMillis = System.currentTimeMillis(),
+                segmentCount = current.size,
+                segmentsJson = encodeSegments(current),
+            )
+        )
+    }
+
+    /**
+     * Snapshot the recording's CURRENT segments as a new [TranscriptVersion]
+     * before they're about to be overwritten — call this once per run
+     * (not once per incremental [replaceSegments] save; a Gemma streaming
+     * run calls that many times per chunk, which would otherwise flood
+     * the version list). A no-op when there's nothing to snapshot yet
+     * (first-ever run on a recording).
+     */
+    suspend fun snapshotCurrentTranscript(
+        recordingId: Long,
+        engineId: String,
+        engineLabel: String,
+    ): Unit = withContext(Dispatchers.IO) {
+        snapshotIfNonEmpty(recordingId, engineId, engineLabel)
+    }
+
+    /**
+     * Replace the live transcript with a saved version's segments — the
+     * inverse of [snapshotCurrentTranscript]. Snapshots whatever is
+     * currently live first (labeled [currentEngineId]/[currentEngineLabel],
+     * i.e. whatever produced it — same convention as
+     * [nl.ihnatov.transcriber.asr.TranscriptionRunner]'s pre-run snapshot),
+     * so restoring an older version can never silently discard the state
+     * you restored FROM — that state becomes a version of its own.
+     *
+     * Returns the restored segments (so the caller can re-write sidecar
+     * files without a redundant DB read), or null if [versionId] doesn't
+     * exist.
+     */
+    suspend fun restoreVersion(
+        versionId: Long,
+        currentEngineId: String,
+        currentEngineLabel: String,
+    ): List<Segment>? = withContext(Dispatchers.IO) {
+        val version = versions.get(versionId) ?: return@withContext null
+        snapshotIfNonEmpty(version.recordingId, currentEngineId, currentEngineLabel)
+        val restored = decodeSegments(version.segmentsJson).map { it.toSegment(version.recordingId) }
+        segments.replaceAll(version.recordingId, restored)
+        restored
+    }
+
+    suspend fun deleteVersion(id: Long) = versions.delete(id)
 
     /** Observe all post-processing outputs for a recording (in creation order). */
     fun observeOutputs(recordingId: Long): Flow<List<OutputDoc>> = outputs.observe(recordingId)

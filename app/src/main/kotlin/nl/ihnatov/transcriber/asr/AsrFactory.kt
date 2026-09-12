@@ -35,7 +35,7 @@ class AsrFactory(
     private val prefs = context.getSharedPreferences("asr_factory", Context.MODE_PRIVATE)
 
     fun create(kind: AsrBackendKind): AsrBackend = when (kind) {
-        AsrBackendKind.WhisperCpp -> WhisperCppBackend()
+        AsrBackendKind.WhisperCpp -> WhisperCppBackend(promptStore)
         AsrBackendKind.Gemma4 -> Gemma4Backend(context, promptStore, gemmaSettings)
         AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual -> SherpaOfflineBackend(kind)
         AsrBackendKind.NemotronStream -> throw UnsupportedOperationException(

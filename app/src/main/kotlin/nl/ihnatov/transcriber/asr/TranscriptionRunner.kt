@@ -169,6 +169,18 @@ class TranscriptionRunner(
             return@channelFlow
         }
 
+        // Snapshot whatever transcript already exists BEFORE this run
+        // overwrites it — once per run, not once per incremental save (the
+        // Gemma streaming loop calls replaceSegments many times per chunk).
+        // Labeled with whichever engine actually PRODUCED those existing
+        // segments (recording.transcribedWithBackend/Model — set at the
+        // end of the PREVIOUS run, see below), not the one about to run;
+        // a no-op when there's nothing to snapshot yet (first-ever run).
+        val snapshotEngineId = recording.transcribedWithBackend ?: "unknown"
+        val snapshotEngineLabel = recording.transcribedWithModel ?: snapshotEngineId
+        runCatching { repository.snapshotCurrentTranscript(recordingId, snapshotEngineId, snapshotEngineLabel) }
+            .onFailure { Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it) }
+
         if (diarize && !diarizer.isEmbeddingModelPresent()) {
             send(AsrEvent.Failed(
                 "Speaker diarization needs the embedding model. " +
@@ -1133,6 +1145,18 @@ class TranscriptionRunner(
                 updated = updated.copy(title = title)
             }
         }
+        // Auto-classify: Meeting/Interview/Note/Idea. Unlike the title
+        // heuristic above, this never clobbers an existing value — once a
+        // recording has a category (from this or a future manual choice),
+        // a re-transcription leaves it alone rather than silently
+        // re-guessing. New to the Android app; see RecordingCategory's doc
+        // comment.
+        if (gemma != null && rows.isNotEmpty() && updated.category == null) {
+            val category = classifyRecording(gemma, rows)
+            if (category != null) {
+                updated = updated.copy(category = category.id)
+            }
+        }
 
         repository.update(updated)
         asr.release()
@@ -1204,6 +1228,21 @@ class TranscriptionRunner(
             ?.removePrefix("\"")?.removeSuffix("\"")
             ?.take(80)
             ?.takeIf { it.isNotBlank() }
+    }
+
+    /** Same excerpt-building approach as [generateTitle], reused independently so a title-generation failure never blocks classification. */
+    private suspend fun classifyRecording(
+        gemma: Gemma4Backend,
+        segments: List<Segment>,
+    ): RecordingCategory? {
+        val excerpt = buildString {
+            for (s in segments) {
+                if (length > 1500) break
+                append(s.text).append(' ')
+            }
+        }.trim().take(2000)
+        if (excerpt.isEmpty()) return null
+        return gemma.suggestCategory(excerpt)
     }
 }
 

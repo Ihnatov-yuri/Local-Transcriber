@@ -2,7 +2,7 @@
 //
 // Exposes four entry points to Kotlin:
 //   nativeInit(modelPath) -> long  (opaque context handle)
-//   nativeTranscribe(handle, samples[], sampleRate, langTag, translate) -> Segment[]
+//   nativeTranscribe(handle, samples[], sampleRate, langTag, translate, initialPrompt) -> Segment[]
 //   nativeRelease(handle)
 //   nativeSystemInfo() -> String
 //
@@ -83,7 +83,8 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     jfloatArray samplesArr,
     jint /*sampleRate*/,
     jstring langTag,
-    jboolean translate) {
+    jboolean translate,
+    jstring initialPrompt) {
 
     if (handle == 0) return nullptr;
     if (!ensureSegmentBinding(env)) return nullptr;
@@ -116,6 +117,19 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     } else {
         params.language = nullptr;   // auto-detect
     }
+
+    // Vocabulary bias: a short list of proper nouns / jargon the decoder
+    // should be primed to expect (PromptStore's global + per-language
+    // terms, joined by the Kotlin side). Same std::string-lifetime pattern
+    // as `lang` above — params.initial_prompt just holds the pointer, so
+    // `prompt` must outlive the whisper_full() call below.
+    std::string prompt;
+    if (initialPrompt) {
+        const char* p = env->GetStringUTFChars(initialPrompt, nullptr);
+        prompt = p ? p : "";
+        env->ReleaseStringUTFChars(initialPrompt, p);
+    }
+    params.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
 
     int rc = whisper_full(ctx, params, samples.data(), n);
     if (rc != 0) {

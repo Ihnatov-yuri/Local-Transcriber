@@ -16,6 +16,8 @@ data class Recording(
     val transcribedWithBackend: String? = null,
     val transcribedWithModel: String? = null,
     val translateToEnglish: Boolean = false,
+    /** [nl.ihnatov.transcriber.asr.RecordingCategory.id], set by [nl.ihnatov.transcriber.asr.Gemma4Backend.suggestCategory] after transcription. Null until classified (or if classification failed/was skipped). */
+    val category: String? = null,
 )
 
 @Entity(
