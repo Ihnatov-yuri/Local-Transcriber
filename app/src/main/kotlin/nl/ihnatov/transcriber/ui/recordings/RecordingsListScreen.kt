@@ -2,11 +2,15 @@ package nl.ihnatov.transcriber.ui.recordings
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -20,9 +24,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,7 +52,9 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.launch
 import nl.ihnatov.transcriber.asr.TranscriptionJobManager
 import nl.ihnatov.transcriber.data.AppContainer
+import nl.ihnatov.transcriber.data.FolderWithCount
 import nl.ihnatov.transcriber.data.Recording
+import nl.ihnatov.transcriber.data.TagWithCount
 import nl.ihnatov.transcriber.ui.components.BigNumber
 import nl.ihnatov.transcriber.ui.components.BrandStrip
 import nl.ihnatov.transcriber.ui.components.Hairline
@@ -85,18 +96,25 @@ fun RecordingsListScreen(
     onOpen: (Long) -> Unit,
     onStartRecording: (() -> Unit)? = null,
 ) {
-    // Search query state — flatMapLatest swaps between the full
-    // observeAll() flow and the search() flow as the user types.
+    // Folder, tag, and search are independently-settable, AND-combined
+    // filters (see RecordingRepository.observeLibrary) — selecting a
+    // folder chip or a tag doesn't replace the search, it narrows it
+    // further, matching the Mac app's own progressive-narrowing Library.
     var query by remember { mutableStateOf("") }
     val source = remember { MutableStateFlow("") }
-    val recordings by remember(container) {
-        source.flatMapLatest { q ->
-            if (q.isBlank()) container.repository.observeAll()
-            else container.repository.search(q)
-        }
+    var selectedFolderId by remember { mutableStateOf<Long?>(null) }
+    var selectedTagId by remember { mutableStateOf<Long?>(null) }
+    val recordings by remember(container, selectedFolderId, selectedTagId) {
+        source.flatMapLatest { q -> container.repository.observeLibrary(selectedFolderId, selectedTagId, q) }
     }.collectAsStateWithLifecycle(initialValue = emptyList())
     androidx.compose.runtime.LaunchedEffect(query) { source.value = query }
     val jobStatuses by container.transcriptionJobManager.statuses.collectAsStateWithLifecycle()
+    val folders by container.repository.observeFoldersWithCounts()
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val tags by container.repository.observeTagsWithCounts()
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    var newFolderPrompt by remember { mutableStateOf(false) }
+    var folderError by remember { mutableStateOf<String?>(null) }
 
     val scope = rememberCoroutineScope()
     val importLauncher = rememberLauncherForActivityResult(
@@ -149,6 +167,32 @@ fun RecordingsListScreen(
                 onImport = { importLauncher.launch(arrayOf("audio/*")) },
             )
             Spacer(Modifier.height(8.dp))
+            // Folder (chip strip, single-select) and tag (compact dropdown,
+            // single-select even though tags are many-to-many on a
+            // recording) filters — same split the Mac app makes: a chip
+            // per folder reads fine since there are usually a handful, but
+            // a chip-wrap of every tag would crowd this narrow column.
+            FolderChipStrip(
+                folders = folders,
+                selectedFolderId = selectedFolderId,
+                onSelect = { selectedFolderId = it },
+                onNewFolder = { folderError = null; newFolderPrompt = true },
+                onRename = { folder, name ->
+                    scope.launch {
+                        folderError = runCatching { container.repository.renameFolder(folder.folder, name) }
+                            .exceptionOrNull()?.message
+                    }
+                },
+                onDelete = { folder ->
+                    if (selectedFolderId == folder.folder.id) selectedFolderId = null
+                    scope.launch { container.repository.deleteFolder(folder.folder) }
+                },
+            )
+            if (tags.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                TagFilterRow(tags = tags, selectedTagId = selectedTagId, onSelect = { selectedTagId = it })
+            }
+            Spacer(Modifier.height(4.dp))
             SearchField(query) { query = it }
             Spacer(Modifier.height(6.dp))
             // List + inverse footer share the remaining vertical space.
@@ -166,7 +210,12 @@ fun RecordingsListScreen(
                             RecordingRow(
                                 rec,
                                 job = jobStatuses[rec.id],
+                                folderName = rec.folderId?.let { fid -> folders.find { it.folder.id == fid }?.folder?.name },
+                                allFolders = folders,
                                 onClick = { onOpen(rec.id) },
+                                onMoveToFolder = { folderId ->
+                                    scope.launch { container.repository.moveToFolder(rec, folderId) }
+                                },
                             )
                         }
                     }
@@ -184,6 +233,19 @@ fun RecordingsListScreen(
             ) {
                 LibraryFooter(onStartRecording)
             }
+        }
+        if (newFolderPrompt) {
+            NewFolderDialog(
+                error = folderError,
+                onDismiss = { newFolderPrompt = false; folderError = null },
+                onConfirm = { name ->
+                    scope.launch {
+                        val result = runCatching { container.repository.createFolder(name) }
+                        result.onSuccess { newFolderPrompt = false; folderError = null }
+                        result.onFailure { folderError = it.message }
+                    }
+                },
+            )
         }
     }
 }
@@ -327,6 +389,175 @@ private fun SearchField(query: String, onChange: (String) -> Unit) {
     }
 }
 
+/**
+ * ALL · one chip per folder ("NAME (count)") · + NEW. Single-select filter
+ * (matches the Mac's `FolderStrip` — `selectedFolderID` is a single value,
+ * not a set), long-press a folder chip for rename/delete.
+ */
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
+@Composable
+private fun FolderChipStrip(
+    folders: List<FolderWithCount>,
+    selectedFolderId: Long?,
+    onSelect: (Long?) -> Unit,
+    onNewFolder: () -> Unit,
+    onRename: (FolderWithCount, String) -> Unit,
+    onDelete: (FolderWithCount) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var renameTarget by remember { mutableStateOf<FolderWithCount?>(null) }
+    var renameDraft by remember { mutableStateOf("") }
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        chipFilter(label = "ALL", selected = selectedFolderId == null, onClick = { onSelect(null) })
+        for (f in folders) {
+            var menuOpen by remember(f.folder.id) { mutableStateOf(false) }
+            Box {
+                Mono(
+                    "${f.folder.name.uppercase()} (${f.recordingCount})",
+                    color = if (selectedFolderId == f.folder.id) Accent else ink.copy(alpha = 0.62f),
+                    modifier = Modifier
+                        .combinedClickable(
+                            onClick = { onSelect(f.folder.id) },
+                            onLongClick = { menuOpen = true },
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+                DropdownMenu(
+                    expanded = menuOpen,
+                    onDismissRequest = { menuOpen = false },
+                    containerColor = MaterialTheme.colorScheme.background,
+                ) {
+                    DropdownMenuItem(
+                        text = { Mono("RENAME…", color = ink) },
+                        onClick = { menuOpen = false; renameDraft = f.folder.name; renameTarget = f },
+                    )
+                    DropdownMenuItem(
+                        text = { Mono("DELETE FOLDER", color = Accent) },
+                        onClick = { menuOpen = false; onDelete(f) },
+                    )
+                }
+            }
+        }
+        Mono(
+            "+ NEW",
+            color = ink.copy(alpha = 0.45f),
+            modifier = Modifier.clickable(onClick = onNewFolder).padding(horizontal = 8.dp, vertical = 4.dp),
+        )
+    }
+    renameTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            containerColor = MaterialTheme.colorScheme.background,
+            title = { Mono("RENAME FOLDER", color = ink) },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onRename(target, renameDraft)
+                    renameTarget = null
+                }) { Mono("SAVE") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Mono("CANCEL") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun chipFilter(label: String, selected: Boolean, onClick: () -> Unit) {
+    Mono(
+        label,
+        color = if (selected) Accent else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.62f),
+        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 4.dp),
+    )
+}
+
+/**
+ * Compact "TAG: name ▾" dropdown — deliberately not a chip row. The Mac
+ * app's own comment explains why: a chip per tag would crowd the list
+ * column the way a chip per folder doesn't (there are usually far more
+ * tags than folders). Single-select, even though a recording can carry
+ * several tags at once — this only narrows the Library, it doesn't edit
+ * anything (tag editing lives on the Detail screen).
+ */
+@Composable
+private fun TagFilterRow(
+    tags: List<TagWithCount>,
+    selectedTagId: Long?,
+    onSelect: (Long?) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var menuOpen by remember { mutableStateOf(false) }
+    val selectedName = tags.find { it.tag.id == selectedTagId }?.tag?.name ?: "ALL"
+    Box {
+        Mono(
+            "TAG: ${selectedName.uppercase()} ▾",
+            color = if (selectedTagId == null) ink.copy(alpha = 0.55f) else Accent,
+            modifier = Modifier.clickable { menuOpen = true }.padding(vertical = 4.dp),
+        )
+        DropdownMenu(
+            expanded = menuOpen,
+            onDismissRequest = { menuOpen = false },
+            containerColor = MaterialTheme.colorScheme.background,
+        ) {
+            DropdownMenuItem(
+                text = { Mono("ALL", color = ink) },
+                onClick = { menuOpen = false; onSelect(null) },
+            )
+            for (t in tags) {
+                DropdownMenuItem(
+                    text = { Text("${t.tag.name} (${t.recordingCount})") },
+                    onClick = { menuOpen = false; onSelect(t.tag.id) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewFolderDialog(
+    error: String?,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        title = { Mono("NEW FOLDER", color = MaterialTheme.colorScheme.onBackground) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    singleLine = true,
+                    placeholder = { Text("Folder name") },
+                )
+                if (error != null) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(error, color = Accent, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(draft) }) { Mono("CREATE") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Mono("CANCEL") }
+        },
+    )
+}
+
 @Composable
 private fun EmptyState(query: String) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -340,16 +571,47 @@ private fun EmptyState(query: String) {
 }
 
 @Composable
-private fun RecordingRow(rec: Recording, job: TranscriptionJobManager.JobStatus?, onClick: () -> Unit) {
+private fun RecordingRow(
+    rec: Recording,
+    job: TranscriptionJobManager.JobStatus?,
+    folderName: String?,
+    allFolders: List<FolderWithCount>,
+    onClick: () -> Unit,
+    onMoveToFolder: (Long?) -> Unit,
+) {
     val ink = MaterialTheme.colorScheme.onBackground
     val isToday = isToday(rec.createdAtMillis)
+    var moveMenuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { moveMenuOpen = true },
+            )
             .padding(vertical = 13.dp),
         verticalAlignment = Alignment.Top,
     ) {
+        DropdownMenu(
+            expanded = moveMenuOpen,
+            onDismissRequest = { moveMenuOpen = false },
+            containerColor = MaterialTheme.colorScheme.background,
+        ) {
+            // Mirrors the Mac's "Move to Folder…" context-menu submenu:
+            // every OTHER folder, plus "Remove from Folder" when filed.
+            for (f in allFolders.filter { it.folder.id != rec.folderId }) {
+                DropdownMenuItem(
+                    text = { Text(f.folder.name) },
+                    onClick = { moveMenuOpen = false; onMoveToFolder(f.folder.id) },
+                )
+            }
+            if (rec.folderId != null) {
+                DropdownMenuItem(
+                    text = { Mono("REMOVE FROM FOLDER", color = Accent) },
+                    onClick = { moveMenuOpen = false; onMoveToFolder(null) },
+                )
+            }
+        }
         // Date column (54 dp). Time stamp ink + day mono-caps soft.
         Column(Modifier.width(54.dp)) {
             Text(
@@ -380,6 +642,14 @@ private fun RecordingRow(rec: Recording, job: TranscriptionJobManager.JobStatus?
             )
             Spacer(Modifier.height(3.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
+                folderName?.let {
+                    Mono("▸ ${it.uppercase()}", color = Accent, style = MaterialTheme.typography.labelSmall)
+                    Mono(
+                        " · ",
+                        color = ink.copy(alpha = 0.30f),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
                 rec.sourceLanguage?.takeIf { it.isNotBlank() }?.let {
                     Mono(it, color = ink.copy(alpha = 0.55f), style = MaterialTheme.typography.labelSmall)
                     Mono(

@@ -16,9 +16,11 @@ import nl.ihnatov.transcriber.asr.PostProcessor
 import nl.ihnatov.transcriber.asr.PostProcessingPreset
 import nl.ihnatov.transcriber.asr.TranscriptionJobManager
 import nl.ihnatov.transcriber.data.AppContainer
+import nl.ihnatov.transcriber.data.Folder
 import nl.ihnatov.transcriber.data.OutputDoc
 import nl.ihnatov.transcriber.data.Recording
 import nl.ihnatov.transcriber.data.Segment
+import nl.ihnatov.transcriber.data.Tag
 import nl.ihnatov.transcriber.data.TranscriptVersion
 
 class RecordingDetailViewModel(
@@ -58,6 +60,10 @@ class RecordingDetailViewModel(
         val presetStatus: Map<String, PresetStatus> = emptyMap(),
         /** Past transcript snapshots, newest first — see [nl.ihnatov.transcriber.data.RecordingRepository.observeVersions]. */
         val versions: List<TranscriptVersion> = emptyList(),
+        /** Every folder that exists — for the "FOLDER: X ▾" dropdown's choices. */
+        val allFolders: List<Folder> = emptyList(),
+        /** This recording's own tags. */
+        val tags: List<Tag> = emptyList(),
     ) {
         val running get() = job.running
         val stageLabel get() = job.stageLabel
@@ -84,12 +90,18 @@ class RecordingDetailViewModel(
         }
     private val presetStatuses = MutableStateFlow<Map<String, PresetStatus>>(emptyMap())
 
-    /** Bundle of the four lower-frequency flows so the outer combine stays under 5 args. */
+    /** Bundle of four lower-frequency flows so the outer combine's own arity stays manageable. */
     private data class DocPack(
         val outputs: List<OutputDoc>,
         val presets: List<PostProcessingPreset>,
         val statuses: Map<String, PresetStatus>,
         val versions: List<TranscriptVersion>,
+    )
+
+    /** Folder/tag data (Phase 6) bundled the same way — a second nested pair rather than growing the outer combine past 5 args. */
+    private data class OrganizePack(
+        val allFolders: List<Folder>,
+        val tags: List<Tag>,
     )
 
     val ui: StateFlow<UiState> = combine(
@@ -102,8 +114,13 @@ class RecordingDetailViewModel(
             container.repository.observeVersions(recordingId),
             ::DocPack,
         ),
+        combine(
+            container.repository.observeFolders(),
+            container.repository.observeTagsForRecording(recordingId),
+            ::OrganizePack,
+        ),
         job,
-    ) { rec, segs, docPack, j ->
+    ) { rec, segs, docPack, organizePack, j ->
         UiState(
             recording = rec,
             segments = segs,
@@ -112,6 +129,8 @@ class RecordingDetailViewModel(
             job = j,
             presetStatus = docPack.statuses,
             versions = docPack.versions,
+            allFolders = organizePack.allFolders,
+            tags = organizePack.tags,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
@@ -246,6 +265,24 @@ class RecordingDetailViewModel(
 
     fun deleteVersion(id: Long) {
         viewModelScope.launch { container.repository.deleteVersion(id) }
+    }
+
+    /** null = remove from its folder. Mirrors the Mac's inline "FOLDER: X ▾" dropdown. */
+    fun moveToFolder(folderId: Long?) {
+        viewModelScope.launch {
+            val rec = ui.value.recording ?: return@launch
+            container.repository.moveToFolder(rec, folderId)
+        }
+    }
+
+    /** Find-or-create by name, attach to this recording. Mirrors the Mac's inline tag editor (commits on Return/comma in the UI). */
+    fun addTag(name: String) {
+        viewModelScope.launch { container.repository.addTag(name, recordingId) }
+    }
+
+    /** Detaches the tag; the Tag row itself is pruned by the repository if this was its last usage. */
+    fun removeTag(tagId: Long) {
+        viewModelScope.launch { container.repository.removeTag(tagId, recordingId) }
     }
 
     private fun updateStatus(

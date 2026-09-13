@@ -8,8 +8,11 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [Recording::class, Segment::class, OutputDoc::class, PendingTask::class, TranscriptVersion::class],
-    version = 5,
+    entities = [
+        Recording::class, Segment::class, OutputDoc::class, PendingTask::class, TranscriptVersion::class,
+        Folder::class, Tag::class, RecordingTagCrossRef::class,
+    ],
+    version = 6,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -18,6 +21,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun outputs(): OutputDao
     abstract fun pendingTasks(): PendingTaskDao
     abstract fun transcriptVersions(): TranscriptVersionDao
+    abstract fun folders(): FolderDao
+    abstract fun tags(): TagDao
 
     companion object {
         /**
@@ -64,13 +69,64 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Phase 6: folders and tags. Adds `recordings.folderId` (plain
+         * nullable column, no FK constraint — SQLite can't add one to an
+         * existing populated table without a full recreate-copy-drop
+         * dance, and every folder-delete path already goes through
+         * [FolderDao.delete], which unfiles recordings itself before
+         * dropping the row; a DB-level constraint would be redundant
+         * belt-and-suspenders here, not a correctness requirement), plus
+         * the new `folders`/`tags`/`recording_tag_cross_ref` tables. The
+         * cross-ref table DOES get real foreign keys (cascade both ways)
+         * since it's brand new — nothing existing to migrate around.
+         */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `recordings` ADD COLUMN `folderId` INTEGER DEFAULT NULL")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `folders` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `name` TEXT NOT NULL,
+                        `sortOrder` INTEGER NOT NULL,
+                        `createdAtMillis` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `tags` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `name` TEXT NOT NULL,
+                        `createdAtMillis` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `recording_tag_cross_ref` (
+                        `recordingId` INTEGER NOT NULL,
+                        `tagId` INTEGER NOT NULL,
+                        PRIMARY KEY(`recordingId`, `tagId`),
+                        FOREIGN KEY(`recordingId`) REFERENCES `recordings`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(`tagId`) REFERENCES `tags`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_recording_tag_cross_ref_tagId` ON `recording_tag_cross_ref` (`tagId`)"
+                )
+            }
+        }
+
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(
                 context.applicationContext,
                 AppDatabase::class.java,
                 "transcriber.db",
             )
-                .addMigrations(MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .build()
     }
 }

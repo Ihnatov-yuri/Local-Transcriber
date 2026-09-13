@@ -8,6 +8,7 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
 class RecordingRepository(
@@ -16,22 +17,26 @@ class RecordingRepository(
     private val segments: SegmentDao,
     private val outputs: OutputDao,
     private val versions: TranscriptVersionDao,
+    private val folders: FolderDao,
+    private val tags: TagDao,
 ) {
 
-    fun observeAll(): Flow<List<Recording>> = recordings.observeAll()
-
     /**
-     * Search recordings by free-text query. Matches against title and any
-     * segment text (substring, case-insensitive on SQLite's default
-     * collation). Empty/blank query returns [observeAll]'s full list.
+     * The Library list's one query: [folderId], [tagId], and [query] are
+     * independently-settable, AND-combined filters — pass null/blank to
+     * skip a filter. Mirrors the Mac app's own progressive-narrowing
+     * `filtered` computed property (folder → tag → search), so applying
+     * folder and tag filters together with a search term behaves exactly
+     * like the Mac: each just narrows further, none of them are
+     * exclusive modes.
      *
      * Escapes the SQL LIKE wildcards (% and _) and our escape char (\)
-     * inside the query so a search for "100%" doesn't match everything.
+     * inside [query] so a search for "100%" doesn't match everything.
      */
-    fun search(query: String): Flow<List<Recording>> {
+    fun observeLibrary(folderId: Long? = null, tagId: Long? = null, query: String = ""): Flow<List<Recording>> {
         val trimmed = query.trim()
-        if (trimmed.isEmpty()) return observeAll()
-        return recordings.search("%${escapeLikePattern(trimmed)}%")
+        val pattern = if (trimmed.isEmpty()) null else "%${escapeLikePattern(trimmed)}%"
+        return recordings.observeFiltered(folderId, tagId, pattern)
     }
 
     fun observe(id: Long): Flow<Recording?> = recordings.observe(id)
@@ -203,6 +208,85 @@ class RecordingRepository(
     }
 
     suspend fun deleteVersion(id: Long) = versions.delete(id)
+
+    // ---- Folders (Phase 6) ----
+    // A recording lives in at most one folder. Name uniqueness is enforced
+    // here, case-insensitively, not via a DB constraint — same reasoning
+    // as the Mac's own Folder/Tag comment: a UNIQUE column would turn a
+    // duplicate insert into a silent upsert instead of a rejected one.
+
+    class EmptyNameException : Exception("Name cannot be empty.")
+    class DuplicateNameException(name: String) : Exception("'$name' already exists.")
+
+    fun observeFoldersWithCounts(): Flow<List<FolderWithCount>> = folders.observeAllWithCounts()
+
+    /** Plain folder list (no counts) — the Detail screen's "FOLDER: X ▾" dropdown just needs names to choose from. */
+    fun observeFolders(): Flow<List<Folder>> = folders.observeAllWithCounts().map { list -> list.map { it.folder } }
+
+    suspend fun createFolder(name: String): Folder {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) throw EmptyNameException()
+        if (folders.findByName(trimmed) != null) throw DuplicateNameException(trimmed)
+        val existing = folders.listAll()
+        val folder = Folder(
+            name = trimmed,
+            sortOrder = (existing.maxOfOrNull { it.sortOrder } ?: -1) + 1,
+            createdAtMillis = System.currentTimeMillis(),
+        )
+        return folder.copy(id = folders.insert(folder))
+    }
+
+    suspend fun renameFolder(folder: Folder, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) throw EmptyNameException()
+        val existing = folders.findByName(trimmed)
+        if (existing != null && existing.id != folder.id) throw DuplicateNameException(trimmed)
+        folders.update(folder.copy(name = trimmed))
+    }
+
+    /** Recordings in [folder] survive — they're unfiled, never deleted (matches the Mac's `.nullify` delete rule). */
+    suspend fun deleteFolder(folder: Folder) = folders.delete(folder.id)
+
+    /** null = remove from its folder. */
+    suspend fun moveToFolder(recording: Recording, folderId: Long?) =
+        recordings.update(recording.copy(folderId = folderId))
+
+    // ---- Tags (Phase 6) ----
+    // Many-to-many with Recording. Tags have no independent lifecycle or
+    // "delete tag" action — a Tag row disappears automatically once its
+    // last usage is removed (see removeTag), same as the Mac.
+
+    fun observeTagsWithCounts(): Flow<List<TagWithCount>> = tags.observeAllWithCounts()
+
+    fun observeTagsForRecording(recordingId: Long): Flow<List<Tag>> = tags.observeForRecording(recordingId)
+
+    /** Find-or-create by trimmed, case-insensitive name; no-op if already applied. */
+    suspend fun addTag(name: String, recordingId: Long): Tag? {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return null
+        val tag = tags.findByName(trimmed) ?: run {
+            val new = Tag(name = trimmed, createdAtMillis = System.currentTimeMillis())
+            new.copy(id = tags.insert(new))
+        }
+        tags.attach(recordingId, tag.id)
+        return tag
+    }
+
+    /** Removes the tag from this recording; deletes the Tag row entirely if that was its last usage. */
+    suspend fun removeTag(tagId: Long, recordingId: Long) = tags.detachAndPruneIfOrphaned(recordingId, tagId)
+
+    /**
+     * Diff-based bulk edit: after this call, [recordingId] carries exactly
+     * [names] (each found-or-created); anything it carried before that
+     * isn't in [names] is removed (and pruned if that orphans it).
+     */
+    suspend fun setTags(names: List<String>, recordingId: Long) {
+        val wanted = names.map { it.trim() }.filter { it.isNotEmpty() }
+        val current = tags.listForRecording(recordingId)
+        val stale = current.filter { tag -> wanted.none { it.equals(tag.name, ignoreCase = true) } }
+        for (tag in stale) removeTag(tag.id, recordingId)
+        for (name in wanted) addTag(name, recordingId)
+    }
 
     /** Observe all post-processing outputs for a recording (in creation order). */
     fun observeOutputs(recordingId: Long): Flow<List<OutputDoc>> = outputs.observe(recordingId)

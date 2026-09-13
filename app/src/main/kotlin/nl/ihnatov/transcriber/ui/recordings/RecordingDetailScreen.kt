@@ -8,6 +8,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -39,6 +42,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -55,8 +59,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -64,6 +70,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -76,6 +83,8 @@ import nl.ihnatov.transcriber.asr.defaultEngineFor
 import nl.ihnatov.transcriber.audio.AudioPlayerController
 import nl.ihnatov.transcriber.audio.WaveformLoader
 import nl.ihnatov.transcriber.data.AppContainer
+import nl.ihnatov.transcriber.data.Folder
+import nl.ihnatov.transcriber.data.Tag
 import nl.ihnatov.transcriber.ui.KeepScreenOn
 import nl.ihnatov.transcriber.ui.MarkdownText
 import nl.ihnatov.transcriber.ui.components.Hairline
@@ -306,6 +315,17 @@ fun RecordingDetailScreen(
                     rec = ui.recording,
                     segmentCount = ui.segments.size,
                     speakerCount = speakerKeys.size,
+                )
+                Spacer(Modifier.height(8.dp))
+                HairlineSoft()
+                Spacer(Modifier.height(8.dp))
+                OrganizeRow(
+                    currentFolderId = ui.recording?.folderId,
+                    allFolders = ui.allFolders,
+                    tags = ui.tags,
+                    onMoveToFolder = vm::moveToFolder,
+                    onAddTag = vm::addTag,
+                    onRemoveTag = vm::removeTag,
                 )
                 Spacer(Modifier.height(8.dp))
                 HairlineSoft()
@@ -718,6 +738,154 @@ private fun MetadataStrip(
         if (segmentCount > 0) {
             Mono("$segmentCount TURNS", color = ink.copy(alpha = 0.62f))
         }
+    }
+}
+
+/**
+ * Folder dropdown + tag editor, side by side — mirrors the Mac's
+ * `organizeRow()` (`HStack { folderMenu(); TagEditorRow(...) }`).
+ */
+@Composable
+private fun OrganizeRow(
+    currentFolderId: Long?,
+    allFolders: List<Folder>,
+    tags: List<Tag>,
+    onMoveToFolder: (Long?) -> Unit,
+    onAddTag: (String) -> Unit,
+    onRemoveTag: (Long) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.Top) {
+        FolderMenu(currentFolderId = currentFolderId, allFolders = allFolders, onMoveToFolder = onMoveToFolder)
+        Spacer(Modifier.width(Spacing.m))
+        TagEditorRow(
+            tags = tags,
+            onAddTag = onAddTag,
+            onRemoveTag = onRemoveTag,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** "FOLDER: NAME ▾" — every other folder, plus "Remove from Folder" when filed. Mirrors the Mac's `folderMenu()`. */
+@Composable
+private fun FolderMenu(
+    currentFolderId: Long?,
+    allFolders: List<Folder>,
+    onMoveToFolder: (Long?) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var menuOpen by remember { mutableStateOf(false) }
+    val currentName = allFolders.find { it.id == currentFolderId }?.name
+    Box {
+        Mono(
+            "FOLDER: ${currentName?.uppercase() ?: "—"} ▾",
+            color = if (currentFolderId == null) ink.copy(alpha = 0.62f) else Accent,
+            modifier = Modifier.clickable { menuOpen = true }.padding(vertical = 4.dp),
+        )
+        DropdownMenu(
+            expanded = menuOpen,
+            onDismissRequest = { menuOpen = false },
+            containerColor = MaterialTheme.colorScheme.background,
+        ) {
+            for (f in allFolders.filter { it.id != currentFolderId }) {
+                DropdownMenuItem(
+                    text = { Text(f.name) },
+                    onClick = { menuOpen = false; onMoveToFolder(f.id) },
+                )
+            }
+            if (currentFolderId != null) {
+                DropdownMenuItem(
+                    text = { Mono("REMOVE FROM FOLDER", color = Accent) },
+                    onClick = { menuOpen = false; onMoveToFolder(null) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Current tags as removable chips (✕, bottom hairline like the Mac's
+ * underlined chip) plus an inline "add tag…" field that commits on
+ * Enter or a trailing comma. Mirrors the Mac's `TagEditorRow`.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TagEditorRow(
+    tags: List<Tag>,
+    onAddTag: (String) -> Unit,
+    onRemoveTag: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var draft by remember { mutableStateOf("") }
+    fun commitDraft() {
+        val name = draft.trim()
+        draft = ""
+        if (name.isNotEmpty()) onAddTag(name)
+    }
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = modifier,
+    ) {
+        Mono("TAGS", color = ink.copy(alpha = 0.40f), modifier = Modifier.padding(vertical = 4.dp))
+        for (tag in tags.sortedBy { it.name }) {
+            Box {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                ) {
+                    Mono(tag.name, color = ink)
+                    Spacer(Modifier.width(5.dp))
+                    Mono(
+                        "✕",
+                        color = ink.copy(alpha = 0.40f),
+                        modifier = Modifier.clickable { onRemoveTag(tag.id) },
+                    )
+                }
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .drawBehind {
+                            drawLine(
+                                color = ink.copy(alpha = 0.16f),
+                                start = Offset(0f, size.height),
+                                end = Offset(size.width, size.height),
+                                strokeWidth = 1.dp.toPx(),
+                            )
+                        },
+                )
+            }
+        }
+        BasicTextField(
+            value = draft,
+            onValueChange = { value ->
+                if (value.endsWith(",")) {
+                    draft = value.removeSuffix(",")
+                    commitDraft()
+                } else {
+                    draft = value
+                }
+            },
+            singleLine = true,
+            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = ink),
+            cursorBrush = SolidColor(Accent),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { commitDraft() }),
+            modifier = Modifier.width(90.dp).padding(vertical = 4.dp),
+            decorationBox = { inner ->
+                Box {
+                    if (draft.isEmpty()) {
+                        Text(
+                            "add tag…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ink.copy(alpha = 0.40f),
+                        )
+                    }
+                    inner()
+                }
+            },
+        )
     }
 }
 

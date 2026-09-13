@@ -18,6 +18,8 @@ data class Recording(
     val translateToEnglish: Boolean = false,
     /** [nl.ihnatov.transcriber.asr.RecordingCategory.id], set by [nl.ihnatov.transcriber.asr.Gemma4Backend.suggestCategory] after transcription. Null until classified (or if classification failed/was skipped). */
     val category: String? = null,
+    /** A recording lives in at most one [Folder]; null = unfiled. No cascade — deleting a Folder nullifies this instead (see MIGRATION_5_6). */
+    val folderId: Long? = null,
 )
 
 @Entity(

@@ -52,6 +52,8 @@ class AppContainer(private val appContext: Context) {
             segments = database.segments(),
             outputs = database.outputs(),
             versions = database.transcriptVersions(),
+            folders = database.folders(),
+            tags = database.tags(),
         )
     }
 
