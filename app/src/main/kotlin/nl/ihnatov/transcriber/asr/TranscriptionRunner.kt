@@ -105,11 +105,24 @@ private const val CHUNK_ALIGN_MIN_SILENCE_MS = 250
 /** RMS threshold below which we consider a 25 ms window silent (~ -46 dBFS). */
 private const val CHUNK_ALIGN_RMS_THRESHOLD = 0.005f
 
+/**
+ * Target chunk length for Whisper's VAD-aligned long-file chunking (Phase
+ * 5's OOM fix). Bigger than Gemma's [Gemma4Backend.CHUNK_SECONDS] on
+ * purpose — whisper.cpp has none of Gemma's prompt-length/wedge pressure,
+ * so fewer, larger chunks mean less per-call overhead while still bounding
+ * peak memory far below a multi-hour file's full-buffer size.
+ */
+private const val WHISPER_CHUNK_TARGET_SECONDS = 60.0
+
+/** Below this, a single full-buffer decode+transcribe (today's shape) has no real OOM risk — not worth the chunking overhead. */
+private const val WHISPER_CHUNK_THRESHOLD_SECONDS = 90.0
+
 class TranscriptionRunner(
     private val context: Context,
     private val repository: RecordingRepository,
     private val factory: AsrFactory,
     private val diarizer: DiarizationRunner,
+    private val uiPrefs: UiPrefs? = null,
 ) {
 
     fun run(
@@ -143,6 +156,12 @@ class TranscriptionRunner(
          * isn't Gemma.
          */
         hybridDiarize: Boolean = false,
+        /** Super mode (Phase 3): run [superPairA] + [superPairB] and vote-merge instead of just [backend]. */
+        superMode: Boolean = false,
+        superPairA: AsrBackendKind? = null,
+        superPairB: AsrBackendKind? = null,
+        /** Constrained-JSON arbitration second pass on low-agreement Super chunks. Meaningless unless [superMode]. */
+        maxQuality: Boolean = false,
     ): Flow<AsrEvent> = channelFlow {
         // Why channelFlow not flow {}: the chunk loop launches a sibling
         // "poller" coroutine that surfaces Gemma's per-token partial text
@@ -156,6 +175,13 @@ class TranscriptionRunner(
         // string. Promote the list: single → force, multi → resolve at-detect
         // time, empty → null.
         val primaryLanguage = languages.singleOrNull()
+        val runSuper = superMode && superPairA != null && superPairB != null && superPairA != superPairB
+        // Engines that can't translate (the sherpa-onnx ones, and a Super
+        // pair — its two halves would disagree) get no target at all;
+        // otherwise the output would be stamped with a language it isn't
+        // in. Shadows the parameter on purpose so every later use sees it.
+        @Suppress("NAME_SHADOWING")
+        val translateTo = translateTo?.takeIf { !runSuper && backend.supportsTranslation }
         val recording = repository.get(recordingId)
         if (recording == null) {
             send(AsrEvent.Failed("Recording $recordingId not found"))
@@ -170,30 +196,99 @@ class TranscriptionRunner(
             return@channelFlow
         }
 
-        val modelFile = factory.resolveModel(backend)
-        if (modelFile == null) {
-            val dir = factory.modelsDir()
-            val expected = factory.expectedExtensionsHint(backend)
-            val existing = runCatching { dir.listFiles()?.map { it.name } ?: emptyList() }
-                .getOrDefault(emptyList())
-            val listing = if (existing.isEmpty()) "(empty)" else existing.joinToString(", ")
-            send(AsrEvent.Failed(
-                "No model file for ${backend.name}.\n" +
-                    "Expected: $expected\n" +
-                    "Found in ${dir.absolutePath}: $listing\n" +
-                    "Use Settings → Import model to add one."
-            ))
-            return@channelFlow
+        // Diarization tuning: Settings override wins, else the language-
+        // aware / Mac-ported default. See DiarizationRunner.DEFAULT_* and
+        // UiPrefs' diar_* / turn_coalesce_gap_sec keys.
+        val clusterThreshold = uiPrefs?.clusterThreshold?.value
+            ?: DiarizationRunner.defaultClusterThreshold(languages)
+        val minDurationOn = uiPrefs?.minDurationOnSec?.value ?: DiarizationRunner.DEFAULT_MIN_DURATION_ON
+        val minDurationOff = uiPrefs?.minDurationOffSec?.value ?: DiarizationRunner.DEFAULT_MIN_DURATION_OFF
+        val turnCoalesceGapSec = (uiPrefs?.turnCoalesceGapSec?.value ?: DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()).toDouble()
+
+        // Gemma 4 E4B needs the memory guard whether it's the sole backend
+        // or one half of a Super pair — check by NAME so it applies to
+        // whichever Gemma variant AsrFactory would actually resolve.
+        suspend fun checkGemmaE4BMemory(): AsrEvent.Failed? {
+            val gemmaModel = factory.resolveModel(AsrBackendKind.Gemma4) ?: return null
+            if (!gemmaModel.name.contains("E4B", ignoreCase = true)) return null
+            val budget = MemoryGuard.estimateBudget(context)
+            if (budget.estimatedBudgetBytes >= MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES) return null
+            val have = MemoryGuard.gibString(budget.estimatedBudgetBytes)
+            val need = MemoryGuard.gibString(MemoryGuard.GEMMA_E4B_MIN_BUDGET_BYTES)
+            val why = if (budget.isLimiterEstimate) {
+                " (Android's background memory limiter caps this app around ${have} GB)"
+            } else {
+                " (only ${have} GB free right now)"
+            }
+            return AsrEvent.Failed(
+                "Gemma 4 E4B needs about $need GB of memory headroom$why. " +
+                    "Try Gemma 4 E2B instead, or close other apps and retry."
+            )
         }
 
-        val asr = factory.create(backend)
-        send(AsrEvent.Stage("Loading model", 0.05f))
-        val loadRes = asr.load(modelFile.absolutePath)
-        if (loadRes.isFailure) {
-            send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "model load failed"))
-            asr.release()
-            return@channelFlow
+        val modelFile: File
+        val asr: AsrBackend
+        if (runSuper) {
+            if ((superPairA == AsrBackendKind.Gemma4 || superPairB == AsrBackendKind.Gemma4)) {
+                checkGemmaE4BMemory()?.let { send(it); return@channelFlow }
+            }
+            // No single model FILE for Super mode — EnsembleBackend resolves
+            // each sub-engine's own model internally. This placeholder path
+            // is never read from disk, only used for logging/display
+            // (transcribedWithModel) the same way a real model's name is.
+            modelFile = File(factory.modelsDir(), "super-${superPairA.name.lowercase()}-${superPairB.name.lowercase()}")
+            asr = EnsembleBackend(superPairA!!, superPairB!!, factory, arbitrationEnabled = maxQuality, languages = languages)
+            send(AsrEvent.Stage("Loading Super mode engines", 0.05f))
+            val loadRes = asr.load(modelFile.absolutePath)
+            if (loadRes.isFailure) {
+                send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "Super mode engines failed to load"))
+                asr.release()
+                return@channelFlow
+            }
+        } else {
+            val resolved = factory.resolveModel(backend, languages)
+            if (resolved == null) {
+                val dir = factory.modelsDir()
+                val expected = factory.expectedExtensionsHint(backend)
+                val existing = runCatching { dir.listFiles()?.map { it.name } ?: emptyList() }
+                    .getOrDefault(emptyList())
+                val listing = if (existing.isEmpty()) "(empty)" else existing.joinToString(", ")
+                send(AsrEvent.Failed(
+                    "No model file for ${backend.name}.\n" +
+                        "Expected: $expected\n" +
+                        "Found in ${dir.absolutePath}: $listing\n" +
+                        "Use Settings → Import model to add one."
+                ))
+                return@channelFlow
+            }
+            modelFile = resolved
+            if (backend == AsrBackendKind.Gemma4) {
+                checkGemmaE4BMemory()?.let { send(it); return@channelFlow }
+            }
+            asr = factory.create(backend)
+            send(AsrEvent.Stage("Loading model", 0.05f))
+            val loadRes = asr.load(modelFile.absolutePath)
+            if (loadRes.isFailure) {
+                send(AsrEvent.Failed(loadRes.exceptionOrNull()?.message ?: "model load failed"))
+                asr.release()
+                return@channelFlow
+            }
         }
+
+        // Snapshot whatever transcript already exists BEFORE this run
+        // overwrites it — once per run, not once per incremental save (the
+        // Gemma streaming loop calls replaceSegments many times per chunk),
+        // and only now that pre-flight (models present, engine loaded) has
+        // passed: a run that fails before touching the transcript must not
+        // leave a duplicate version behind. Labeled with whichever engine
+        // actually PRODUCED those existing segments
+        // (recording.transcribedWithBackend/Model — set at the end of the
+        // PREVIOUS run, see below), not the one about to run; a no-op when
+        // there's nothing to snapshot yet (first-ever run).
+        val snapshotEngineId = recording.transcribedWithBackend ?: "unknown"
+        val snapshotEngineLabel = recording.transcribedWithModel ?: snapshotEngineId
+        runCatching { repository.snapshotCurrentTranscript(recordingId, snapshotEngineId, snapshotEngineLabel) }
+            .onFailure { Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it) }
 
         send(AsrEvent.Stage("Reading audio", 0.1f))
         // For Gemma we stream-decode: a 1-hour MP3 is ~230 MB as float32 and
@@ -203,6 +298,10 @@ class TranscriptionRunner(
         val gemma = asr as? Gemma4Backend
         val rawSegments: List<RawSegment>
         val mono: FloatArray
+        // Set by the long-file non-Gemma path: the file was too big to hold
+        // as one buffer for ASR, so diarization must use the windowed
+        // (file-streaming) path too instead of decoding it whole after all.
+        var diarizeWindowed = false
         // Sherpa pre-pass results, populated inside the Gemma branch when
         // hybrid diarization is on. Reused by the reconcile block below.
         var sherpaSegmentsFromPrepass: List<DiarizationRunner.SpeakerSegment>? = null
@@ -268,12 +367,22 @@ class TranscriptionRunner(
                             diarizer.runChunked(
                                 file = File(audioPath),
                                 numClusters = expectedSpeakers,
+                                threshold = clusterThreshold,
+                                minDurationOn = minDurationOn,
+                                minDurationOff = minDurationOff,
                                 durationSec = recording.durationSeconds,
                                 onProgress = { fraction ->
                                     val pct = (fraction * 100f).toInt().coerceIn(0, 99)
                                     trySend(AsrEvent.Stage(
                                         "Identifying speakers · $pct%",
                                         (0.10f + 0.04f * fraction).coerceAtMost(0.14f),
+                                    ))
+                                },
+                                onOverSegmented = {
+                                    trySend(AsrEvent.Stage(
+                                        "Lots of speakers detected — if you know how many, " +
+                                            "set Expected Speakers in the RUN sheet",
+                                        0.14f,
                                     ))
                                 },
                             ).getOrThrow()
@@ -307,6 +416,9 @@ class TranscriptionRunner(
                             diarizer.run(
                                 samples = full.samples,
                                 numClusters = expectedSpeakers,
+                                threshold = clusterThreshold,
+                                minDurationOn = minDurationOn,
+                                minDurationOff = minDurationOff,
                                 onProgress = { fraction ->
                                     val seconds = (fraction / 0.01f).toInt()
                                     // Bar clamped to the sherpa-reserved
@@ -343,6 +455,38 @@ class TranscriptionRunner(
                             send(AsrEvent.Stage(
                                 "Speaker clustering complete (${sherpaSegmentsFromPrepass.size} turns)",
                                 0.14f,
+                            ))
+                        }
+                    }
+                }
+            }
+
+            // Best-effort Gemma cleanup pass over the sherpa clustering:
+            // ask whether any of the clusters it found are actually the
+            // same speaker. Never blocks or fails the run — see
+            // Gemma4Backend.suggestSpeakerMergeMap's own doc comment.
+            val prepassClusters = sherpaSegmentsFromPrepass
+            val prepassGemma = gemma
+            if (prepassGemma != null && prepassClusters != null) {
+                val summaries = prepassClusters.groupBy { it.speakerId }.map { (id, segs) ->
+                    ClusterSummary(
+                        id = id,
+                        durationSeconds = segs.sumOf { (it.end - it.start).toDouble() },
+                        confidence = segs.map { it.confidence }.average().toFloat(),
+                    )
+                }
+                if (summaries.size >= 2) {
+                    val mergePairs = runCatching { prepassGemma.suggestSpeakerMergeMap(summaries) }.getOrDefault(emptyList())
+                    if (mergePairs.isNotEmpty()) {
+                        val mapping = applyMergeMap(summaries.map { it.id }.toSet(), mergePairs)
+                        val merged = prepassClusters.map { it.copy(speakerId = mapping[it.speakerId] ?: it.speakerId) }
+                        val renumbered = DiarizationRunner.renumberByFirstAppearance(merged)
+                        sherpaSegmentsFromPrepass = renumbered
+                        val mergedCount = summaries.size - renumbered.map { it.speakerId }.distinct().size
+                        if (mergedCount > 0) {
+                            send(AsrEvent.Stage(
+                                "Gemma merged $mergedCount over-split speaker cluster(s)",
+                                0.145f,
                             ))
                         }
                     }
@@ -791,20 +935,34 @@ class TranscriptionRunner(
                             } else {
                                 out.map { it to null }
                             }
+                        // Strip Gemma's inline "Speaker N:" marker from the
+                        // TEXT (independent of where the speaker id itself
+                        // came from — sherpa or the marker) before any
+                        // text-merging step below, so a turn merge never
+                        // leaves a stray marker stitched mid-sentence.
+                        val markerFreeRaw = if (useGemmaDiar) {
+                            perChunkAssignedRaw.map { (raw, spkId) ->
+                                raw.copy(text = stripGemmaSpeakerMarker(raw.text).first) to spkId
+                            }
+                        } else perChunkAssignedRaw
                         // Merge short isolated backchannels ("yeah", "mhm")
-                        // into the surrounding speaker's turn. Cheap, runs
-                        // on each incremental save so the UI shows the
-                        // cleaned-up attribution as Gemma streams chunks.
-                        val perChunkAssigned = coalesceBackchannels(perChunkAssignedRaw)
+                        // into the surrounding speaker's turn and drop pure-
+                        // filler noise. Cheap, runs on each incremental save
+                        // so the UI shows the cleaned-up attribution as
+                        // Gemma streams chunks. General turn coalescing
+                        // (same-speaker merge across a tunable gap) runs
+                        // further down, AFTER dedupChunkBoundaries — it
+                        // would otherwise merge two chunks' segments into
+                        // one BEFORE the boundary-seam dedup pass gets a
+                        // chance to see them as separate, letting a
+                        // duplicated recap phrase slip through un-trimmed.
+                        val perChunkAssigned = dropPureFillerSegments(coalesceBackchannels(markerFreeRaw))
                         val partialRows = perChunkAssigned.map { (raw, spkId) ->
-                            val cleanText = if (useGemmaDiar)
-                                stripGemmaSpeakerMarker(raw.text).first
-                            else raw.text
                             Segment(
                                 recordingId = recordingId,
                                 startSeconds = raw.startSeconds,
                                 endSeconds = raw.endSeconds,
-                                text = cleanText.trim(),
+                                text = raw.text.trim(),
                                 language = translateTo ?: primaryLanguage,
                                 speaker = spkId?.let { "SPEAKER_%02d".format(it) },
                             )
@@ -819,7 +977,15 @@ class TranscriptionRunner(
                             partialRows,
                             chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
                         )
-                        val rowsWithNames = applyInferredSpeakerNames(dedupedPartial)
+                        // De-chunk: the ~28s chunk windows are an implementation
+                        // detail — the transcript should read as speaker TURNS.
+                        // Ports the Mac app's coalesceBySpeaker (default 30s gap).
+                        // Diarized runs only, as on the Mac: without speakers
+                        // every row has speaker == null and the whole
+                        // transcript would merge into one row.
+                        val coalescedPartial =
+                            if (diarize) coalesceTurnSegments(dedupedPartial, turnCoalesceGapSec) else dedupedPartial
+                        val rowsWithNames = applyInferredSpeakerNames(coalescedPartial)
                         repository.replaceSegments(recordingId, rowsWithNames)
                     }
                     // The streaming onPartialText callback already emitted
@@ -854,15 +1020,7 @@ class TranscriptionRunner(
             // Gemma did the diarization inline; we don't run sherpa-onnx.
             mono = FloatArray(0)
         } else {
-            // Whisper path — full-buffer decode (whisper.cpp wants the whole clip).
-            val decoded = runCatching { AudioDecoder.decode(File(audioPath)) }
-                .getOrElse {
-                    send(AsrEvent.Failed("Failed to decode $audioPath: ${it.message}"))
-                    asr.release()
-                    return@channelFlow
-                }
-            mono = decoded.samples
-            send(AsrEvent.Stage("Transcribing", 0.2f))
+            // Whisper path.
             // Whisper.cpp's JNI API takes a single language. For constrained
             // auto with Whisper we'd need to add detect+filter logic — for now
             // multi-select degrades to full auto (null) when more than one is
@@ -873,19 +1031,130 @@ class TranscriptionRunner(
             // English when they asked for Arabic. The UI will warn about this
             // mismatch up front.
             val whisperTranslate = translateTo == "en"
-            val tx = asr.transcribe(
-                samples = mono,
-                sampleRate = decoded.sampleRate,
-                language = primaryLanguage,
-                translate = whisperTranslate,
-                progress = null,
-            )
-            if (tx.isFailure) {
-                asr.release()
-                send(AsrEvent.Failed(tx.exceptionOrNull()?.message ?: "transcription failed"))
-                return@channelFlow
+            val audioFile = File(audioPath)
+            if (recording.durationSeconds <= WHISPER_CHUNK_THRESHOLD_SECONDS) {
+                // Short file — single-shot full-buffer decode+transcribe,
+                // same shape this app has always used. The decoded buffer
+                // doubles as `mono` for diarization below.
+                val decoded = runCatching { AudioDecoder.decode(audioFile) }
+                    .getOrElse {
+                        send(AsrEvent.Failed("Failed to decode $audioPath: ${it.message}"))
+                        asr.release()
+                        return@channelFlow
+                    }
+                mono = decoded.samples
+                send(AsrEvent.Stage("Transcribing", 0.2f))
+                val tx = asr.transcribe(
+                    samples = mono,
+                    sampleRate = decoded.sampleRate,
+                    language = primaryLanguage,
+                    translate = whisperTranslate,
+                    progress = null,
+                )
+                if (tx.isFailure) {
+                    asr.release()
+                    send(AsrEvent.Failed(tx.exceptionOrNull()?.message ?: "transcription failed"))
+                    return@channelFlow
+                }
+                rawSegments = tx.getOrThrow()
+            } else {
+                // Long file — stream-decode and chunk at VAD cut points
+                // instead of loading the whole clip into one FloatArray
+                // (doubled again by jni_whisper.cpp's own native-side
+                // copy) — that full-buffer load was the actual OOM driver
+                // on multi-hour audio. whisper.cpp's C API needs the whole
+                // buffer PER CALL, but nothing stops calling it once per
+                // chunk and stitching with a time offset, same shape as
+                // SherpaOfflineBackend already does for Parakeet/
+                // Omnilingual. Reuses the exact scanSilences/
+                // computeCutPoints/decodeAtCutPoints pipeline the Gemma
+                // branch above already exercises.
+                send(AsrEvent.Stage("Scanning for sentence boundaries", 0.12f))
+                val silences = runCatching {
+                    AudioDecoder.scanSilences(
+                        audioFile,
+                        minSilenceMs = CHUNK_ALIGN_MIN_SILENCE_MS,
+                        rmsThreshold = CHUNK_ALIGN_RMS_THRESHOLD,
+                    )
+                }.getOrElse {
+                    Log.w(TAG, "silence scan failed; falling back to fixed-time chunks", it)
+                    emptyList()
+                }
+                val cutPoints = AudioDecoder.computeCutPoints(
+                    silences = silences,
+                    durationSec = recording.durationSeconds,
+                    targetChunkSec = WHISPER_CHUNK_TARGET_SECONDS,
+                    flexSec = CHUNK_ALIGN_FLEX_SECONDS,
+                )
+                val expectedWhisperChunks = cutPoints.size + 1
+                val whisperOverlapSamples = CHUNK_OVERLAP_SECONDS * AudioDecoder.TARGET_SR
+                val out = mutableListOf<RawSegment>()
+                var chunkIdx = 0
+                try {
+                    AudioDecoder.decodeAtCutPoints(
+                        audioFile,
+                        cutPoints = cutPoints,
+                        hardCutOverlapSamples = whisperOverlapSamples,
+                        silenceCutOverlapSamples = 0,
+                    ).collect { chunk ->
+                        send(AsrEvent.Stage(
+                            "Transcribing ${chunkIdx + 1}/$expectedWhisperChunks",
+                            (0.15f + 0.75f * chunkIdx / expectedWhisperChunks).coerceAtMost(0.95f),
+                        ))
+                        val tx = asr.transcribe(
+                            samples = chunk.samples,
+                            sampleRate = chunk.sampleRate,
+                            language = primaryLanguage,
+                            translate = whisperTranslate,
+                            progress = null,
+                        )
+                        if (tx.isFailure) {
+                            throw TranscriptionBailout(AsrEvent.Failed(
+                                "Chunk ${chunkIdx + 1} failed: " +
+                                    (tx.exceptionOrNull()?.message ?: "unknown")
+                            ))
+                        }
+                        val offset = chunk.startSeconds
+                        for (seg in tx.getOrThrow()) {
+                            out += RawSegment(
+                                startSeconds = seg.startSeconds + offset,
+                                endSeconds = seg.endSeconds + offset,
+                                text = seg.text,
+                                words = seg.words?.map { w ->
+                                    w.copy(start = w.start + offset, end = w.end + offset)
+                                },
+                            )
+                        }
+                        // Unlike Gemma, whisper.cpp has no "skip the recap"
+                        // prompting — it transcribes the whole chunk
+                        // including the overlap, so a hard-cut chunk
+                        // boundary genuinely produces duplicate text at the
+                        // seam. Register it for dedupChunkBoundaries below
+                        // (same "only hard cuts need dedup" rule as the
+                        // Gemma branch — silence-aligned cuts carry zero
+                        // overlap, nothing to dedup).
+                        if (chunkIdx > 0 && chunk.overlapSamples > 0) {
+                            chunkBoundaryStartSeconds.add(chunk.startSeconds)
+                        }
+                        chunkIdx++
+                    }
+                } catch (b: TranscriptionBailout) {
+                    asr.release()
+                    send(b.failure)
+                    return@channelFlow
+                } catch (t: Throwable) {
+                    asr.release()
+                    send(AsrEvent.Failed("Failed to decode/transcribe $audioPath: ${t.message}"))
+                    return@channelFlow
+                }
+                rawSegments = out
+                // Diarization (if requested) goes through the windowed,
+                // file-streaming path below — decoding the whole file into
+                // one buffer here would reintroduce exactly the OOM this
+                // chunked ASR pass exists to avoid.
+                mono = FloatArray(0)
+                diarizeWindowed = diarize
             }
-            rawSegments = tx.getOrThrow()
         }
 
         // Optional diarization. Three flavours:
@@ -926,9 +1195,37 @@ class TranscriptionRunner(
             }
         } else if (diarize && rawSegments.isNotEmpty()) {
             send(AsrEvent.Stage("Identifying speakers", 0.7f))
-            val diarRes = diarizer.run(
+            val diarRes = if (diarizeWindowed) {
+                runCatching {
+                    diarizer.runChunked(
+                        file = File(audioPath),
+                        numClusters = expectedSpeakers,
+                        threshold = clusterThreshold,
+                        minDurationOn = minDurationOn,
+                        minDurationOff = minDurationOff,
+                        durationSec = recording.durationSeconds,
+                        onProgress = { fraction ->
+                            val pct = (fraction * 100f).toInt().coerceIn(0, 99)
+                            trySend(AsrEvent.Stage(
+                                "Identifying speakers · $pct%",
+                                (0.7f + 0.25f * fraction).coerceAtMost(0.95f),
+                            ))
+                        },
+                        onOverSegmented = {
+                            trySend(AsrEvent.Stage(
+                                "Lots of speakers detected — if you know how many, " +
+                                    "set Expected Speakers in the RUN sheet",
+                                0.9f,
+                            ))
+                        },
+                    ).getOrThrow()
+                }
+            } else diarizer.run(
                 samples = mono,
                 numClusters = expectedSpeakers,
+                threshold = clusterThreshold,
+                minDurationOn = minDurationOn,
+                minDurationOff = minDurationOff,
             )
             if (diarRes.isFailure) {
                 // Don't fail the whole run — transcription succeeded. Surface a
@@ -944,12 +1241,12 @@ class TranscriptionRunner(
         } else {
             rawSegments.map { it to null }
         }
-        // Backchannel coalescing on the FINAL assignment. The incremental
-        // chunk-loop already coalesces per-batch, but only the full-file
-        // pass has both the left AND right neighbour of every interior
-        // segment available, so this catches a few that the partial pass
-        // couldn't sandwich-detect at chunk boundaries.
-        val assigned = coalesceBackchannels(assignedRaw)
+        // Backchannel coalescing + filler-drop on the FINAL assignment. The
+        // incremental chunk-loop already runs both per-batch, but only the
+        // full-file pass has both the left AND right neighbour of every
+        // interior segment available, so this catches a few the partial
+        // pass couldn't sandwich-detect at chunk boundaries.
+        val assigned = dropPureFillerSegments(coalesceBackchannels(assignedRaw))
 
         send(AsrEvent.Stage("Saving", 0.97f))
         // Effective output language per segment. If we translated, that's
@@ -975,35 +1272,87 @@ class TranscriptionRunner(
             rows,
             chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
         )
-        val rowsWithNames = applyInferredSpeakerNames(dedupedRows)
+        // De-chunk: merge same-speaker turns across the tunable gap, same
+        // as the incremental path — this final pass also coalesces
+        // whatever the per-chunk passes couldn't (e.g. Whisper's single
+        // full-file run never went through the incremental path at all).
+        // Diarized runs only (see the incremental call for why).
+        val coalescedRows =
+            if (diarize) coalesceTurnSegments(dedupedRows, turnCoalesceGapSec) else dedupedRows
+        val rowsWithNames = applyInferredSpeakerNames(coalescedRows)
         repository.replaceSegments(recordingId, rowsWithNames)
+        // Re-read the row: the user may have re-titled, re-filed
+        // (folderId) or categorised the recording while this run was in
+        // flight, and Room's @Update replaces the WHOLE row — writing back
+        // the copy we fetched at the start would silently revert that.
+        val fresh = repository.get(recordingId) ?: recording
         // The Recording row keeps a boolean "was translated?" — the actual
         // target lives in Segment.language. Avoids a Room migration while
         // still letting the UI surface "Translated to {target}" by looking
         // at the segments. See RecordingsListScreen / TranscriptExporter.
-        var updated = recording.copy(
+        var updated = fresh.copy(
             transcribedWithBackend = asr.id,
             transcribedWithModel = modelFile.name,
             translateToEnglish = translateTo != null,
-            sourceLanguage = recording.sourceLanguage ?: primaryLanguage,
+            sourceLanguage = fresh.sourceLanguage ?: primaryLanguage,
         )
 
+        // Text work (auto-title, auto-classify) is Gemma's job regardless
+        // of which engine transcribed — with Parakeet as the default ASR
+        // engine, gating this on `gemma != null` would mean it almost never
+        // runs. Reuse the ASR engine when it IS Gemma; otherwise release
+        // the ASR engine first (memory) and load a standalone Gemma for
+        // the two short prompts, if one is installed and fits.
+        val wantsTitle = rows.isNotEmpty() && looksLikeDefaultTitle(updated.title)
+        val wantsCategory = rows.isNotEmpty() && updated.category == null
+        var asrReleased = false
+        var standaloneTextGemma: Gemma4Backend? = null
+        val textGemma: Gemma4Backend? = gemma ?: run {
+            if (!wantsTitle && !wantsCategory) return@run null
+            val gModel = factory.resolveModel(AsrBackendKind.Gemma4) ?: return@run null
+            if (checkGemmaE4BMemory() != null) return@run null
+            asr.release()
+            asrReleased = true
+            send(AsrEvent.Stage("Loading Gemma for naming", 0.975f))
+            val g = factory.create(AsrBackendKind.Gemma4) as? Gemma4Backend ?: return@run null
+            val res = g.load(gModel.absolutePath)
+            if (res.isFailure) {
+                Log.w(TAG, "standalone Gemma for text work failed to load; skipping title/classify", res.exceptionOrNull())
+                g.release()
+                null
+            } else {
+                standaloneTextGemma = g
+                g
+            }
+        }
+
         // Auto-title: if the recording still has the default timestamp-style
-        // title and we have a Gemma engine loaded, ask Gemma for a short
-        // descriptive title. This is the biggest single Library improvement —
-        // "Recording_2026-05-17_14-23-30" is useless, "Q3 planning with
-        // Ahmed and Sara" is actually findable. `gemma` was bound at the
-        // start of the function for the streaming-decode path; reuse it.
-        if (gemma != null && rows.isNotEmpty() && looksLikeDefaultTitle(updated.title)) {
+        // title, ask Gemma for a short descriptive title. This is the
+        // biggest single Library improvement — "Recording_2026-05-17_14-23-30"
+        // is useless, "Q3 planning with Ahmed and Sara" is actually findable.
+        if (textGemma != null && wantsTitle) {
             send(AsrEvent.Stage("Naming the recording", 0.98f))
-            val title = generateTitle(gemma, rows)
+            val title = generateTitle(textGemma, rows)
             if (!title.isNullOrBlank()) {
                 updated = updated.copy(title = title)
             }
         }
+        // Auto-classify: Meeting/Interview/Note/Idea. Unlike the title
+        // heuristic above, this never clobbers an existing value — once a
+        // recording has a category (from this or a future manual choice),
+        // a re-transcription leaves it alone rather than silently
+        // re-guessing. New to the Android app; see RecordingCategory's doc
+        // comment.
+        if (textGemma != null && wantsCategory) {
+            val category = classifyRecording(textGemma, rows)
+            if (category != null) {
+                updated = updated.copy(category = category.id)
+            }
+        }
+        standaloneTextGemma?.release()
 
         repository.update(updated)
-        asr.release()
+        if (!asrReleased) asr.release()
 
         // Sidecar files (.txt / .srt / .json) next to the audio. Cheap to
         // write, lets the user share the transcript via the OS share sheet
@@ -1072,6 +1421,21 @@ class TranscriptionRunner(
             ?.removePrefix("\"")?.removeSuffix("\"")
             ?.take(80)
             ?.takeIf { it.isNotBlank() }
+    }
+
+    /** Same excerpt-building approach as [generateTitle], reused independently so a title-generation failure never blocks classification. */
+    private suspend fun classifyRecording(
+        gemma: Gemma4Backend,
+        segments: List<Segment>,
+    ): RecordingCategory? {
+        val excerpt = buildString {
+            for (s in segments) {
+                if (length > 1500) break
+                append(s.text).append(' ')
+            }
+        }.trim().take(2000)
+        if (excerpt.isEmpty()) return null
+        return gemma.suggestCategory(excerpt)
     }
 }
 
@@ -1179,16 +1543,49 @@ private fun stripGemmaSpeakerMarker(text: String): Pair<String, Int?> {
 }
 
 /**
+ * [coalesceTurns] for already-persisted-shape [Segment] rows — used here
+ * instead of the [RawSegment] version because turn coalescing has to run
+ * AFTER [dedupChunkBoundaries]: merging two chunks' segments into one
+ * BEFORE the boundary-seam dedup pass would hide the seam from it, letting
+ * a duplicated recap phrase slip through un-trimmed. Same merge rule:
+ * same speaker + gap below [gapSec] → concatenate into one row.
+ */
+internal fun coalesceTurnSegments(rows: List<Segment>, gapSec: Double): List<Segment> {
+    val sorted = rows.sortedBy { it.startSeconds }
+    val out = mutableListOf<Segment>()
+    for (seg in sorted) {
+        val last = out.lastOrNull()
+        if (last != null && last.speaker == seg.speaker && seg.startSeconds - last.endSeconds < gapSec) {
+            out[out.size - 1] = last.copy(
+                endSeconds = maxOf(last.endSeconds, seg.endSeconds),
+                text = last.text + " " + seg.text,
+            )
+        } else {
+            out.add(seg)
+        }
+    }
+    return out
+}
+
+/**
  * Scan transcript text for self-introduction phrases ("Hi, I'm Ahmed",
- * "My name is Sara", "This is Yuri speaking") and propagate the detected
- * name to every segment with the same speaker key. First match wins per
+ * "My name is Sara", "This is Yuri speaking", plus Ukrainian/Dutch/Arabic
+ * equivalents — see [findIntroducedName]) and propagate the detected name
+ * to every segment with the same speaker key. First match wins per
  * speaker — once a key gets a name, subsequent intros for that key are
  * ignored (real conversations have one canonical name per voice).
+ *
+ * Also applies the addressee rule, ported from the Mac app
+ * (`Transcriberr/ASR/DiarizationRunner.swift` `inferSpeakerNames`): in a
+ * TWO-person conversation, greeting someone by name ("Hi, Lana") implies
+ * the OTHER speaker's name — the one inference self-introductions alone
+ * can't make.
  *
  * Conservative by design: a false positive ("I'm tired") would be visible
  * in the UI and require manual cleanup, so we only match capitalized
  * names following a small set of high-precision lead-ins, and skip a
- * stoplist of common words that look like names after "I'm".
+ * stoplist of common words that look like names after "I'm". Arabic has
+ * no letter case, so its stoplist carries more of the precision burden.
  *
  * Runs on the full row set on every chunk save so a name found in chunk N
  * back-fills earlier rows for the same speaker as soon as it's discovered.
@@ -1202,6 +1599,21 @@ internal fun applyInferredSpeakerNames(rows: List<Segment>): List<Segment> {
         val cand = findIntroducedName(seg.text) ?: continue
         inferred[key] = cand
     }
+
+    val keys = rows.mapNotNull { it.speaker }.distinct()
+    if (keys.size == 2) {
+        val (a, b) = keys
+        for (seg in rows) {
+            val key = seg.speaker ?: continue
+            val other = if (key == a) b else a
+            if (other in inferred) continue
+            val m = GREETING_NAME_PATTERN.find(seg.text) ?: continue
+            val cand = m.groupValues[1].trim()
+            if (isStoplistedName(cand) || cand == inferred[key]) continue
+            inferred[other] = cand
+        }
+    }
+
     if (inferred.isEmpty()) return rows
     return rows.map { seg ->
         val key = seg.speaker
@@ -1226,6 +1638,46 @@ private val SPEAKER_NAME_STOPLIST = setOf(
     "telling", "the", "a", "an", "not", "really", "just", "still", "from",
     "in", "on", "at", "with", "about", "also", "afraid", "tired", "hungry",
     "right", "left", "up", "down", "very", "pretty", "kind", "sort",
+    // "Hi, I'm Ahmed" also matches the ADDRESSEE pattern (greeting word +
+    // capitalized token) with "I'm" misread as the greeted name — block it
+    // here rather than special-casing the addressee regex. isStoplistedName
+    // only looks at the first word, so "i'm"/"i" cover "I'm"/"I am" both.
+    "i'm", "i", "im",
+    // Words that follow a greeting far more often than a name does —
+    // "hello, my name is", "hi there", "hey guys/everyone/all/again".
+    "my", "there", "guys", "everyone", "everybody", "all", "again", "you",
+    "team", "folks", "friends", "dear", "and", "so", "yes", "no", "hi",
+    "hello", "hey", "welcome", "thanks", "thank",
+    // Dutch — same role as the English list above, for "Ik ben X" etc.
+    "moe", "hier", "daar", "klaar", "blij", "boos", "bang", "trots",
+    "verdrietig", "zeker", "best", "nu", "nog", "ook", "zo", "sorry",
+)
+
+/** Arabic has no case signal to lean on, so this list is doing more precision work per hit. */
+private val ARABIC_SPEAKER_NAME_STOPLIST = setOf(
+    "متأكد", "متأكدة", "بخير", "هنا", "جاهز", "جاهزة", "آسف", "آسفة",
+    "سعيد", "سعيدة", "متعب", "متعبة", "خايف", "خائف", "عارف", "عارفة",
+)
+
+private fun isStoplistedName(candidate: String): Boolean {
+    val firstWord = candidate.substringBefore(' ').lowercase()
+    return firstWord in SPEAKER_NAME_STOPLIST || candidate in ARABIC_SPEAKER_NAME_STOPLIST
+}
+
+/**
+ * Greeting-by-name pattern for the addressee rule: "Hi/Hello/Привіт/Hoi/
+ * مرحبا NAME". Deliberately separate from [findIntroducedName]'s
+ * self-introduction patterns — this one captures the person being
+ * addressed, not the speaker.
+ */
+// The greeting word is case-insensitive (inline `(?iu:…)`); the captured
+// NAME is not — a whole-pattern IGNORE_CASE would let "hello, my name is…"
+// hand "my" to the other speaker as their name. Arabic has no case, so
+// its branch relies on the stoplist instead.
+private val GREETING_NAME_PATTERN = Regex(
+    "(?iu:привіт|вітаю|добрий день|здравствуй|привет|hi|hello|hey|hoi|hallo" +
+        "|مرحبا|أهلا|السلام عليكم|صباح الخير|مساء الخير)[,!]?\\s+" +
+        "([A-ZА-ЯІЇЄҐ][a-zа-яіїєґё'’\\-]{1,30}|[؀-ۿ]{2,30})",
 )
 
 internal fun findIntroducedName(text: String): String? {
@@ -1258,13 +1710,26 @@ internal fun findIntroducedName(text: String): String? {
                 "(?=\\s*[,.]|\\s+(?:and|the|a|an|from|with|at|here|speaking|calling)\\b)",
             RegexOption.IGNORE_CASE,
         ),
+        // Ukrainian: "мене звати / мене звуть NAME" ("my name is").
+        Regex(
+            "(?:мене звати|мене звуть)\\s+([А-ЯІЇЄҐ][а-яіїєґ'’\\-]{1,30})",
+            RegexOption.IGNORE_CASE,
+        ),
+        // Dutch: "Ik ben / Mijn naam is / Dit is NAME".
+        Regex(
+            "\\b(?:ik ben|mijn naam is|dit is)\\s+([A-Z][a-z][a-z'\\-]+(?:\\s+[A-Z][a-z][a-z'\\-]+)?)",
+            RegexOption.IGNORE_CASE,
+        ),
+        // Arabic: "اسمي NAME" (my name is), "أنا NAME" (I am),
+        // "معك NAME" (phone-style "this is" — "you're with NAME"). No case
+        // signal in Arabic script, so the stoplist below does more work.
+        Regex("(?:اسمي|أنا|معك)\\s+([؀-ۿ]{2,30})"),
     )
     for (re in intros) {
         val m = re.find(text) ?: continue
         val cand = m.groupValues[1].trim()
         if (cand.length !in 2..40) continue
-        val firstWord = cand.substringBefore(' ').lowercase()
-        if (firstWord in SPEAKER_NAME_STOPLIST) continue
+        if (isStoplistedName(cand)) continue
         return cand
     }
     return null
@@ -1391,16 +1856,27 @@ internal fun dedupChunkBoundaries(
         if (dropCount > 0) {
             val trimmed = currTokens.drop(dropCount).joinToString(" ").trim()
             if (trimmed.isEmpty()) {
-                android.util.Log.d(
-                    TAG, "dedup: dropped fully-duplicate segment ($dropCount tokens) " +
-                        "at ${curr.startSeconds}s"
-                )
+                // runCatching: this function is exercised directly by plain
+                // JVM unit tests (no Android framework, no Robolectric) —
+                // android.util.Log's real implementation is native and
+                // throws when unmocked outside an instrumented run. A
+                // logging call must never be able to crash the dedup pass
+                // either way, so swallow-on-failure is correct in
+                // production too, not just a test workaround.
+                runCatching {
+                    android.util.Log.d(
+                        TAG, "dedup: dropped fully-duplicate segment ($dropCount tokens) " +
+                            "at ${curr.startSeconds}s"
+                    )
+                }
                 continue
             }
-            android.util.Log.d(
-                TAG, "dedup: trimmed $dropCount overlapping tokens from segment " +
-                    "at ${curr.startSeconds}s"
-            )
+            runCatching {
+                android.util.Log.d(
+                    TAG, "dedup: trimmed $dropCount overlapping tokens from segment " +
+                        "at ${curr.startSeconds}s"
+                )
+            }
             out.add(curr.copy(text = trimmed))
         } else {
             out.add(curr)

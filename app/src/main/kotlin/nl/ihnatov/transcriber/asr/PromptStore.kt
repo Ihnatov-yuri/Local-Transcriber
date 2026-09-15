@@ -4,6 +4,8 @@ import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 /**
  * Tone applied to post-processing output. Inspired by Wispr Flow's "Styles"
@@ -67,6 +69,17 @@ class PromptStore(context: Context) {
     private val _vocabulary = MutableStateFlow(prefs.getString(KEY_VOCABULARY, "") ?: "")
     val vocabulary: StateFlow<String> = _vocabulary.asStateFlow()
 
+    /**
+     * Per-language vocabulary lists, keyed by ISO code ("ar"/"uk"/"en"/"nl").
+     * Mirrors the Mac app's `PromptStore.vocabularyByLanguage` — a run in
+     * language X gets the global list plus X's list, so a Ukrainian
+     * transcription isn't diluted with English-only product names. See
+     * [vocabularyTerms].
+     */
+    private val _vocabularyByLanguage =
+        MutableStateFlow(decodeVocabByLanguage(prefs.getString(KEY_VOCAB_BY_LANG, null)))
+    val vocabularyByLanguage: StateFlow<Map<String, String>> = _vocabularyByLanguage.asStateFlow()
+
     private val _removeFillers = MutableStateFlow(prefs.getBoolean(KEY_REMOVE_FILLERS, false))
     val removeFillers: StateFlow<Boolean> = _removeFillers.asStateFlow()
 
@@ -100,6 +113,27 @@ class PromptStore(context: Context) {
         _vocabulary.value = text
         prefs.edit().putString(KEY_VOCABULARY, text).apply()
     }
+
+    /** Set (or, if [text] is blank, clear) the vocabulary list for one language code. */
+    fun setVocabularyForLanguage(code: String, text: String) {
+        val key = code.lowercase()
+        val updated = if (text.isBlank()) _vocabularyByLanguage.value - key
+        else _vocabularyByLanguage.value + (key to text)
+        _vocabularyByLanguage.value = updated
+        prefs.edit().putString(KEY_VOCAB_BY_LANG, vocabJson.encodeToString(updated)).apply()
+    }
+
+    /**
+     * Global vocabulary terms plus the per-language terms for [languages] —
+     * every language's list when [languages] is empty (full auto-detect
+     * could surface any of them), only the selected languages' lists
+     * otherwise. Same selection rule as the Mac app's
+     * `PromptStore.vocabulary(for:)`. Callers cap/format the result
+     * themselves (Gemma's system prompt, whisper.cpp's initial_prompt, and
+     * preset templates each have their own budget and phrasing).
+     */
+    fun vocabularyTerms(languages: Set<String> = emptySet()): List<String> =
+        selectVocabularyTerms(_vocabulary.value, _vocabularyByLanguage.value, languages)
 
     fun setRemoveFillers(value: Boolean) {
         _removeFillers.value = value
@@ -143,19 +177,19 @@ class PromptStore(context: Context) {
         // this system-channel template, to keep them anchored to the audio.
         val hint = languageHint(languages)
         val base = template.replace("{language_hint}", hint)
-        return base + buildExtras()
+        return base + buildExtras(languages)
     }
 
-    private fun buildExtras(): String {
+    private fun buildExtras(languages: List<String>): String {
         val parts = mutableListOf<String>()
         // Cap the count of terms we inline so a user who installed all
         // domain packs doesn't blow the per-chunk token budget. The
-        // capped list keeps the order from parseVocabulary, which has the
-        // user's hand-curated entries first (they're appended at the top
-        // of the file in DomainVocabulary.apply) — so the truncation
-        // drops the LEAST-recently-added domain terms first, not the
-        // user's own additions.
-        val terms = parseVocabulary(_vocabulary.value).take(VOCAB_TERMS_PROMPT_CAP)
+        // capped list keeps the order from vocabularyTerms, which has the
+        // user's hand-curated global entries first (they're appended at
+        // the top of the file in DomainVocabulary.apply) — so the
+        // truncation drops the LEAST-recently-added domain terms first,
+        // not the user's own additions.
+        val terms = vocabularyTerms(languages.toSet()).take(VOCAB_TERMS_PROMPT_CAP)
         if (terms.isNotEmpty()) {
             parts += "Vocabulary (spell exactly when heard): " + terms.joinToString(", ") + "."
         }
@@ -174,6 +208,23 @@ class PromptStore(context: Context) {
         if (toneSentence != null) parts += toneSentence
         return if (parts.isEmpty()) "" else "\n\nAdditional instructions:\n- " +
             parts.joinToString("\n- ")
+    }
+
+    /**
+     * Vocabulary terms formatted as a whisper.cpp `initial_prompt` — plain
+     * text the decoder is primed with, not an instruction (whisper has no
+     * concept of a system/user channel the way Gemma does). [language] is
+     * whisper.cpp's own single resolved language for this run (its JNI API
+     * takes one language, not a constrained-auto set — see
+     * TranscriptionRunner's `primaryLanguage`); null/blank pulls in every
+     * per-language list, same "could be any of them" rule as [render].
+     * Capped well under whisper.cpp's own ~224-token prompt window (see
+     * `whisper_full_params.prompt_tokens` in whisper.h) so multi-token
+     * names still fit.
+     */
+    fun whisperPrompt(language: String? = null): String {
+        val languages = if (language.isNullOrBlank()) emptySet() else setOf(language)
+        return vocabularyTerms(languages).take(WHISPER_VOCAB_TERMS_CAP).joinToString(", ")
     }
 
     private fun languageHint(languages: List<String>): String {
@@ -205,17 +256,18 @@ class PromptStore(context: Context) {
         else -> "the language with ISO code '$code'"
     }
 
-    /** Parse comma- or newline-separated terms, trimming and dropping blanks. */
-    private fun parseVocabulary(text: String): List<String> =
-        text.split('\n', ',')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
+    /** Defensive by design — a corrupt or missing pref must never crash prompt rendering. */
+    private fun decodeVocabByLanguage(raw: String?): Map<String, String> {
+        if (raw.isNullOrBlank()) return emptyMap()
+        return runCatching { vocabJson.decodeFromString<Map<String, String>>(raw) }.getOrDefault(emptyMap())
+    }
 
     companion object {
         private const val KEY_TRANSCRIBE = "gemma_prompt_transcribe"
         private const val KEY_TRANSLATE = "gemma_prompt_translate"
         private const val KEY_VOCABULARY = "gemma_vocabulary"
+        private const val KEY_VOCAB_BY_LANG = "gemma_vocabulary_by_language"
+        private val vocabJson = Json { ignoreUnknownKeys = true }
         private const val KEY_REMOVE_FILLERS = "gemma_remove_fillers"
         private const val KEY_VERBATIM = "gemma_verbatim"
         private const val KEY_TONE = "gemma_tone"
@@ -230,6 +282,9 @@ class PromptStore(context: Context) {
          * outputs truncated.
          */
         const val VOCAB_TERMS_PROMPT_CAP = 250
+
+        /** See [whisperPrompt]: whisper.cpp's own prompt window is much tighter than Gemma's context. */
+        const val WHISPER_VOCAB_TERMS_CAP = 120
 
         // System-channel prompts. Per Google's audio docs, the language
         // anchor lives in the USER message next to the audio (constructed
@@ -312,4 +367,32 @@ class PromptStore(context: Context) {
                 "- Preserve names, place names, and numerical facts exactly.\n" +
                 "- If the audio is silent or unintelligible, output an empty string."
     }
+}
+
+/** Parse comma- or newline-separated terms, trimming and dropping blanks. */
+internal fun parseVocabulary(text: String): List<String> =
+    text.split('\n', ',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+
+/**
+ * Pure selection logic behind [PromptStore.vocabularyTerms] — split out so
+ * it's testable without a [android.content.Context]. [languages] empty
+ * pulls in every entry of [byLanguage] (full auto-detect could surface any
+ * of them); non-empty selects only those languages' entries. Language codes
+ * are matched case-insensitively.
+ */
+internal fun selectVocabularyTerms(
+    global: String,
+    byLanguage: Map<String, String>,
+    languages: Set<String>,
+): List<String> {
+    val parts = mutableListOf<String>()
+    parts += parseVocabulary(global)
+    val keys = languages.ifEmpty { byLanguage.keys }
+    for (code in keys) {
+        byLanguage[code.lowercase()]?.let { parts += parseVocabulary(it) }
+    }
+    return parts.distinct()
 }

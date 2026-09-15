@@ -113,11 +113,71 @@ class UiPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_PROSE_MODE, value).apply()
     }
 
+    // ---- Diarization tuning (Settings → Models → Diarization) ----
+    //
+    // All three are nullable: null means "use the built-in default"
+    // (language-aware for threshold, fixed for the other two — see
+    // DiarizationRunner.DEFAULT_* / defaultClusterThreshold). Stored as
+    // -1f sentinel in SharedPreferences since it has no native nullable
+    // float getter.
+    private val _clusterThreshold = MutableStateFlow(loadNullableFloat(KEY_CLUSTER_THRESHOLD))
+    val clusterThreshold: StateFlow<Float?> = _clusterThreshold.asStateFlow()
+
+    fun setClusterThreshold(value: Float?) {
+        _clusterThreshold.value = value
+        saveNullableFloat(KEY_CLUSTER_THRESHOLD, value)
+    }
+
+    private val _minDurationOnSec = MutableStateFlow(loadNullableFloat(KEY_MIN_DURATION_ON))
+    val minDurationOnSec: StateFlow<Float?> = _minDurationOnSec.asStateFlow()
+
+    fun setMinDurationOnSec(value: Float?) {
+        _minDurationOnSec.value = value
+        saveNullableFloat(KEY_MIN_DURATION_ON, value)
+    }
+
+    private val _minDurationOffSec = MutableStateFlow(loadNullableFloat(KEY_MIN_DURATION_OFF))
+    val minDurationOffSec: StateFlow<Float?> = _minDurationOffSec.asStateFlow()
+
+    fun setMinDurationOffSec(value: Float?) {
+        _minDurationOffSec.value = value
+        saveNullableFloat(KEY_MIN_DURATION_OFF, value)
+    }
+
+    /**
+     * Speaker-turn coalescing gap in seconds — segments from the same
+     * speaker separated by less than this merge into one turn. Mac app
+     * default is 30s ("smooth blocks"); Settings can tune down to ~2s
+     * ("fine Samsung-style turns"). null = use [DEFAULT_TURN_COALESCE_GAP_SEC].
+     */
+    private val _turnCoalesceGapSec = MutableStateFlow(loadNullableFloat(KEY_TURN_COALESCE_GAP))
+    val turnCoalesceGapSec: StateFlow<Float?> = _turnCoalesceGapSec.asStateFlow()
+
+    fun setTurnCoalesceGapSec(value: Float?) {
+        _turnCoalesceGapSec.value = value
+        saveNullableFloat(KEY_TURN_COALESCE_GAP, value)
+    }
+
+    private fun loadNullableFloat(key: String): Float? {
+        val v = prefs.getFloat(key, Float.NaN)
+        return if (v.isNaN()) null else v
+    }
+
+    private fun saveNullableFloat(key: String, value: Float?) {
+        val editor = prefs.edit()
+        if (value == null) editor.remove(key) else editor.putFloat(key, value)
+        editor.apply()
+    }
+
     companion object {
         private const val KEY_LAST_LANGUAGES = "last_languages"
         private const val KEY_VOCAB_LANGUAGES = "vocab_languages"
         private const val KEY_PREFERRED_EMBEDDING = "preferred_embedding"
         private const val KEY_SHOW_TIMESTAMPS = "show_timestamps"
         private const val KEY_PROSE_MODE = "prose_mode"
+        private const val KEY_CLUSTER_THRESHOLD = "diar_cluster_threshold"
+        private const val KEY_MIN_DURATION_ON = "diar_min_duration_on"
+        private const val KEY_MIN_DURATION_OFF = "diar_min_duration_off"
+        private const val KEY_TURN_COALESCE_GAP = "turn_coalesce_gap_sec"
     }
 }

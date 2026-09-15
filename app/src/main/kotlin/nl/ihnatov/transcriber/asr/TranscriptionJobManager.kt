@@ -8,10 +8,13 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import nl.ihnatov.transcriber.data.PendingTask
 import nl.ihnatov.transcriber.data.PendingTaskDao
 import nl.ihnatov.transcriber.data.RecordingRepository
@@ -51,6 +54,16 @@ class TranscriptionJobManager(
         val waitingForCharger: Boolean = false,
         /** Task is queued behind another job (not charger-parked). */
         val queued: Boolean = false,
+        /**
+         * Stop was requested but the coroutine hasn't unwound yet.
+         * Coroutine cancellation is cooperative and only checked at
+         * suspension points — a chunk already in flight (especially a
+         * single-shot whisper.cpp call, which has none) keeps running
+         * until it returns. This distinguishes "asked to stop, still
+         * finishing the in-flight step" from a plain running job so the
+         * UI can say so instead of looking unresponsive.
+         */
+        val stopping: Boolean = false,
         val stageLabel: String = "",
         val progress: Float = 0f,
         val error: String? = null,
@@ -72,6 +85,18 @@ class TranscriptionJobManager(
          * diarize=true and backend=Gemma4. Silently ignored otherwise.
          */
         val hybridDiarize: Boolean = false,
+        /**
+         * Super mode (Phase 3 of the 2026-09 plan): run [superPairA] and
+         * [superPairB] together and vote-merge instead of just [backend].
+         * Persisted on the `pending_tasks` row (schema 7) — every start,
+         * even an immediate one, round-trips through that row, so these
+         * have to survive it or Super mode never runs.
+         */
+        val superMode: Boolean = false,
+        val superPairA: AsrBackendKind? = null,
+        val superPairB: AsrBackendKind? = null,
+        /** "Max quality" — the constrained-JSON arbitration second pass. Meaningless unless [superMode]. */
+        val maxQuality: Boolean = false,
     )
 
     private val _statuses = MutableStateFlow<Map<Long, JobStatus>>(emptyMap())
@@ -79,7 +104,10 @@ class TranscriptionJobManager(
 
     /** What's currently running. null when idle. */
     private var runningId: Long? = null
+    private var runningParams: Params? = null
     private var currentJob: Job? = null
+    /** Set by [checkpointRunning]; cleared (and its row deleted) when that job ends in-process. */
+    @Volatile private var checkpointedId: Long? = null
 
     init {
         // Restore queued + charger-parked tasks from the DB so a process
@@ -175,6 +203,7 @@ class TranscriptionJobManager(
 
     private fun startInternal(recordingId: Long, params: Params) {
         runningId = recordingId
+        runningParams = params
         updateStatus(recordingId) {
             JobStatus(running = true, stageLabel = "Starting", progress = 0f)
         }
@@ -194,6 +223,10 @@ class TranscriptionJobManager(
                     diarize = params.diarize,
                     expectedSpeakers = params.expectedSpeakers,
                     hybridDiarize = params.hybridDiarize,
+                    superMode = params.superMode,
+                    superPairA = params.superPairA,
+                    superPairB = params.superPairB,
+                    maxQuality = params.maxQuality,
                 ).collect { ev ->
                     val curr = _statuses.value[recordingId] ?: JobStatus(running = true)
                     val next = when (ev) {
@@ -209,7 +242,13 @@ class TranscriptionJobManager(
             } catch (t: CancellationException) {
                 // User pressed Stop. Don't paint an error — paint "Cancelled".
                 updateStatus(recordingId) {
-                    it.copy(running = false, stageLabel = "Cancelled", progress = 0f, error = null)
+                    it.copy(
+                        running = false,
+                        stopping = false,
+                        stageLabel = "Cancelled",
+                        progress = 0f,
+                        error = null,
+                    )
                 }
                 throw t
             } catch (t: Throwable) {
@@ -220,9 +259,25 @@ class TranscriptionJobManager(
             } finally {
                 if (runningId == recordingId) {
                     runningId = null
+                    runningParams = null
                     val curr = _statuses.value[recordingId]
                     if (curr != null && curr.running) {
                         updateStatus(recordingId) { it.copy(running = false) }
+                    }
+                }
+                // A checkpointRunning() call (FGS timeout) re-inserts this
+                // job's row so a process kill can resume it. If we got
+                // here, the job ended in-process (done, failed, or
+                // cancelled by the user) — drop the row, otherwise the
+                // tryStartNext() below would immediately re-run the same
+                // recording and overwrite the transcript it just wrote.
+                // NonCancellable: this finally also runs on user Stop, and
+                // a cancelled coroutine can't otherwise suspend into Room.
+                if (checkpointedId == recordingId) {
+                    checkpointedId = null
+                    withContext(NonCancellable) {
+                        runCatching { pendingTasks.delete(recordingId) }
+                            .onFailure { Log.e(TAG, "failed to clear checkpoint row for $recordingId", it) }
                     }
                 }
                 TranscriptionService.stop(context)
@@ -279,6 +334,13 @@ class TranscriptionJobManager(
      */
     fun cancel(recordingId: Long) {
         if (runningId == recordingId) {
+            // Paint "Stopping…" immediately — cancellation is cooperative
+            // and the in-flight step (a whisper.cpp chunk call has no
+            // suspension points at all) may take a while to actually
+            // unwind. Without this the UI keeps showing the last
+            // stageLabel/progress, unchanged, and looks stuck rather than
+            // working on it.
+            updateStatus(recordingId) { it.copy(stopping = true) }
             currentJob?.cancel()
             // Job's finally block clears running + status + drains next.
             return
@@ -292,6 +354,28 @@ class TranscriptionJobManager(
                 }
             }
         }
+    }
+
+    /**
+     * Called from [TranscriptionService.onTimeout] when the OS is about to
+     * force-stop the foreground service (only reachable on the
+     * mediaProcessing/dataSync fallback types — specialUse has no enforced
+     * timeout). Starting a job deletes its `pending_tasks` row (see
+     * [start]), so without this the in-flight task would be silently lost
+     * instead of resuming on next launch. Runs blocking: onTimeout only
+     * grants a short grace window before the process is killed outright,
+     * so a fire-and-forget coroutine could easily lose the race.
+     */
+    fun checkpointRunning() {
+        val id = runningId ?: return
+        val params = runningParams ?: return
+        runBlocking {
+            runCatching {
+                pendingTasks.upsert(params.toEntity(id, waitForCharger = false))
+                checkpointedId = id
+            }.onFailure { Log.e(TAG, "checkpoint failed for $id", it) }
+        }
+        Log.w(TAG, "checkpointed running recording=$id ahead of FGS timeout kill")
     }
 
     /** Called by PowerConnectedReceiver when AC plugs in. */
@@ -328,6 +412,10 @@ class TranscriptionJobManager(
         hybridDiarize = hybridDiarize,
         waitForCharger = waitForCharger,
         queuedAtMillis = System.currentTimeMillis(),
+        superMode = superMode,
+        superPairA = superPairA?.name,
+        superPairB = superPairB?.name,
+        maxQuality = maxQuality,
     )
 
     private fun PendingTask.toParams(): Params = Params(
@@ -338,6 +426,10 @@ class TranscriptionJobManager(
         diarize = diarize,
         expectedSpeakers = expectedSpeakers,
         hybridDiarize = hybridDiarize,
+        superMode = superMode,
+        superPairA = superPairA?.let { n -> runCatching { AsrBackendKind.valueOf(n) }.getOrNull() },
+        superPairB = superPairB?.let { n -> runCatching { AsrBackendKind.valueOf(n) }.getOrNull() },
+        maxQuality = maxQuality,
     )
 
     companion object {

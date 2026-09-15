@@ -25,6 +25,15 @@ data class CatalogEntry(
     val kind: AsrBackendKind = AsrBackendKind.WhisperCpp,   // unused when role=Diarization
     val recommended: Boolean = false,
     /**
+     * True for a `.tar.bz2` that [ModelDownloader] extracts into
+     * `modelsDir()/<filename>/` instead of saving as a flat file at
+     * `modelsDir()/<filename>` — [filename] names the destination
+     * DIRECTORY in that case, not a file. Used by the sherpa-onnx
+     * directory-based engines (Parakeet: encoder/decoder/joiner + tokens;
+     * Omnilingual/Nemotron: one model file + tokens).
+     */
+    val isArchive: Boolean = false,
+    /**
      * Epoch-millis cutoff: a local copy of this file with `lastModified()`
      * older than this is missing a meaningful upstream improvement and
      * should be re-downloaded. The Settings → Installed UI surfaces an
@@ -38,6 +47,15 @@ data class CatalogEntry(
     val requiredAfterMillis: Long? = null,
     /** Short reason shown next to the Update affordance. */
     val updateReason: String? = null,
+    /**
+     * Languages this model is SPECIALISED for (null = general-purpose).
+     * [AsrFactory.resolveModel] uses it when no model is pinned: a
+     * specialised model is auto-picked only when one of its languages is
+     * being transcribed, and otherwise passed over in favour of a general
+     * one — so installing the Ukrainian fine-tune (the largest Whisper
+     * .bin) doesn't hijack every English or Arabic Whisper run.
+     */
+    val languages: Set<String>? = null,
 )
 
 /**
@@ -99,6 +117,7 @@ object ModelCatalog {
             // convert-h5-to-ggml.py then quantized to q5_0.
             // SHA256: 842c2f2104884a14d34ff0e936a5aa2d26b039a688c75a6cb4ce68f41829aa6e
             url = "https://github.com/Ihnatov-yuri/Local-Transcriber/releases/download/Ukrainian_model/ggml-large-uk-q5_0.bin",
+            languages = setOf("uk"),
         ),
         CatalogEntry(
             id = "gemma-4-e2b",
@@ -161,6 +180,47 @@ object ModelCatalog {
             url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet221_LM.onnx",
             role = ModelRole.Diarization,
             recommended = true,
+        ),
+        CatalogEntry(
+            id = "parakeet-tdt-0.6b-v3",
+            displayName = "Parakeet TDT 0.6B v3 (int8)",
+            description = "NVIDIA transducer ASR, 25 European languages including English, " +
+                "Dutch and Ukrainian (not Arabic). Default engine for non-Arabic recordings — " +
+                "word-level timestamps, fast on CPU.",
+            sizeMb = 487,
+            filename = "parakeet-tdt-0.6b-v3",
+            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+            role = ModelRole.Asr,
+            kind = AsrBackendKind.Parakeet,
+            isArchive = true,
+            recommended = true,
+        ),
+        CatalogEntry(
+            id = "omnilingual-ctc-300m",
+            displayName = "Omnilingual ASR CTC 300M (int8)",
+            description = "Meta's 1600-language CTC model. Default engine whenever Arabic " +
+                "is selected (alone or mixed with other languages) — includes Gulf Arabic " +
+                "(afb). No runtime language switch needed; the model covers all of them.",
+            sizeMb = 293,
+            filename = "omnilingual-ctc-300m",
+            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12.tar.bz2",
+            role = ModelRole.Asr,
+            kind = AsrBackendKind.Omnilingual,
+            isArchive = true,
+            recommended = true,
+        ),
+        CatalogEntry(
+            id = "nemotron-3.5-streaming-0.6b",
+            displayName = "Nemotron 3.5 ASR streaming 0.6B (560ms, int8)",
+            description = "NVIDIA cache-aware streaming transducer — English, Arabic (MSA), " +
+                "Ukrainian, Dutch. Replaces the Gemma 4 chunk loop for the Record screen's " +
+                "live transcription and dictation.",
+            sizeMb = 475,
+            filename = "nemotron-3.5-streaming-0.6b",
+            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+            role = ModelRole.Asr,
+            kind = AsrBackendKind.NemotronStream,
+            isArchive = true,
         ),
     )
 

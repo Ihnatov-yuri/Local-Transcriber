@@ -1,5 +1,6 @@
 package nl.ihnatov.transcriber.asr
 
+import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -7,6 +8,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import nl.ihnatov.transcriber.MainActivity
 import nl.ihnatov.transcriber.R
@@ -45,20 +48,48 @@ class TranscriptionService : Service() {
             .setSilent(true)
             .build()
 
-        // Pick the most specific FGS type the OS supports. mediaProcessing
-        // was added in API 35 (Android 15) and is the right semantic fit for
-        // an on-device transcription job; dataSync covers older devices.
-        val fgsType = if (Build.VERSION.SDK_INT >= 35) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-        } else {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notif, fgsType)
+            startForegroundWithFallback(notif)
         } else {
             startForeground(NOTIF_ID, notif)
         }
         return START_STICKY
+    }
+
+    /**
+     * Prefer specialUse (API 34+): unlike mediaProcessing/dataSync it has
+     * no 6-hour-per-day budget, which matters for long transcription runs.
+     * If the platform ever refuses it we fall back to the typed
+     * alternative rather than letting the service crash outright.
+     */
+    private fun startForegroundWithFallback(notif: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "specialUse FGS start refused, falling back", e)
+            }
+        }
+        val fallbackType = if (Build.VERSION.SDK_INT >= 35) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        }
+        startForeground(NOTIF_ID, notif, fallbackType)
+    }
+
+    /**
+     * Only reachable when we ended up on the mediaProcessing/dataSync
+     * fallback (specialUse has no enforced timeout) — the OS gives us a
+     * short grace window here before it kills the process outright, so we
+     * use it to save the in-flight job rather than silently losing it.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "FGS timeout (type=$fgsType) — checkpointing before the OS kills us")
+        (application as? TranscriberApplication)?.container?.transcriptionJobManager?.checkpointRunning()
+        stopSelf(startId)
     }
 
     override fun onDestroy() {
@@ -67,6 +98,7 @@ class TranscriptionService : Service() {
     }
 
     companion object {
+        private const val TAG = "TranscriptionService"
         private const val NOTIF_ID = 1002
 
         fun start(ctx: Context) {

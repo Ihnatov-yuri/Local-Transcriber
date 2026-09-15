@@ -1,28 +1,25 @@
 [versions]
-agp = "9.2.1"
-kotlin = "2.2.10"
-ksp = "2.3.2"
+agp = "9.4.0"
+kotlin = "2.4.20"
+ksp = "2.3.12"
 coreKtx = "1.15.0"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
-composeBom = "2024.12.01"
+composeBom = "2026.08.00"
 navigationCompose = "2.8.5"
-room = "2.8.4"
-media3 = "1.5.1"
-datastore = "1.1.1"
-coroutines = "1.9.0"
-litertlm = "0.11.0"
-sherpaOnnx = "8.5.1"
-# Pinned to 1.24.3 — sherpa-onnx 8.5.1's libsherpa-onnx-jni.so requires
-# `OrtGetApiBase@VERS_1.24.3` (versioned symbol). The bundled
-# lib-onnx 6.16.7 ships ORT 1.17.1 (wrong version). Microsoft's 1.26.0
-# and 1.19.2 also expose wrong versions. Only Microsoft ORT 1.24.x
-# satisfies the exact versioned-symbol dependency.
-# Verified via `llvm-readelf --dyn-syms` on the .so files in the APK.
-# Bumping requires matching sherpa-onnx version too.
-onnxruntime = "1.24.3"
-serializationJson = "1.7.3"
+room = "2.8.5"
+media3 = "1.11.1"
+datastore = "1.2.1"
+coroutines = "1.11.0"
+litertlm = "0.17.0"
+# sherpa-onnx is no longer a Maven dependency — see app/libs/README.md and
+# scripts/fetch-sherpa-onnx.sh. The official k2-fsa AAR bundles its own
+# matching libonnxruntime.so per ABI, so there's no separate onnxruntime
+# artifact or versioned-symbol pin to maintain here anymore.
+serializationJson = "1.11.0"
 documentfile = "1.0.1"
+commonsCompress = "1.28.0"
+commonmark = "0.30.0"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
 espresso = "3.6.1"
@@ -60,24 +57,23 @@ androidx-documentfile = { module = "androidx.documentfile:documentfile", version
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serializationJson" }
 
+# tar.bz2 extraction for the Parakeet/Omnilingual/Nemotron model archives —
+# the JDK's java.util.zip has no bzip2 codec. Pure Java, no native code, no
+# transitive deps needed for just the tar + bzip2 readers we use.
+commons-compress = { module = "org.apache.commons:commons-compress", version.ref = "commonsCompress" }
+
+# Real CommonMark parsing (tables via the GFM extension, fenced code,
+# blockquotes) for post-processing outputs — replaces the hand-rolled
+# MarkdownText parser (Phase 5 of the 2026-09 plan). Pure Java, no
+# transitive deps beyond each other.
+commonmark = { module = "org.commonmark:commonmark", version.ref = "commonmark" }
+commonmark-ext-gfm-tables = { module = "org.commonmark:commonmark-ext-gfm-tables", version.ref = "commonmark" }
+
 # LiteRT-LM Android — Google's runtime for Gemma 4 .litertlm audio models.
 # Lives on Google Maven (already in settings.gradle.kts via google()), not Central.
 # Replaces the older com.google.mediapipe:tasks-genai which doesn't yet load
 # Gemma 4's litertlm format.
 litertlm-android = { module = "com.google.ai.edge.litertlm:litertlm-android", version.ref = "litertlm" }
-
-# sherpa-onnx native runtime (community-maintained mirror of k2-fsa/sherpa-onnx
-# binaries). Ships libsherpa-onnx-jni.so + ASR Kotlin classes. The diarization
-# Kotlin wrapper is vendored under app/src/main/kotlin/com/k2fsa/sherpa/onnx/
-# because the upstream Maven artifact omits it; native methods still resolve
-# because they're compiled into the shared .so.
-sherpa-onnx = { module = "com.bihe0832.android:lib-sherpa-onnx", version.ref = "sherpaOnnx" }
-
-# Microsoft's official onnxruntime — supersedes the older copy that
-# sherpa-onnx pulls in transitively (com.bihe0832.android:lib-onnx). The
-# transitive copy ships a 4 KB-aligned libonnxruntime.so which fails Android
-# 15's 16 KB-page compatibility check. 1.26+ binaries are 16 KB-aligned.
-onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android", version.ref = "onnxruntime" }
 
 # Tests
 junit = { module = "junit:junit", version.ref = "junit" }
@@ -86,7 +82,8 @@ androidx-espresso-core = { module = "androidx.test.espresso:espresso-core", vers
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+# No standalone kotlin-android plugin: AGP 9's built-in Kotlin support
+# (enabled by default) compiles Kotlin sources without it.
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }

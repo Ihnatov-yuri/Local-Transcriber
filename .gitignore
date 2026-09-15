@@ -34,6 +34,9 @@ app/src/main/jniLibs/**/*.so
 app/src/main/cpp/whisper.cpp/
 app/src/main/cpp/build/
 
+# sherpa-onnx AAR — fetched by scripts/fetch-sherpa-onnx.sh, not vendored
+app/libs/*.aar
+
 # Downloaded models (provisioned at first run, never committed)
 app/src/main/assets/models/
 **/models/*.bin

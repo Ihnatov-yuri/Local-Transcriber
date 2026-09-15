@@ -9,6 +9,7 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ResponseFormat
 import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -728,6 +729,170 @@ class Gemma4Backend(
     }
 
     /**
+     * Best-effort cleanup pass over [DiarizationRunner]'s global clustering:
+     * hands Gemma the cluster ids with their durations and per-segment-
+     * average confidence, and asks which ones are actually the same
+     * speaker misclustered as different ids. Constrained JSON decoding
+     * (`ResponseFormat.json` + `enableResponseFormat = true`, LiteRT-LM
+     * 0.17.0) keeps the output to exactly `{"merge": [[a,b], ...]}` — no
+     * free text to parse out.
+     *
+     * Never fails the caller: a timed-out, malformed, or model-unavailable
+     * response just means "no merge suggested" ([parseMergeMapResponse]
+     * already drops anything invalid). This is a cleanup layer on top of
+     * clustering that already works on its own, not a dependency.
+     */
+    suspend fun suggestSpeakerMergeMap(
+        clusters: List<ClusterSummary>,
+    ): List<Pair<Int, Int>> = withContext(Dispatchers.Default) {
+        if (clusters.size < 2) return@withContext emptyList()
+        mutex.withLock {
+            val e = engine ?: return@withLock emptyList()
+            var conv: Conversation? = null
+            try {
+                conv = e.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(Content.Text(MERGE_MAP_SYSTEM_PROMPT)),
+                        // Deterministic — this is a structured-data task,
+                        // not prose; no benefit to sampling variety.
+                        samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.1),
+                        enableResponseFormat = true,
+                    )
+                )
+                val userMessage = clusters.joinToString("\n", prefix = "Clusters:\n") { c ->
+                    "id=${c.id} duration=${"%.1f".format(c.durationSeconds)}s confidence=${"%.2f".format(c.confidence)}"
+                }
+                val acc = StringBuilder()
+                try {
+                    conv.sendMessageAsync(
+                        Contents.of(Content.Text(userMessage)),
+                        emptyMap(),
+                        responseFormat = ResponseFormat.json(MERGE_MAP_JSON_SCHEMA),
+                    ).collect { msg ->
+                        acc.append(msg.contents.contents.filterIsInstance<Content.Text>().joinToString("") { it.text })
+                    }
+                } catch (ce: CancellationException) {
+                    runCatching { conv.cancelProcess() }
+                    throw ce
+                }
+                val pairs = parseMergeMapResponse(acc.toString(), validIds = clusters.map { it.id }.toSet())
+                Log.i(TAG, "speaker merge-map: ${clusters.size} clusters → ${pairs.size} merge pairs suggested")
+                pairs
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "speaker merge-map suggestion failed, skipping merge", t)
+                emptyList()
+            } finally {
+                runCatching { conv?.close() }
+            }
+        }
+    }
+
+    /**
+     * Super mode's arbitration second pass: given a list of A/B disputes
+     * (see [RoverMerge.Dispute]) from one low-agreement chunk, asks Gemma
+     * to pick a side for each rather than write free text — see
+     * [ARBITRATION_JSON_SCHEMA]'s doc comment for why. Returns one 0/1
+     * choice per dispute in the same order, or null on any failure
+     * (caller falls back to the vote-only merge; this is a quality
+     * refinement, never a dependency).
+     */
+    suspend fun arbitrateDisputes(
+        disputes: List<RoverMerge.Dispute>,
+        labelA: String,
+        labelB: String,
+    ): List<Int>? = withContext(Dispatchers.Default) {
+        if (disputes.isEmpty()) return@withContext null
+        mutex.withLock {
+            val e = engine ?: return@withLock null
+            var conv: Conversation? = null
+            try {
+                conv = e.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(Content.Text(ARBITRATION_SYSTEM_PROMPT)),
+                        samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.1),
+                        enableResponseFormat = true,
+                    )
+                )
+                val userMessage = disputes.withIndex().joinToString(
+                    "\n",
+                    prefix = "Disputes ($labelA=0 vs $labelB=1):\n",
+                ) { (i, d) -> "$i: [0] ${d.optionA}  [1] ${d.optionB}" }
+                val acc = StringBuilder()
+                try {
+                    conv.sendMessageAsync(
+                        Contents.of(Content.Text(userMessage)),
+                        emptyMap(),
+                        responseFormat = ResponseFormat.json(ARBITRATION_JSON_SCHEMA),
+                    ).collect { msg ->
+                        acc.append(msg.contents.contents.filterIsInstance<Content.Text>().joinToString("") { it.text })
+                    }
+                } catch (ce: CancellationException) {
+                    runCatching { conv.cancelProcess() }
+                    throw ce
+                }
+                parseArbitrationResponse(acc.toString(), disputes.size)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "arbitration failed, caller falls back to vote-only merge", t)
+                null
+            } finally {
+                runCatching { conv?.close() }
+            }
+        }
+    }
+
+    /**
+     * Auto-classify a recording into a [RecordingCategory] from a short
+     * transcript excerpt, via constrained JSON decoding (same mechanism as
+     * [suggestSpeakerMergeMap]/[arbitrateDisputes]). New to the Android
+     * app — see [RecordingCategory]'s doc comment. Never fails the
+     * caller: any timeout, malformed response, or model-unavailable
+     * condition is "no category" (null), not a thrown exception —
+     * classification is a Library-browsing nicety, never a transcription
+     * dependency.
+     */
+    suspend fun suggestCategory(excerpt: String): RecordingCategory? = withContext(Dispatchers.Default) {
+        if (excerpt.isBlank()) return@withContext null
+        mutex.withLock {
+            val e = engine ?: return@withLock null
+            var conv: Conversation? = null
+            try {
+                conv = e.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(Content.Text(CLASSIFY_SYSTEM_PROMPT)),
+                        samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.1),
+                        enableResponseFormat = true,
+                    )
+                )
+                val acc = StringBuilder()
+                try {
+                    conv.sendMessageAsync(
+                        Contents.of(Content.Text("Transcript excerpt:\n$excerpt")),
+                        emptyMap(),
+                        responseFormat = ResponseFormat.json(CLASSIFY_JSON_SCHEMA),
+                    ).collect { msg ->
+                        acc.append(msg.contents.contents.filterIsInstance<Content.Text>().joinToString("") { it.text })
+                    }
+                } catch (ce: CancellationException) {
+                    runCatching { conv.cancelProcess() }
+                    throw ce
+                }
+                parseClassifyResponse(acc.toString())
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "auto-classify failed, skipping", t)
+                null
+            } finally {
+                runCatching { conv?.close() }
+            }
+        }
+    }
+
+    /**
      * Role + hard rules. Stays in the systemInstruction channel; the user
      * message at run-time is just "Transcribe." or "Translate." so the model
      * has nothing to echo back.
@@ -1226,6 +1391,30 @@ class Gemma4Backend(
 
     companion object {
         private const val TAG = "Gemma4Backend"
+
+        /** System prompt for [suggestCategory]. Output shape is enforced by the JSON schema, not this text. */
+        private const val CLASSIFY_SYSTEM_PROMPT =
+            "You are classifying an audio recording from a short excerpt of its transcript. " +
+                "Categories:\n" +
+                "- meeting: multiple people discussing or deciding something together\n" +
+                "- interview: one person asking another a structured series of questions\n" +
+                "- note: a single speaker's own thoughts, log, or reminder to themselves\n" +
+                "- idea: a single speaker brainstorming or pitching a concept\n" +
+                "Pick exactly one. If genuinely ambiguous, prefer note."
+
+        /** System prompt for [suggestSpeakerMergeMap]. Output shape is enforced by the JSON schema, not this text. */
+        private const val MERGE_MAP_SYSTEM_PROMPT =
+            "You are cleaning up speaker-diarization output. You will be given a list of " +
+                "speaker clusters, each with an id, total speaking duration, and average " +
+                "confidence. Some clusters may actually be the SAME speaker, split into " +
+                "separate ids by clustering error — this is common for short or low-" +
+                "confidence clusters. Only suggest merging two clusters if you have good " +
+                "reason to believe they are the same speaker; a short cluster is not, by " +
+                "itself, reason to merge it with a longer one. If you are unsure, do not " +
+                "suggest a merge. Never suggest merging two clusters that are both long " +
+                "and high-confidence — those are almost always genuinely different " +
+                "speakers. Respond with only the merge pairs; an empty list is a valid " +
+                "and often correct answer."
 
         /**
          * Audio per inference. Gemma 4 internally caps at ~30 sec; we leave

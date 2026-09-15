@@ -12,7 +12,14 @@
          Samsung devices aggressively suspend background apps despite FGS +
          wake locks unless this exemption is granted. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- Transcription FGS: mediaProcessing on API 35+, dataSync as fallback on older. -->
+    <!--
+        Transcription FGS: specialUse on API 34+ (no 6 h/day cap, unlike
+        mediaProcessing/dataSync below), mediaProcessing on API 35 as a
+        defensive fallback if starting with specialUse is ever refused,
+        dataSync as the last resort on older devices.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+        android:minSdkVersion="34" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING"
         android:minSdkVersion="35" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -35,7 +42,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Transcriber"
-        tools:targetApi="35">
+        tools:targetApi="37">
 
         <activity
             android:name=".MainActivity"
@@ -56,6 +63,10 @@
         <service
             android:name=".asr.TranscriptionService"
             android:exported="false"
-            android:foregroundServiceType="mediaProcessing|dataSync" />
+            android:foregroundServiceType="specialUse|mediaProcessing|dataSync">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="on-device audio transcription, which can run longer than the 6-hour daily budget mediaProcessing/dataSync allow" />
+        </service>
     </application>
 </manifest>

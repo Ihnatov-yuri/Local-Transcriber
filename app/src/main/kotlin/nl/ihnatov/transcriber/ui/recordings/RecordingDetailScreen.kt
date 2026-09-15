@@ -8,6 +8,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -38,6 +42,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -54,8 +59,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -63,16 +70,21 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import nl.ihnatov.transcriber.asr.AsrBackendKind
+import nl.ihnatov.transcriber.asr.TextDestutter
 import nl.ihnatov.transcriber.asr.TranscriptExporter
+import nl.ihnatov.transcriber.asr.defaultEngineFor
 import nl.ihnatov.transcriber.audio.AudioPlayerController
 import nl.ihnatov.transcriber.audio.WaveformLoader
 import nl.ihnatov.transcriber.data.AppContainer
+import nl.ihnatov.transcriber.data.Folder
+import nl.ihnatov.transcriber.data.Tag
 import nl.ihnatov.transcriber.ui.KeepScreenOn
 import nl.ihnatov.transcriber.ui.MarkdownText
 import nl.ihnatov.transcriber.ui.components.Hairline
@@ -119,7 +131,48 @@ fun RecordingDetailScreen(
     val lastLangs by container.uiPrefs.lastLanguages.collectAsStateWithLifecycle()
     var selectedLangs by remember { mutableStateOf(lastLangs) }
     var translateTo by remember { mutableStateOf<String?>(null) }
-    var backend by remember { mutableStateOf(container.defaultBackend()) }
+    // "Auto" engine policy: Parakeet by default, Omnilingual once Arabic is
+    // selected — see AsrBackend.defaultEngineFor. Tracks the language pick
+    // automatically until the user taps ENGINE to override it explicitly;
+    // after that we stop overwriting their choice.
+    // If the policy's pick has no model installed yet (fresh install with
+    // only Gemma/Whisper, before Parakeet was ever downloaded), fall back
+    // to an engine that DOES have one — otherwise auto-run after recording
+    // silently never fires and RUN just says "no model installed".
+    fun autoEngineFor(langs: Set<String>): AsrBackendKind {
+        val preferred = defaultEngineFor(langs)
+        val fallbacks = listOf(
+            preferred, AsrBackendKind.Gemma4, AsrBackendKind.WhisperCpp,
+            AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual,
+        )
+        return fallbacks.firstOrNull { container.asrFactory.listModels(it).isNotEmpty() } ?: preferred
+    }
+    var backend by remember { mutableStateOf(autoEngineFor(lastLangs)) }
+    var backendManuallySet by remember { mutableStateOf(false) }
+    LaunchedEffect(selectedLangs) {
+        if (!backendManuallySet) backend = autoEngineFor(selectedLangs)
+    }
+    // Super mode (Phase 3): run two engines and vote-merge instead of just
+    // `backend`. Pair is a small curated list, not two free pickers — most
+    // combinations aren't meaningful (e.g. Parakeet+Parakeet), and these
+    // two mirror the plan's own default/Arabic split.
+    var superMode by remember { mutableStateOf(false) }
+    var superPairIdx by remember { mutableIntStateOf(0) }
+    val superPair = SUPER_PAIR_PRESETS[superPairIdx]
+    var maxQuality by remember { mutableStateOf(false) }
+
+    // File-transcription engine cycle. NemotronStream isn't offered here —
+    // it's a streaming-only engine driven by LiveTranscriber on the Record
+    // screen, not something that transcribes an already-recorded file.
+    val cycleBackend = {
+        backendManuallySet = true
+        val order = listOf(
+            AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual,
+            AsrBackendKind.Gemma4, AsrBackendKind.WhisperCpp,
+        )
+        val idx = order.indexOf(backend).let { if (it < 0) 0 else it }
+        backend = order[(idx + 1) % order.size]
+    }
     var diarize by remember { mutableStateOf(false) }
     val diarReady = remember { container.diarizationRunner.isEmbeddingModelPresent() }
     val embeddingModelName = remember { container.diarizationRunner.embeddingModelDisplayName() }
@@ -144,9 +197,18 @@ fun RecordingDetailScreen(
     var langDialogOpen by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<String?>(null) }
     var renameDraft by remember { mutableStateOf("") }
+    var historySheetOpen by remember { mutableStateOf(false) }
+    var restoreTarget by remember { mutableStateOf<Long?>(null) }
     var fullscreen by remember { mutableStateOf(false) }
     val showTimestamps by container.uiPrefs.showTimestamps.collectAsStateWithLifecycle()
     val proseMode by container.uiPrefs.proseMode.collectAsStateWithLifecycle()
+    // Same toggle PostProcessor.assembleTranscriptForPrompt already applies
+    // before every preset — applying it here too keeps what's ON SCREEN
+    // consistent with what presets read, per the plan's Phase 4 item
+    // ("runs before every preset and on segment display when 'Remove
+    // fillers' is on"). Display-only: the stored segment.text (and its
+    // exported sidecars) are untouched.
+    val removeFillers by container.promptStore.removeFillers.collectAsStateWithLifecycle()
 
     val installedModels = remember(backend) { container.asrFactory.listModels(backend) }
     var autoFired by remember { mutableStateOf(false) }
@@ -162,6 +224,10 @@ fun RecordingDetailScreen(
                 diarize = diarize,
                 expectedSpeakers = expectedSpeakers,
                 hybridDiarize = hybridDiar && diarize && backend == AsrBackendKind.Gemma4 && diarReady,
+                superMode = superMode,
+                superPairA = superPair.first,
+                superPairB = superPair.second,
+                maxQuality = maxQuality,
             )
         }
     }
@@ -217,6 +283,7 @@ fun RecordingDetailScreen(
                 onBack = onBack,
                 rec = ui.recording,
                 hasTranscript = ui.segments.isNotEmpty(),
+                hasHistory = ui.versions.isNotEmpty(),
                 fullscreen = fullscreen,
                 onToggleFullscreen = { fullscreen = !fullscreen },
                 onShare = {
@@ -229,6 +296,7 @@ fun RecordingDetailScreen(
                     }
                     context.startActivity(Intent.createChooser(intent, "Share transcript"))
                 },
+                onShowHistory = { historySheetOpen = true },
                 onDelete = { vm.delete(onBack) },
             )
             Spacer(Modifier.height(10.dp))
@@ -262,6 +330,17 @@ fun RecordingDetailScreen(
                 )
                 Spacer(Modifier.height(8.dp))
                 HairlineSoft()
+                Spacer(Modifier.height(8.dp))
+                OrganizeRow(
+                    currentFolderId = ui.recording?.folderId,
+                    allFolders = ui.allFolders,
+                    tags = ui.tags,
+                    onMoveToFolder = vm::moveToFolder,
+                    onAddTag = vm::addTag,
+                    onRemoveTag = vm::removeTag,
+                )
+                Spacer(Modifier.height(8.dp))
+                HairlineSoft()
                 Spacer(Modifier.height(12.dp))
 
                 // Transcribe RUN strip — collapsed by default. Shows current
@@ -280,11 +359,9 @@ fun RecordingDetailScreen(
                     hybridDiar = hybridDiar,
                     runOnCharger = runOnCharger,
                     installedModelsEmpty = installedModels.isEmpty(),
-                    onCycleBackend = {
-                        backend = if (backend == AsrBackendKind.Gemma4)
-                            AsrBackendKind.WhisperCpp
-                        else AsrBackendKind.Gemma4
-                    },
+                    superMode = superMode,
+                    superPairLabel = superPairLabel(superPair),
+                    onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
                         val cycle = listOf<String?>(null, "en", "ar", "uk", "nl")
@@ -316,6 +393,10 @@ fun RecordingDetailScreen(
                             runOnCharger = runOnCharger,
                             hybridDiarize = hybridDiar && diarize &&
                                 backend == AsrBackendKind.Gemma4 && diarReady,
+                            superMode = superMode,
+                            superPairA = superPair.first,
+                            superPairB = superPair.second,
+                            maxQuality = maxQuality,
                         )
                     },
                     onCancel = { vm.cancelTranscription() },
@@ -393,6 +474,7 @@ fun RecordingDetailScreen(
                         speakerColors = speakerKeys.mapIndexed { idx, k -> k to speakerColor(idx) }.toMap(),
                         showTimestamps = showTimestamps,
                         proseMode = proseMode,
+                        removeFillers = removeFillers,
                         activeSegmentId = activeSegmentId,
                         onEdit = vm::editSegmentText,
                         onSegmentSeek = { seg -> playerController.seekToSeconds(seg.startSeconds) },
@@ -403,7 +485,12 @@ fun RecordingDetailScreen(
                         onShare = {
                             val rec = ui.recording ?: return@OutputBody
                             val intent = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
+                                // Real markdown content (see MarkdownText.kt) —
+                                // apps that understand the type (Obsidian,
+                                // most note apps, Gmail's compose) get to
+                                // treat it as such instead of literal
+                                // asterisks and pound signs.
+                                type = "text/markdown"
                                 putExtra(Intent.EXTRA_SUBJECT, "${rec.title} — ${tab.doc.title}")
                                 putExtra(Intent.EXTRA_TEXT, tab.doc.markdown)
                             }
@@ -434,6 +521,52 @@ fun RecordingDetailScreen(
                     selectedLangs = picks
                     container.uiPrefs.setLastLanguages(picks)
                     langDialogOpen = false
+                },
+            )
+        }
+        // Version history — past transcript snapshots, taken automatically
+        // right before each re-run (and before a restore) overwrites the
+        // live transcript. See TranscriptVersion.kt / RecordingRepository.
+        if (historySheetOpen) {
+            val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+            ModalBottomSheet(
+                onDismissRequest = { historySheetOpen = false },
+                sheetState = sheetState,
+                containerColor = MaterialTheme.colorScheme.background,
+            ) {
+                VersionHistorySheet(
+                    versions = ui.versions,
+                    onRestore = { restoreTarget = it },
+                    onDelete = { vm.deleteVersion(it) },
+                )
+            }
+        }
+        restoreTarget?.let { versionId ->
+            val version = ui.versions.firstOrNull { it.id == versionId }
+            AlertDialog(
+                onDismissRequest = { restoreTarget = null },
+                containerColor = MaterialTheme.colorScheme.background,
+                title = { Mono("RESTORE VERSION", color = MaterialTheme.colorScheme.onBackground) },
+                text = {
+                    Text(
+                        "Replace the current transcript with the " +
+                            "${version?.engineLabel ?: "selected"} version from " +
+                            (version?.let { formatStampMono(it.createdAtMillis) } ?: "") +
+                            "? The current transcript is saved to history first, so " +
+                            "this can be undone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f),
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        vm.restoreVersion(versionId)
+                        restoreTarget = null
+                        historySheetOpen = false
+                    }) { Mono("RESTORE") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { restoreTarget = null }) { Mono("CANCEL") }
                 },
             )
         }
@@ -474,11 +607,7 @@ fun RecordingDetailScreen(
                     },
                     runOnCharger = runOnCharger,
                     expectedSpeakers = expectedSpeakers,
-                    onCycleBackend = {
-                        backend = if (backend == AsrBackendKind.Gemma4)
-                            AsrBackendKind.WhisperCpp
-                        else AsrBackendKind.Gemma4
-                    },
+                    onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
                         val cycle = listOf<String?>(null, "en", "ar", "uk", "nl")
@@ -495,6 +624,12 @@ fun RecordingDetailScreen(
                             else -> expectedSpeakers + 1
                         }
                     },
+                    superMode = superMode,
+                    onToggleSuper = { superMode = !superMode },
+                    superPairLabel = superPairLabel(superPair),
+                    onCyclePair = { superPairIdx = (superPairIdx + 1) % SUPER_PAIR_PRESETS.size },
+                    maxQuality = maxQuality,
+                    onToggleMaxQuality = { maxQuality = !maxQuality },
                 )
             }
         }
@@ -508,9 +643,11 @@ private fun DetailTopRow(
     onBack: () -> Unit,
     @Suppress("UNUSED_PARAMETER") rec: nl.ihnatov.transcriber.data.Recording?,
     hasTranscript: Boolean,
+    hasHistory: Boolean,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     onShare: () -> Unit,
+    onShowHistory: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
@@ -559,6 +696,12 @@ private fun DetailTopRow(
                         onClick = { menuOpen = false; onShare() },
                     )
                 }
+                if (hasHistory) {
+                    DropdownMenuItem(
+                        text = { Mono("HISTORY", color = ink) },
+                        onClick = { menuOpen = false; onShowHistory() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Mono("DELETE RECORDING", color = Accent) },
                     onClick = { menuOpen = false; onDelete() },
@@ -596,6 +739,10 @@ private fun MetadataStrip(
             Mono(it.uppercase(), color = ink.copy(alpha = 0.62f))
             Mono("·", color = ink.copy(alpha = 0.3f))
         }
+        nl.ihnatov.transcriber.asr.RecordingCategory.fromId(rec?.category)?.let { cat ->
+            Mono(cat.displayName.uppercase(), color = ink.copy(alpha = 0.62f))
+            Mono("·", color = ink.copy(alpha = 0.3f))
+        }
         if (speakerCount > 0) {
             Mono("$speakerCount SPEAKERS", color = ink.copy(alpha = 0.62f))
             Mono("·", color = ink.copy(alpha = 0.3f))
@@ -603,6 +750,154 @@ private fun MetadataStrip(
         if (segmentCount > 0) {
             Mono("$segmentCount TURNS", color = ink.copy(alpha = 0.62f))
         }
+    }
+}
+
+/**
+ * Folder dropdown + tag editor, side by side — mirrors the Mac's
+ * `organizeRow()` (`HStack { folderMenu(); TagEditorRow(...) }`).
+ */
+@Composable
+private fun OrganizeRow(
+    currentFolderId: Long?,
+    allFolders: List<Folder>,
+    tags: List<Tag>,
+    onMoveToFolder: (Long?) -> Unit,
+    onAddTag: (String) -> Unit,
+    onRemoveTag: (Long) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.Top) {
+        FolderMenu(currentFolderId = currentFolderId, allFolders = allFolders, onMoveToFolder = onMoveToFolder)
+        Spacer(Modifier.width(Spacing.m))
+        TagEditorRow(
+            tags = tags,
+            onAddTag = onAddTag,
+            onRemoveTag = onRemoveTag,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** "FOLDER: NAME ▾" — every other folder, plus "Remove from Folder" when filed. Mirrors the Mac's `folderMenu()`. */
+@Composable
+private fun FolderMenu(
+    currentFolderId: Long?,
+    allFolders: List<Folder>,
+    onMoveToFolder: (Long?) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var menuOpen by remember { mutableStateOf(false) }
+    val currentName = allFolders.find { it.id == currentFolderId }?.name
+    Box {
+        Mono(
+            "FOLDER: ${currentName?.uppercase() ?: "—"} ▾",
+            color = if (currentFolderId == null) ink.copy(alpha = 0.62f) else Accent,
+            modifier = Modifier.clickable { menuOpen = true }.padding(vertical = 4.dp),
+        )
+        DropdownMenu(
+            expanded = menuOpen,
+            onDismissRequest = { menuOpen = false },
+            containerColor = MaterialTheme.colorScheme.background,
+        ) {
+            for (f in allFolders.filter { it.id != currentFolderId }) {
+                DropdownMenuItem(
+                    text = { Text(f.name) },
+                    onClick = { menuOpen = false; onMoveToFolder(f.id) },
+                )
+            }
+            if (currentFolderId != null) {
+                DropdownMenuItem(
+                    text = { Mono("REMOVE FROM FOLDER", color = Accent) },
+                    onClick = { menuOpen = false; onMoveToFolder(null) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Current tags as removable chips (✕, bottom hairline like the Mac's
+ * underlined chip) plus an inline "add tag…" field that commits on
+ * Enter or a trailing comma. Mirrors the Mac's `TagEditorRow`.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TagEditorRow(
+    tags: List<Tag>,
+    onAddTag: (String) -> Unit,
+    onRemoveTag: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    var draft by remember { mutableStateOf("") }
+    fun commitDraft() {
+        val name = draft.trim()
+        draft = ""
+        if (name.isNotEmpty()) onAddTag(name)
+    }
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = modifier,
+    ) {
+        Mono("TAGS", color = ink.copy(alpha = 0.40f), modifier = Modifier.padding(vertical = 4.dp))
+        for (tag in tags.sortedBy { it.name }) {
+            Box {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                ) {
+                    Mono(tag.name, color = ink)
+                    Spacer(Modifier.width(5.dp))
+                    Mono(
+                        "✕",
+                        color = ink.copy(alpha = 0.40f),
+                        modifier = Modifier.clickable { onRemoveTag(tag.id) },
+                    )
+                }
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .drawBehind {
+                            drawLine(
+                                color = ink.copy(alpha = 0.16f),
+                                start = Offset(0f, size.height),
+                                end = Offset(size.width, size.height),
+                                strokeWidth = 1.dp.toPx(),
+                            )
+                        },
+                )
+            }
+        }
+        BasicTextField(
+            value = draft,
+            onValueChange = { value ->
+                if (value.endsWith(",")) {
+                    draft = value.removeSuffix(",")
+                    commitDraft()
+                } else {
+                    draft = value
+                }
+            },
+            singleLine = true,
+            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = ink),
+            cursorBrush = SolidColor(Accent),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { commitDraft() }),
+            modifier = Modifier.width(90.dp).padding(vertical = 4.dp),
+            decorationBox = { inner ->
+                Box {
+                    if (draft.isEmpty()) {
+                        Text(
+                            "add tag…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ink.copy(alpha = 0.40f),
+                        )
+                    }
+                    inner()
+                }
+            },
+        )
     }
 }
 
@@ -622,6 +917,8 @@ private fun RunStrip(
     hybridDiar: Boolean,
     runOnCharger: Boolean,
     installedModelsEmpty: Boolean,
+    superMode: Boolean,
+    superPairLabel: String,
     onCycleBackend: () -> Unit,
     onPickLanguages: () -> Unit,
     onCycleTranslate: () -> Unit,
@@ -647,7 +944,7 @@ private fun RunStrip(
             Mono("RUN ${if (expanded) "▾" else "▸"}", color = ink)
             Spacer(Modifier.width(10.dp))
             val summary = buildString {
-                append(if (backend == AsrBackendKind.Gemma4) "GEMMA 4" else "WHISPER")
+                append(if (superMode) "SUPER · $superPairLabel" else runSheetEngineLabel(backend))
                 append(" · ")
                 append(summarizeLanguages(selectedLangs).uppercase())
                 translateTo?.let { append(" → ").append(it.uppercase()) }
@@ -669,17 +966,22 @@ private fun RunStrip(
         }
         val active = job.running || job.waitingForCharger || job.queued
         if (active) {
-            // Inverse "Stop" / status row.
+            // Inverse "Stop" / status row. Not clickable while already
+            // stopping — cancellation is cooperative (see JobStatus.
+            // stopping's doc comment) so a second tap can't speed
+            // anything up, and leaving the tap affordance up would read
+            // as "my first tap didn't register."
             Column(
                 Modifier
                     .fillMaxWidth()
                     .background(ink)
-                    .clickable(onClick = onCancel)
+                    .let { if (job.stopping) it else it.clickable(onClick = onCancel) }
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Mono(
                     when {
+                        job.stopping -> "STOPPING…"
                         job.waitingForCharger -> "WAITING FOR CHARGER — TAP TO CANCEL"
                         job.queued -> "QUEUED — TAP TO CANCEL"
                         else -> "TRANSCRIBING — TAP TO STOP"
@@ -776,6 +1078,12 @@ private fun RunOptionsSheetContent(
     onToggleHybrid: () -> Unit,
     onToggleCharger: () -> Unit,
     onCycleSpeakers: () -> Unit,
+    superMode: Boolean,
+    onToggleSuper: () -> Unit,
+    superPairLabel: String,
+    onCyclePair: () -> Unit,
+    maxQuality: Boolean,
+    onToggleMaxQuality: () -> Unit,
 ) {
     // Which row's help dialog is currently shown. Null = none. Per-row
     // help is opened by tapping the (?) chip at the right end of each
@@ -795,21 +1103,42 @@ private fun RunOptionsSheetContent(
         )
         Spacer(Modifier.height(6.dp))
         RunOptionLine(
-            label = "ENGINE",
-            value = if (backend == AsrBackendKind.Gemma4) "GEMMA 4" else "WHISPER",
-            onClick = onCycleBackend,
-            onHelp = { helpFor = RunOptionHelp.ENGINE },
+            label = "SUPER",
+            value = if (superMode) "ON" else "OFF",
+            onClick = onToggleSuper,
+            onHelp = { helpFor = RunOptionHelp.SUPER },
         )
-        // Gemma model picker — only when the Gemma backend has more than
-        // one model installed (E2B + E4B). Tapping cycles the active
-        // model and pins it. Hidden otherwise (nothing to choose).
-        if (backend == AsrBackendKind.Gemma4 && gemmaModelLabel != null) {
+        if (superMode) {
             RunOptionLine(
-                label = "MODEL",
-                value = gemmaModelLabel,
-                onClick = onCycleGemmaModel,
-                onHelp = { helpFor = RunOptionHelp.MODEL },
+                label = "PAIR",
+                value = superPairLabel,
+                onClick = onCyclePair,
+                onHelp = { helpFor = RunOptionHelp.PAIR },
             )
+            RunOptionLine(
+                label = "MAX QUALITY",
+                value = if (maxQuality) "ON" else "OFF",
+                onClick = onToggleMaxQuality,
+                onHelp = { helpFor = RunOptionHelp.MAX_QUALITY },
+            )
+        } else {
+            RunOptionLine(
+                label = "ENGINE",
+                value = runSheetEngineLabel(backend),
+                onClick = onCycleBackend,
+                onHelp = { helpFor = RunOptionHelp.ENGINE },
+            )
+            // Gemma model picker — only when the Gemma backend has more than
+            // one model installed (E2B + E4B). Tapping cycles the active
+            // model and pins it. Hidden otherwise (nothing to choose).
+            if (backend == AsrBackendKind.Gemma4 && gemmaModelLabel != null) {
+                RunOptionLine(
+                    label = "MODEL",
+                    value = gemmaModelLabel,
+                    onClick = onCycleGemmaModel,
+                    onHelp = { helpFor = RunOptionHelp.MODEL },
+                )
+            }
         }
         RunOptionLine(
             label = "LANG",
@@ -817,12 +1146,17 @@ private fun RunOptionsSheetContent(
             onClick = onPickLanguages,
             onHelp = { helpFor = RunOptionHelp.LANG },
         )
-        RunOptionLine(
-            label = "TRANSLATE",
-            value = (translateTo?.uppercase() ?: "OFF"),
-            onClick = onCycleTranslate,
-            onHelp = { helpFor = RunOptionHelp.TRANSLATE },
-        )
+        // Only whisper.cpp and Gemma can translate; the sherpa-onnx engines
+        // (and a Super pair) transcribe as-is, so don't offer a target the
+        // runner would have to ignore.
+        if (backend.supportsTranslation && !superMode) {
+            RunOptionLine(
+                label = "TRANSLATE",
+                value = (translateTo?.uppercase() ?: "OFF"),
+                onClick = onCycleTranslate,
+                onHelp = { helpFor = RunOptionHelp.TRANSLATE },
+            )
+        }
         RunOptionLine(
             label = "DIARIZE",
             value = if (diarize) "ON" else "OFF",
@@ -940,6 +1274,26 @@ private enum class RunOptionHelp(val title: String, val body: String) {
         "WAIT parks the job in the queue until you plug the phone into power. " +
             "NOW starts immediately. Gemma 4 is heavy — long files on battery " +
             "will warm the device and drain quickly.",
+    ),
+    SUPER(
+        "SUPER",
+        "Run two engines on every chunk and vote-merge the result instead of " +
+            "trusting one. Keeps what both agree on, picks the more plausible " +
+            "reading where they differ. Roughly 2× the compute of a single " +
+            "engine — for when accuracy matters more than speed.",
+    ),
+    PAIR(
+        "PAIR",
+        "Which two engines Super mode runs. PARAKEET + WHISPER for most " +
+            "recordings; OMNILINGUAL + GEMMA 4 when Arabic is in the mix — " +
+            "Omnilingual reads Gulf Arabic, Gemma covers what it misses.",
+    ),
+    MAX_QUALITY(
+        "MAX QUALITY",
+        "On top of the vote, send the chunks where the two engines disagreed " +
+            "most to Gemma for a second look — a constrained choice between " +
+            "the two readings, never free text, so it can't invent content. " +
+            "Slower; only worth it on recordings you'll rely on.",
     ),
 }
 
@@ -1195,6 +1549,7 @@ private fun TranscriptBody(
     speakerColors: Map<String, Color> = emptyMap(),
     showTimestamps: Boolean,
     proseMode: Boolean,
+    removeFillers: Boolean,
     activeSegmentId: Long?,
     onEdit: (nl.ihnatov.transcriber.data.Segment, String) -> Unit,
     onSegmentSeek: (nl.ihnatov.transcriber.data.Segment) -> Unit,
@@ -1210,7 +1565,7 @@ private fun TranscriptBody(
         return
     }
     if (proseMode) {
-        ProseBody(segments, speakerColors, showTimestamps)
+        ProseBody(segments, speakerColors, showTimestamps, removeFillers)
         return
     }
     var editingId by remember { mutableStateOf<Long?>(null) }
@@ -1287,8 +1642,11 @@ private fun TranscriptBody(
                                 }) { Mono("SAVE") }
                             }
                         } else {
+                            val displayText = remember(seg.text, removeFillers) {
+                                if (removeFillers) TextDestutter.collapseLine(seg.text) else seg.text
+                            }
                             Text(
-                                seg.text,
+                                displayText,
                                 color = ink,
                                 style = MaterialTheme.typography.bodyLarge,
                             )
@@ -1305,11 +1663,12 @@ private fun ProseBody(
     segments: List<nl.ihnatov.transcriber.data.Segment>,
     speakerColors: Map<String, Color>,
     showTimestamps: Boolean,
+    removeFillers: Boolean,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     val muted = ink.copy(alpha = 0.55f)
-    val body = remember(segments, showTimestamps) {
-        buildAnnotatedProse(segments, showTimestamps, speakerColors, muted)
+    val body = remember(segments, showTimestamps, removeFillers) {
+        buildAnnotatedProse(segments, showTimestamps, speakerColors, muted, removeFillers)
     }
     val scroll = rememberScrollState()
     SelectionContainer {
@@ -1350,7 +1709,16 @@ private fun OutputBody(
                 modifier = Modifier.clickable(onClick = onDelete).padding(6.dp),
             )
         }
-        MarkdownText(markdown = doc.markdown, modifier = Modifier.fillMaxWidth())
+        // Was missing a scroll modifier entirely — any output longer than
+        // one screen (a real Minutes/Summary easily is) had no way to see
+        // the rest. Caught live-testing the commonmark rewrite; unrelated
+        // to it but a real, user-visible gap worth closing here rather
+        // than filing away.
+        val outputScroll = rememberScrollState()
+        MarkdownText(
+            markdown = doc.markdown,
+            modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(outputScroll),
+        )
     }
 }
 
@@ -1448,6 +1816,24 @@ private fun EditorialPlayer(
 
 // ─── Helpers + dialogs (carried over) ────────────────────────────────
 
+/** Curated Super-mode pairs — see the plan's engine matrix (section 3): Parakeet+Whisper by default, Omnilingual+Gemma 4 for Arabic. */
+private val SUPER_PAIR_PRESETS = listOf(
+    AsrBackendKind.Parakeet to AsrBackendKind.WhisperCpp,
+    AsrBackendKind.Omnilingual to AsrBackendKind.Gemma4,
+)
+
+private fun superPairLabel(pair: Pair<AsrBackendKind, AsrBackendKind>): String =
+    "${runSheetEngineLabel(pair.first)} + ${runSheetEngineLabel(pair.second)}"
+
+private fun runSheetEngineLabel(kind: AsrBackendKind): String = when (kind) {
+    AsrBackendKind.Gemma4 -> "GEMMA 4"
+    AsrBackendKind.WhisperCpp -> "WHISPER"
+    AsrBackendKind.Parakeet -> "PARAKEET"
+    AsrBackendKind.Omnilingual -> "OMNILINGUAL"
+    // Streaming-only — not a file-transcription choice on this screen.
+    AsrBackendKind.NemotronStream -> "NEMOTRON"
+}
+
 private fun summarizeLanguages(set: Set<String>): String {
     if (set.isEmpty()) return "Auto"
     if (set.size == 1) return when (set.first()) {
@@ -1506,6 +1892,78 @@ private fun LanguagesDialog(
     )
 }
 
+@Composable
+private fun VersionHistorySheet(
+    versions: List<nl.ihnatov.transcriber.data.TranscriptVersion>,
+    onRestore: (Long) -> Unit,
+    onDelete: (Long) -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Mono("HISTORY", color = ink)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Past transcript versions, saved automatically before each re-run or restore.",
+            style = MaterialTheme.typography.bodySmall,
+            color = ink.copy(alpha = 0.62f),
+        )
+        Spacer(Modifier.height(12.dp))
+        if (versions.isEmpty()) {
+            Text(
+                "No saved versions yet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = ink.copy(alpha = 0.55f),
+            )
+            Spacer(Modifier.height(16.dp))
+        } else {
+            LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                items(versions, key = { it.id }) { version ->
+                    VersionRow(
+                        version = version,
+                        onRestore = { onRestore(version.id) },
+                        onDelete = { onDelete(version.id) },
+                    )
+                    HairlineSoft()
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+@Composable
+private fun VersionRow(
+    version: nl.ihnatov.transcriber.data.TranscriptVersion,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Mono(version.engineLabel.uppercase(), color = ink)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "${formatStampMono(version.createdAtMillis)} · ${version.segmentCount} turns",
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = IbmPlexMono),
+                color = ink.copy(alpha = 0.55f),
+            )
+        }
+        Mono(
+            "RESTORE",
+            color = Accent,
+            modifier = Modifier.clickable(onClick = onRestore).padding(6.dp),
+        )
+        Mono(
+            "DELETE",
+            color = ink.copy(alpha = 0.55f),
+            modifier = Modifier.clickable(onClick = onDelete).padding(6.dp),
+        )
+    }
+}
+
 private fun timestamp(seconds: Double): String {
     val s = seconds.toInt()
     return "%02d:%02d".format(s / 60, s % 60)
@@ -1558,6 +2016,7 @@ private fun buildAnnotatedProse(
     showTimestamps: Boolean,
     speakerColors: Map<String, Color>,
     mutedColor: Color,
+    removeFillers: Boolean,
 ): AnnotatedString {
     val builder = AnnotatedString.Builder()
     var lastSpeakerKey: String? = "__init__"
@@ -1587,7 +2046,8 @@ private fun buildAnnotatedProse(
         } else if (anyEmitted) {
             builder.append(" ")
         }
-        val body = seg.text.trim()
+        val trimmed = seg.text.trim()
+        val body = if (removeFillers) TextDestutter.collapseLine(trimmed) else trimmed
         if (body.isNotEmpty()) {
             builder.append(body)
             anyEmitted = true

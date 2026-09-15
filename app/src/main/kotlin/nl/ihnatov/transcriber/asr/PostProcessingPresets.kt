@@ -273,8 +273,45 @@ class PresetStore(context: Context) {
             userTemplate = "Transcript to proofread (keep the original language):\n{transcript}",
         )
 
+        /**
+         * Meeting minutes: decisions and action items by owner. Ported from
+         * the Mac app's `PresetStore.swift` `minutes` preset — same
+         * sections, adapted to this app's placeholder set
+         * ({language_hint}/{transcript}/{vocabulary} instead of the Mac's
+         * {transcript_with_speakers}).
+         */
+        val DEFAULT_MINUTES = PostProcessingPreset(
+            id = "minutes",
+            displayName = "Minutes",
+            description = "Decisions and action items by owner",
+            outputTitle = "Minutes",
+            systemTemplate = """
+                You are an expert minute-taker for meetings. Faithful to the
+                transcript: never invent decisions, owners, dates, or numbers.
+                {language_hint}
+                Speaker labels identify who said what — use them for attribution.
+                {vocabulary}
+            """.trimIndent(),
+            userTemplate = """
+                Write meeting minutes from the transcript below, in Markdown,
+                omitting any section that would be empty:
+
+                **TL;DR** — 2-3 sentences: what the meeting was about and the outcome.
+                **Decisions** — one bullet per decision, with who made or confirmed it.
+                **Action items by owner** — a subsection per person who owns tasks;
+                bullet each task (-> deadline if said). Include tasks assigned TO
+                them by others.
+                **Risks / blockers** — anything flagged as a problem.
+                **Open questions** — unresolved threads and who should answer them.
+
+                Transcript:
+                {transcript}
+            """.trimIndent(),
+        )
+
         val DEFAULTS: List<PostProcessingPreset> = listOf(
             DEFAULT_SUMMARY,
+            DEFAULT_MINUTES,
             DEFAULT_CONTEXT_REWRITE,
             DEFAULT_CLEAN,
             DEFAULT_PROOFREAD,

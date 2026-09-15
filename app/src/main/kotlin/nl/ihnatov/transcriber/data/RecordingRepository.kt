@@ -8,6 +8,7 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
 class RecordingRepository(
@@ -15,26 +16,31 @@ class RecordingRepository(
     private val recordings: RecordingDao,
     private val segments: SegmentDao,
     private val outputs: OutputDao,
+    private val versions: TranscriptVersionDao,
+    private val folders: FolderDao,
+    private val tags: TagDao,
 ) {
 
-    fun observeAll(): Flow<List<Recording>> = recordings.observeAll()
-
     /**
-     * Search recordings by free-text query. Matches against title and any
-     * segment text (substring, case-insensitive on SQLite's default
-     * collation). Empty/blank query returns [observeAll]'s full list.
+     * The Library list's one query: [folderId], [tagId], and [query] are
+     * independently-settable, AND-combined filters — pass null/blank to
+     * skip a filter. Mirrors the Mac app's own progressive-narrowing
+     * `filtered` computed property (folder → tag → search), so applying
+     * folder and tag filters together with a search term behaves exactly
+     * like the Mac: each just narrows further, none of them are
+     * exclusive modes.
      *
      * Escapes the SQL LIKE wildcards (% and _) and our escape char (\)
-     * inside the query so a search for "100%" doesn't match everything.
+     * inside [query] so a search for "100%" doesn't match everything.
      */
-    fun search(query: String): Flow<List<Recording>> {
+    fun observeLibrary(folderId: Long? = null, tagId: Long? = null, query: String = ""): Flow<List<Recording>> {
         val trimmed = query.trim()
-        if (trimmed.isEmpty()) return observeAll()
-        val escaped = trimmed
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        return recordings.search("%$escaped%")
+        val pattern = if (trimmed.isEmpty()) null else "%${escapeLikePattern(trimmed)}%"
+        // No tag and no search: use the recordings-only query so the
+        // Library list doesn't subscribe to `segments` (which a streaming
+        // run rewrites once per chunk) or pay the JOIN + DISTINCT at all.
+        if (tagId == null && pattern == null) return recordings.observeByFolder(folderId)
+        return recordings.observeFiltered(folderId, tagId, pattern)
     }
 
     fun observe(id: Long): Flow<Recording?> = recordings.observe(id)
@@ -131,6 +137,181 @@ class RecordingRepository(
 
     suspend fun updateSegment(segment: Segment) = segments.update(segment)
 
+    /**
+     * Every recording's id paired with its transcript, oldest-first
+     * segment order — the raw material for
+     * [nl.ihnatov.transcriber.asr.VocabularyHarvester.harvest]. Reads the
+     * whole library, so callers should run this off the main thread and
+     * not too often (see `LearnedNames.kt`'s launch-time trigger).
+     */
+    suspend fun allTranscriptsForHarvest(): List<nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem> =
+        withContext(Dispatchers.IO) {
+            // One query for the whole library instead of one per recording.
+            segments.listAllOrdered()
+                .groupBy { it.recordingId }
+                .map { (id, segs) ->
+                    nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem(id, segs.joinToString("\n") { it.text })
+                }
+        }
+
+    fun observeVersions(recordingId: Long): Flow<List<TranscriptVersion>> = versions.observe(recordingId)
+
+    /** Shared by [snapshotCurrentTranscript] and [restoreVersion]; a no-op when there's nothing to snapshot yet. */
+    private suspend fun snapshotIfNonEmpty(recordingId: Long, engineId: String, engineLabel: String) {
+        val current = segments.list(recordingId)
+        if (current.isEmpty()) return
+        val json = encodeSegments(current)
+        // Byte-identical to the newest stored version → nothing changed
+        // since it was taken (e.g. a run that failed pre-flight, or a
+        // restore of the version that's already live). Don't add a
+        // duplicate row to the history sheet.
+        val latest = versions.latest(recordingId)
+        if (latest != null && latest.segmentsJson == json) return
+        versions.insert(
+            TranscriptVersion(
+                recordingId = recordingId,
+                engineId = engineId,
+                engineLabel = engineLabel,
+                createdAtMillis = System.currentTimeMillis(),
+                segmentCount = current.size,
+                segmentsJson = json,
+            )
+        )
+    }
+
+    /**
+     * Snapshot the recording's CURRENT segments as a new [TranscriptVersion]
+     * before they're about to be overwritten — call this once per run
+     * (not once per incremental [replaceSegments] save; a Gemma streaming
+     * run calls that many times per chunk, which would otherwise flood
+     * the version list). A no-op when there's nothing to snapshot yet
+     * (first-ever run on a recording).
+     */
+    suspend fun snapshotCurrentTranscript(
+        recordingId: Long,
+        engineId: String,
+        engineLabel: String,
+    ): Unit = withContext(Dispatchers.IO) {
+        snapshotIfNonEmpty(recordingId, engineId, engineLabel)
+    }
+
+    /**
+     * Replace the live transcript with a saved version's segments — the
+     * inverse of [snapshotCurrentTranscript]. Snapshots whatever is
+     * currently live first (labeled [currentEngineId]/[currentEngineLabel],
+     * i.e. whatever produced it — same convention as
+     * [nl.ihnatov.transcriber.asr.TranscriptionRunner]'s pre-run snapshot),
+     * so restoring an older version can never silently discard the state
+     * you restored FROM — that state becomes a version of its own.
+     *
+     * Returns the restored segments (so the caller can re-write sidecar
+     * files without a redundant DB read), or null if [versionId] doesn't
+     * exist.
+     */
+    suspend fun restoreVersion(
+        versionId: Long,
+        currentEngineId: String,
+        currentEngineLabel: String,
+    ): List<Segment>? = withContext(Dispatchers.IO) {
+        val version = versions.get(versionId) ?: return@withContext null
+        val restored = decodeSegments(version.segmentsJson).map { it.toSegment(version.recordingId) }
+        // decodeSegments maps a corrupt blob to an empty list. Restoring
+        // "nothing" over a live transcript would be silent data loss (and
+        // the caller rewrites the sidecars from what we return), so refuse
+        // when the stored count says the version wasn't empty.
+        if (restored.isEmpty() && version.segmentCount > 0) {
+            android.util.Log.w(
+                "RecordingRepository",
+                "restoreVersion($versionId): segmentsJson unreadable (expected ${version.segmentCount} rows); refusing",
+            )
+            return@withContext null
+        }
+        snapshotIfNonEmpty(version.recordingId, currentEngineId, currentEngineLabel)
+        segments.replaceAll(version.recordingId, restored)
+        restored
+    }
+
+    suspend fun deleteVersion(id: Long) = versions.delete(id)
+
+    // ---- Folders (Phase 6) ----
+    // A recording lives in at most one folder. Name uniqueness is enforced
+    // here, case-insensitively, not via a DB constraint — same reasoning
+    // as the Mac's own Folder/Tag comment: a UNIQUE column would turn a
+    // duplicate insert into a silent upsert instead of a rejected one.
+
+    class EmptyNameException : Exception("Name cannot be empty.")
+    class DuplicateNameException(name: String) : Exception("'$name' already exists.")
+
+    fun observeFoldersWithCounts(): Flow<List<FolderWithCount>> = folders.observeAllWithCounts()
+
+    /** Plain folder list (no counts) — the Detail screen's "FOLDER: X ▾" dropdown just needs names to choose from. */
+    fun observeFolders(): Flow<List<Folder>> = folders.observeAllWithCounts().map { list -> list.map { it.folder } }
+
+    suspend fun createFolder(name: String): Folder {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) throw EmptyNameException()
+        if (folders.findByName(trimmed) != null) throw DuplicateNameException(trimmed)
+        val existing = folders.listAll()
+        val folder = Folder(
+            name = trimmed,
+            sortOrder = (existing.maxOfOrNull { it.sortOrder } ?: -1) + 1,
+            createdAtMillis = System.currentTimeMillis(),
+        )
+        return folder.copy(id = folders.insert(folder))
+    }
+
+    suspend fun renameFolder(folder: Folder, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) throw EmptyNameException()
+        val existing = folders.findByName(trimmed)
+        if (existing != null && existing.id != folder.id) throw DuplicateNameException(trimmed)
+        folders.update(folder.copy(name = trimmed))
+    }
+
+    /** Recordings in [folder] survive — they're unfiled, never deleted (matches the Mac's `.nullify` delete rule). */
+    suspend fun deleteFolder(folder: Folder) = folders.delete(folder.id)
+
+    /** null = remove from its folder. */
+    suspend fun moveToFolder(recording: Recording, folderId: Long?) =
+        recordings.update(recording.copy(folderId = folderId))
+
+    // ---- Tags (Phase 6) ----
+    // Many-to-many with Recording. Tags have no independent lifecycle or
+    // "delete tag" action — a Tag row disappears automatically once its
+    // last usage is removed (see removeTag), same as the Mac.
+
+    fun observeTagsWithCounts(): Flow<List<TagWithCount>> = tags.observeAllWithCounts()
+
+    fun observeTagsForRecording(recordingId: Long): Flow<List<Tag>> = tags.observeForRecording(recordingId)
+
+    /** Find-or-create by trimmed, case-insensitive name; no-op if already applied. */
+    suspend fun addTag(name: String, recordingId: Long): Tag? {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return null
+        val tag = tags.findByName(trimmed) ?: run {
+            val new = Tag(name = trimmed, createdAtMillis = System.currentTimeMillis())
+            new.copy(id = tags.insert(new))
+        }
+        tags.attach(recordingId, tag.id)
+        return tag
+    }
+
+    /** Removes the tag from this recording; deletes the Tag row entirely if that was its last usage. */
+    suspend fun removeTag(tagId: Long, recordingId: Long) = tags.detachAndPruneIfOrphaned(recordingId, tagId)
+
+    /**
+     * Diff-based bulk edit: after this call, [recordingId] carries exactly
+     * [names] (each found-or-created); anything it carried before that
+     * isn't in [names] is removed (and pruned if that orphans it).
+     */
+    suspend fun setTags(names: List<String>, recordingId: Long) {
+        val wanted = names.map { it.trim() }.filter { it.isNotEmpty() }
+        val current = tags.listForRecording(recordingId)
+        val stale = current.filter { tag -> wanted.none { it.equals(tag.name, ignoreCase = true) } }
+        for (tag in stale) removeTag(tag.id, recordingId)
+        for (name in wanted) addTag(name, recordingId)
+    }
+
     /** Observe all post-processing outputs for a recording (in creation order). */
     fun observeOutputs(recordingId: Long): Flow<List<OutputDoc>> = outputs.observe(recordingId)
 
@@ -187,3 +368,17 @@ class RecordingRepository(
         return dir
     }
 }
+
+/**
+ * Escape SQL LIKE's two wildcards (`%`, `_`) and our own escape character
+ * (`\`) inside a raw search term, so a literal search for e.g. "100%"
+ * matches only that substring instead of "everything" (`%` unescaped is
+ * LIKE's own any-sequence wildcard). Callers wrap the result in their own
+ * leading/trailing `%` for a substring match; the query itself must use
+ * `ESCAPE '\'` for this to take effect (see [RecordingDao.search]).
+ */
+internal fun escapeLikePattern(raw: String): String =
+    raw
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")

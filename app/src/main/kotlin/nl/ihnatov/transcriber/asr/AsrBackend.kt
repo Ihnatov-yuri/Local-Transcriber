@@ -48,23 +48,62 @@ interface AsrBackend {
 }
 
 /**
- * Raw segment as emitted by the native side. Used in JNI as a plain Java
- * class with a (double, double, String) constructor — see [RawSegment]'s
- * field signature; the JNI shim relies on exactly these names.
+ * Raw segment as emitted by the native side. whisper.cpp's JNI shim
+ * (`jni_whisper.cpp`, `ensureSegmentBinding`) looks up this class's
+ * constructor with `GetMethodID(..., "<init>", "(DDLjava/lang/String;)V")`
+ * — an exact 3-arg signature. `@JvmOverloads` keeps that overload alive
+ * alongside the 4-arg one now that [words] exists; removing it breaks
+ * whisper.cpp transcription at the JNI boundary with no compile-time
+ * warning, so don't drop it even though [words] having a default makes it
+ * look redundant.
+ *
+ * [words] is optional and currently only populated by the sherpa-onnx-
+ * backed engines (Parakeet, Omnilingual, Nemotron) and whisper.cpp's own
+ * token timestamps where wired — null means "no word-level data for this
+ * segment," not "empty."
  *
  * Domain segments ([nl.ihnatov.transcriber.data.Segment]) are derived from
  * this by attaching a recording id, language, and speaker.
  */
-data class RawSegment(
+data class RawSegment @JvmOverloads constructor(
     @JvmField val startSeconds: Double,
     @JvmField val endSeconds: Double,
     @JvmField val text: String,
+    val words: List<Word>? = null,
 )
 
-enum class AsrBackendKind {
-    WhisperCpp,
-    Gemma4,
+enum class AsrBackendKind(
+    /**
+     * Can this engine honour a `translateTo` target? whisper.cpp (to
+     * English only) and Gemma 4 (any target) can; the sherpa-onnx engines
+     * are transcribe-only and silently ignore the flag, so the RUN sheet
+     * hides TRANSLATE for them and the runner never stamps a target
+     * language on their output.
+     */
+    val supportsTranslation: Boolean,
+) {
+    WhisperCpp(supportsTranslation = true),
+    Gemma4(supportsTranslation = true),
+    /** sherpa-onnx offline transducer — Parakeet TDT 0.6B v3. English, Dutch, Ukrainian; not Arabic. */
+    Parakeet(supportsTranslation = false),
+    /** sherpa-onnx offline CTC — Meta Omnilingual ASR 300M. Broad language coverage including Gulf Arabic (`afb`). */
+    Omnilingual(supportsTranslation = false),
+    /** sherpa-onnx online (streaming) NeMo CTC — Nemotron 3.5 ASR streaming 0.6B. Record screen / dictation only. */
+    NemotronStream(supportsTranslation = false),
 }
+
+/**
+ * "Auto" engine policy for the RUN sheet's default pick, applied whenever
+ * the user hasn't manually overridden the engine: Parakeet is the anchor
+ * for every language combination except Arabic (it doesn't support
+ * Arabic at all); Omnilingual covers Arabic, alone or mixed with other
+ * languages, since it's the one engine with real Gulf Arabic (`afb`)
+ * coverage. Simpler than the 2026-09 plan's original 4-row language
+ * matrix — chosen deliberately over it — while keeping full feature
+ * parity elsewhere (Super mode, arbitration, word attribution, etc.).
+ */
+fun defaultEngineFor(languages: Set<String>): AsrBackendKind =
+    if ("ar" in languages) AsrBackendKind.Omnilingual else AsrBackendKind.Parakeet
 
 /** Stream events for UI status, separate from ASR results themselves. */
 sealed interface AsrEvent {

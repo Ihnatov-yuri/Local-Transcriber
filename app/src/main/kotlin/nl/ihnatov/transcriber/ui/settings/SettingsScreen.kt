@@ -143,6 +143,7 @@ fun SettingsScreen(container: AppContainer) {
             diarizationRunner = container.diarizationRunner,
             uiPrefs = vm.uiPrefs,
         )
+        DiarizationTuningCard(uiPrefs = vm.uiPrefs)
 
         // ── GEMMA 4 ───────────────────────────────────────────────────
         SectionHeader("Gemma 4")
@@ -158,6 +159,12 @@ fun SettingsScreen(container: AppContainer) {
         SectionHeader("Style & vocabulary")
         DomainVocabCard(promptStore = vm.promptStore, uiPrefs = vm.uiPrefs)
         StyleAndVocabCard(promptStore = vm.promptStore)
+        LearnedNamesCard(
+            store = vm.learnedNamesStore,
+            onAdd = vm::addLearnedTerm,
+            onDismiss = vm::dismissLearnedTerm,
+            onRescan = vm::rescanLearnedNames,
+        )
 
         // Footer — was an "Engines" card with two bullet points of value.
         // Replaced with a single subdued line. The architecture detail is in
@@ -176,7 +183,7 @@ fun SettingsScreen(container: AppContainer) {
             title = { Text("Delete model?") },
             text = {
                 Text(
-                    "${f.name} (${f.length() / 1024 / 1024} MB) will be removed " +
+                    "${f.name} (${fileOrDirSizeBytes(f) / 1024 / 1024} MB) will be removed " +
                         "from this device. You can re-download it later from this " +
                         "screen.",
                 )
@@ -237,7 +244,13 @@ private fun DownloadRow(
             }
             // Action area on the right
             when {
-                status is SettingsViewModel.DownloadStatus.Running -> {
+                status is SettingsViewModel.DownloadStatus.Running ||
+                    status is SettingsViewModel.DownloadStatus.Extracting -> {
+                    // Cancel during Extracting is best-effort: the archive
+                    // reader only checks for cancellation between tar
+                    // entries, not mid-copy of one (there are just 2-3
+                    // entries per model), so tapping cancel here can take
+                    // a little longer to land than during Running.
                     IconButton(onClick = onCancel) {
                         Icon(Icons.Outlined.Close, contentDescription = "Cancel")
                     }
@@ -277,7 +290,8 @@ private fun DownloadRow(
         // overwrites in place via the partial→rename path in AsrFactory,
         // so the existing model selection survives.
         if (needsUpdate && entry.updateReason != null &&
-            status !is SettingsViewModel.DownloadStatus.Running
+            status !is SettingsViewModel.DownloadStatus.Running &&
+            status !is SettingsViewModel.DownloadStatus.Extracting
         ) {
             Text(
                 entry.updateReason,
@@ -298,6 +312,10 @@ private fun DownloadRow(
                 } else {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
+            }
+            SettingsViewModel.DownloadStatus.Extracting -> {
+                Text("Extracting…", style = MaterialTheme.typography.bodySmall)
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
             is SettingsViewModel.DownloadStatus.Failed -> {
                 Text(
@@ -366,7 +384,7 @@ private fun Pill(
  * Section divider for the Settings vertical scroll. Small uppercase label
  * with subdued colour and ~16dp top padding so cards in the previous
  * section get visual breathing room. Cheaper than wrapping each section in
- * a Card-with-header (which makes Settings feel like a Russian doll).
+ * a Card-with-header (which nests containers and adds visual clutter).
  */
 @Composable
 private fun SectionHeader(text: String) {
@@ -474,17 +492,19 @@ private fun InstalledModelsCard(
             // E2B + E4B, or two Whisper sizes). With a single model per
             // backend there's nothing to choose, so no radio is shown.
             val byKind = remember(installedFiles, selectionTick) {
-                installedFiles.groupBy { factory.kindForFile(it) }
+                installedFiles.groupBy { factory.kindForFile(it) ?: factory.kindForDirectory(it) }
+            }
+            // resolveModel reflects the current pin (or biggest-first
+            // default). It lists/stat()s the models dir, so compute it once
+            // per list/selection change rather than per row per frame.
+            val activeNameByKind = remember(installedFiles, selectionTick) {
+                byKind.keys.filterNotNull().associateWith { factory.resolveModel(it)?.name }
             }
             installedFiles.forEach { f ->
-                val kind = factory.kindForFile(f)
+                val kind = factory.kindForFile(f) ?: factory.kindForDirectory(f)
                 val groupSize = kind?.let { byKind[it]?.size } ?: 1
                 val selectable = kind != null && groupSize > 1
-                // resolveModel reflects the current pin (or biggest-first
-                // default). Recomputed each composition; selectionTick
-                // forces it after a tap.
-                val active = selectable &&
-                    factory.resolveModel(kind!!)?.name == f.name
+                val active = selectable && activeNameByKind[kind] == f.name
                 ModelRow(
                     file = f,
                     showRadio = selectable,
@@ -587,6 +607,119 @@ private fun EmbeddingPickerCard(
     }
 }
 
+/**
+ * Diarization tuning knobs added for the 2026-09 global-clustering rewrite:
+ * clustering threshold, turn-coalescing gap, segment-boundary sensitivity.
+ * All three are nullable in [UiPrefs] — "Auto" clears the override and
+ * falls back to [nl.ihnatov.transcriber.asr.DiarizationRunner]'s built-in
+ * defaults (language-aware for threshold).
+ */
+@Composable
+private fun DiarizationTuningCard(uiPrefs: nl.ihnatov.transcriber.asr.UiPrefs) {
+    val threshold by uiPrefs.clusterThreshold.collectAsStateWithLifecycle()
+    val gap by uiPrefs.turnCoalesceGapSec.collectAsStateWithLifecycle()
+    val minOn by uiPrefs.minDurationOnSec.collectAsStateWithLifecycle()
+
+    SettingsSection(
+        title = "DIARIZATION TUNING",
+        subtitle = "How aggressively speaker clustering splits or merges voices, and how chunk-sized turns get stitched back into one continuous conversation.",
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Clustering threshold",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "Higher merges more aggressively (fewer speakers); lower " +
+                    "splits more. Auto uses 0.5 for English-only, 0.7 " +
+                    "otherwise — non-English speech tends to over-split at 0.5.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                AssistChip(onClick = { uiPrefs.setClusterThreshold(null) }, label = { Text("Auto") }, enabled = threshold != null)
+                listOf(0.5f, 0.6f, 0.7f, 0.8f).forEach { t ->
+                    AssistChip(
+                        onClick = { uiPrefs.setClusterThreshold(t) },
+                        label = { Text("%.1f".format(t)) },
+                        enabled = threshold != t,
+                    )
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Speaker turns",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "Same-speaker segments closer together than this merge into " +
+                    "one turn — the chunk boundaries used during transcription " +
+                    "aren't conversational structure. 30s reads as smooth " +
+                    "blocks; 2s keeps fine, Samsung-style turns.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                listOf(2f, 10f, 30f, 60f).forEach { g ->
+                    AssistChip(
+                        onClick = { uiPrefs.setTurnCoalesceGapSec(g) },
+                        label = { Text(if (g == nl.ihnatov.transcriber.asr.DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()) "${g.toInt()}s (default)" else "${g.toInt()}s") },
+                        enabled = (gap ?: nl.ihnatov.transcriber.asr.DEFAULT_TURN_COALESCE_GAP_SEC.toFloat()) != g,
+                    )
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Segment sensitivity",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "How short a voiced/silent stretch can be before the " +
+                    "segmentation model still calls it a real speaker turn. " +
+                    "Fine catches quick back-and-forth; Coarse ignores short interjections.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(null); uiPrefs.setMinDurationOffSec(null) },
+                    label = { Text("Default") },
+                    enabled = minOn != null,
+                )
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(0.1f); uiPrefs.setMinDurationOffSec(0.3f) },
+                    label = { Text("Fine") },
+                    enabled = minOn != 0.1f,
+                )
+                AssistChip(
+                    onClick = { uiPrefs.setMinDurationOnSec(0.3f); uiPrefs.setMinDurationOffSec(0.8f) },
+                    label = { Text("Coarse") },
+                    enabled = minOn != 0.3f,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun ModelRow(
     file: File,
@@ -617,7 +750,7 @@ private fun ModelRow(
             Text(file.name, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
             Text(
                 buildString {
-                    append("%d MB".format(file.length() / 1024 / 1024))
+                    append("%d MB".format(fileOrDirSizeBytes(file) / 1024 / 1024))
                     if (showRadio && active) append(" · active")
                 },
                 style = MaterialTheme.typography.bodySmall,
@@ -1111,6 +1244,53 @@ private fun StyleAndVocabCard(promptStore: PromptStore) {
                 )
             }
 
+            // ---- Per-language vocabulary ----
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "Per-language vocabulary",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    "Extra terms added only when a run includes this language, " +
+                        "on top of the global list above. Auto-detect runs pull " +
+                        "in every language's list.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+                val vocabByLang by promptStore.vocabularyByLanguage.collectAsStateWithLifecycle()
+                var activeLangCode by remember { mutableStateOf("ar") }
+                val langOptions = listOf(
+                    "ar" to "Arabic", "uk" to "Ukrainian", "en" to "English", "nl" to "Dutch",
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    langOptions.forEach { (code, label) ->
+                        val hasTerms = !vocabByLang[code].isNullOrBlank()
+                        AssistChip(
+                            onClick = { activeLangCode = code },
+                            label = { Text(if (hasTerms) "$label •" else label) },
+                            enabled = activeLangCode != code,
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = vocabByLang[activeLangCode] ?: "",
+                    onValueChange = { promptStore.setVocabularyForLanguage(activeLangCode, it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                    placeholder = {
+                        val activeLabel = langOptions.first { it.first == activeLangCode }.second
+                        Text("Terms only used for $activeLabel runs")
+                    },
+                    textStyle = MaterialTheme.typography.bodySmall,
+                )
+            }
+
             // ---- Tone ----
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
@@ -1156,6 +1336,88 @@ private fun StyleAndVocabCard(promptStore: PromptStore) {
             checked = verbatim,
             onChange = promptStore::setVerbatim,
         )
+    }
+}
+
+/**
+ * "Learned" vocabulary suggestions — names/terms
+ * [nl.ihnatov.transcriber.asr.VocabularyHarvester] found recurring across
+ * two or more recordings that aren't in the vocabulary yet. One tap adds a
+ * suggestion to the global vocabulary; the × dismisses it for good. Port
+ * of the Mac app's `UI/Settings/LearnedTermsSection.swift`.
+ */
+@Composable
+private fun LearnedNamesCard(
+    store: nl.ihnatov.transcriber.asr.LearnedNamesStore,
+    onAdd: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onDismiss: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onRescan: () -> Unit,
+) {
+    val terms by store.terms.collectAsStateWithLifecycle()
+    val dismissed by store.dismissedKeys.collectAsStateWithLifecycle()
+    val lastScan by store.lastScanMillis.collectAsStateWithLifecycle()
+    val visible = remember(terms, dismissed) { terms.filter { it.key !in dismissed } }
+
+    SettingsSection(
+        title = "LEARNED",
+        subtitle = "Names that show up in two or more of your recordings but " +
+            "aren't in the vocabulary yet. One tap adds a spelling; the × " +
+            "dismisses it for good.",
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                lastScan?.let {
+                    "Last scanned " + java.text.DateFormat
+                        .getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+                        .format(java.util.Date(it))
+                } ?: "Not scanned yet",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedButton(onClick = onRescan) {
+                Icon(Icons.Outlined.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Rescan library")
+            }
+        }
+        if (visible.isEmpty()) {
+            Text(
+                "No new names yet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+        } else {
+            if (visible.size > 1) {
+                TextButton(onClick = { visible.forEach(onAdd) }) {
+                    Text("Add all ${visible.size}")
+                }
+            }
+            visible.forEach { term ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(term.spelling, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "${term.recordings} recordings · ${term.occurrences}×",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                        )
+                    }
+                    IconButton(onClick = { onAdd(term) }) {
+                        Icon(Icons.Outlined.CheckCircle, contentDescription = "Add to vocabulary")
+                    }
+                    IconButton(onClick = { onDismiss(term) }) {
+                        Icon(Icons.Outlined.Close, contentDescription = "Dismiss")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1436,6 +1698,10 @@ private fun GemmaComputeCard(settings: GemmaSettingsStore) {
         }
     }
 }
+
+/** [File.length] is meaningless for a directory (the sherpa-onnx engines) — sum its contents instead. */
+private fun fileOrDirSizeBytes(file: File): Long =
+    if (file.isDirectory) file.listFiles()?.sumOf { it.length() } ?: 0L else file.length()
 
 private fun formatTokens(n: Int): String = when {
     n >= 1024 && n % 1024 == 0 -> "${n / 1024}K"

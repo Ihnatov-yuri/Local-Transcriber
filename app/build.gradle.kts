@@ -1,6 +1,8 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
@@ -8,15 +10,18 @@ plugins {
 
 android {
     namespace = "nl.ihnatov.transcriber"
-    compileSdk = 35
-    ndkVersion = "27.2.12479018"
+    compileSdk = 37
+    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "nl.ihnatov.transcriber"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-mvp"
+        targetSdk = 37
+        // Bump both per shipped build (docs/PLAN-2026-09.md §6). versionCode
+        // must stay monotonic — Obtainium and the OS use it to decide
+        // whether an APK is an upgrade.
+        versionCode = 100
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -31,7 +36,7 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DGGML_OPENMP=OFF",
                     // Android 15+ requires native .so files aligned at 16 KB
-                    // page boundaries. NDK r27 does this by default for our
+                    // page boundaries. The NDK does this by default for our
                     // own targets, but we need to propagate it to whisper.cpp's
                     // libraries (libggml*.so, libwhisper.so) too.
                     "-DCMAKE_SHARED_LINKER_FLAGS_INIT=-Wl,-z,max-page-size=16384",
@@ -50,6 +55,41 @@ android {
         }
     }
 
+    // Release signing. The keystore and its secrets never enter git: they
+    // are read from local.properties (gitignored) —
+    //   release.storeFile=/Users/you/.android/transcriber.jks
+    //   release.storePassword=…
+    //   release.keyAlias=transcriber
+    //   release.keyPassword=…
+    // When the keys are absent the release build is produced UNSIGNED
+    // (app-release-unsigned.apk), which still compiles and lets CI/R8
+    // run; scripts/release.sh refuses to publish an unsigned APK.
+    val localProps = Properties().apply {
+        val f = rootProject.file("local.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    val releaseStoreFile = localProps.getProperty("release.storeFile")?.let { file(it) }
+    val hasReleaseSigning = releaseStoreFile?.exists() == true &&
+        localProps.getProperty("release.storePassword") != null &&
+        localProps.getProperty("release.keyAlias") != null &&
+        localProps.getProperty("release.keyPassword") != null
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = localProps.getProperty("release.storePassword")
+                keyAlias = localProps.getProperty("release.keyAlias")
+                keyPassword = localProps.getProperty("release.keyPassword")
+                // v1 is irrelevant at minSdk 29; v2 + v3 (key rotation) as
+                // the plan asks. v4 is only for incremental installs.
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -60,17 +100,15 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
-        freeCompilerArgs += listOf("-Xjvm-default=all")
     }
 
     buildFeatures {
@@ -85,6 +123,17 @@ android {
                 "/META-INF/DEPENDENCIES",
             )
         }
+    }
+}
+
+// Built-in Kotlin (AGP 9+) reads jvmTarget from android.compileOptions by
+// default; set it explicitly here anyway since we also carry a compiler arg.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+        // Stable replacement for the old -Xjvm-default=all (deprecated
+        // since Kotlin 2.2.0); no-compatibility is its direct equivalent.
+        freeCompilerArgs.addAll("-jvm-default=no-compatibility")
     }
 }
 
@@ -119,27 +168,23 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.commons.compress)
+    implementation(libs.commonmark)
+    implementation(libs.commonmark.ext.gfm.tables)
 
     // Gemma 4 audio backend (LiteRT-LM Engine + Conversation with AudioBytes)
     implementation(libs.litertlm.android)
 
-    // On-device speaker diarization (pyannote segmentation + 3D-Speaker embeddings).
+    // On-device speaker diarization (pyannote segmentation + 3D-Speaker
+    // embeddings) and ASR engines added in the 2026-09 catch-up (Parakeet,
+    // Omnilingual, Nemotron streaming) all come from the same runtime.
     //
-    // sherpa-onnx 8.5.1's `libsherpa-onnx-jni.so` requires the
-    // versioned symbol `OrtGetApiBase@VERS_1.24.3` (verified via
-    // `llvm-readelf --dyn-syms`). The community-bundled
-    // `com.bihe0832.android:lib-onnx:6.16.7` ships ORT 1.17.1
-    // (symbol `VERS_1.17.1` — wrong). We exclude it and pull in
-    // Microsoft's ORT 1.24.3 instead — that publishes the matching
-    // versioned symbol AND ships 16 KB-aligned .so files for the
-    // Android 15 page-size requirement. Diarization works AND no
-    // alignment warning. If sherpa-onnx is upgraded the
-    // `onnxruntime` version pin in libs.versions.toml must move
-    // with it.
-    implementation(libs.sherpa.onnx) {
-        exclude(group = "com.bihe0832.android", module = "lib-onnx")
-    }
-    implementation(libs.onnxruntime.android)
+    // This is the official k2-fsa Android AAR, not a Maven artifact — see
+    // app/libs/README.md and scripts/fetch-sherpa-onnx.sh. It bundles its
+    // own libonnxruntime.so per ABI (16 KB aligned, verified via
+    // `llvm-readelf -l`), so there's no separate onnxruntime dependency or
+    // versioned-symbol pin to maintain.
+    implementation(files("libs/sherpa-onnx-1.13.8.aar"))
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

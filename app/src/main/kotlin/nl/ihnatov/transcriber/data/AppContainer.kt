@@ -8,6 +8,7 @@ import nl.ihnatov.transcriber.asr.AsrBackendKind
 import nl.ihnatov.transcriber.asr.AsrFactory
 import nl.ihnatov.transcriber.asr.DiarizationRunner
 import nl.ihnatov.transcriber.asr.GemmaSettingsStore
+import nl.ihnatov.transcriber.asr.LearnedNamesStore
 import nl.ihnatov.transcriber.asr.LiveTranscriber
 import nl.ihnatov.transcriber.asr.ModelDownloader
 import nl.ihnatov.transcriber.asr.PostProcessor
@@ -50,6 +51,9 @@ class AppContainer(private val appContext: Context) {
             recordings = database.recordings(),
             segments = database.segments(),
             outputs = database.outputs(),
+            versions = database.transcriptVersions(),
+            folders = database.folders(),
+            tags = database.tags(),
         )
     }
 
@@ -62,6 +66,9 @@ class AppContainer(private val appContext: Context) {
     val snippetStore: SnippetStore by lazy { SnippetStore(appContext) }
 
     val gemmaSettings: GemmaSettingsStore by lazy { GemmaSettingsStore(appContext) }
+
+    /** "Learned" vocabulary suggestions (Settings → Learned) — see LearnedNames.kt. */
+    val learnedNamesStore: LearnedNamesStore by lazy { LearnedNamesStore(appContext) }
 
     /**
      * Cross-screen UI preferences. Holds the last-used language picks (so
@@ -81,7 +88,7 @@ class AppContainer(private val appContext: Context) {
     val diarizationRunner: DiarizationRunner by lazy { DiarizationRunner(appContext, uiPrefs) }
 
     val transcriptionRunner: TranscriptionRunner by lazy {
-        TranscriptionRunner(appContext, repository, asrFactory, diarizationRunner)
+        TranscriptionRunner(appContext, repository, asrFactory, diarizationRunner, uiPrefs)
     }
 
     /**

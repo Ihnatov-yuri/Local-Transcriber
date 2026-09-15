@@ -61,6 +61,8 @@ class RecordViewModel(
         data object Idle : LiveStatus
         data object Loading : LiveStatus
         data object Running : LiveStatus
+        /** stop() was called but the engine handle hasn't finished releasing yet — see [stopLive]. */
+        data object Stopping : LiveStatus
         data object ModelMissing : LiveStatus
         data class Failed(val reason: String) : LiveStatus
     }
@@ -269,12 +271,13 @@ class RecordViewModel(
         // gasp.
         liveEventsJob?.cancel()
         liveEventsJob = null
-        // Flip the UI status immediately. `w.stop()` may block for up to one
-        // chunk's inference (~3 sec for Whisper tiny) waiting on the engine's
-        // internal mutex; we don't want the user staring at "Live · streaming"
-        // for those 3 seconds. The background cleanup still runs to release
-        // the native engine handle.
-        _liveStatus.value = LiveStatus.Idle
+        // Flip the UI status immediately to Stopping, not Idle — `w.stop()`
+        // may block for up to one chunk's inference (~3 sec for Whisper
+        // tiny) waiting on the engine's internal mutex, and jumping
+        // straight to Idle hid that in-flight teardown rather than
+        // surfacing it. The background cleanup still runs to release the
+        // native engine handle; Idle lands once it actually finishes.
+        _liveStatus.value = LiveStatus.Stopping
         if (clearTranscript) {
             _liveLines.value = emptyList()
         }
@@ -283,7 +286,15 @@ class RecordViewModel(
         // framework has already cancelled viewModelScope, so a launch
         // there would be a no-op and backend.release() would never run,
         // leaking the ~1.5 GB Gemma engine handle until process death.
-        container.appScope.launch { w.stop() }
+        container.appScope.launch {
+            w.stop()
+            // Guard against a newer session already having moved status
+            // past Stopping (e.g. the user tapped live-on again before
+            // this teardown finished) — don't stomp on it.
+            if (_liveStatus.value == LiveStatus.Stopping) {
+                _liveStatus.value = LiveStatus.Idle
+            }
+        }
     }
 
     fun pauseResume() {
