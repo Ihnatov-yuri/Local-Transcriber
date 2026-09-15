@@ -28,7 +28,9 @@ object TextDestutter {
      * Pure hesitation sounds — dropped outright before stutter collapse
      * (which also lets "how it uh how it" collapse as a phrase echo).
      */
-    private val FILLERS = setOf("uh", "um", "erm", "mm", "mhm", "hmm", "mmm")
+    // Shared with DiarizationRunner's pure-filler segment drop so the two
+    // passes agree on what a filler is.
+    internal val FILLERS = setOf("uh", "um", "erm", "mm", "mhm", "hmm", "mmm", "mmhmm", "hm")
 
     fun collapse(text: String): String =
         text.split("\n").joinToString("\n") { collapseLine(it) }

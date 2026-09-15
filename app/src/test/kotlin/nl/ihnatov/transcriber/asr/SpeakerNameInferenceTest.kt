@@ -148,3 +148,42 @@ class SpeakerNameInferenceTest {
         assertEquals(2, result.size)
     }
 }
+
+class SpeakerNameInferenceRegressionTest {
+    private fun row(speaker: String, text: String, start: Double) = nl.ihnatov.transcriber.data.Segment(
+        recordingId = 1L, startSeconds = start, endSeconds = start + 1.0, text = text, speaker = speaker,
+    )
+
+    @org.junit.Test
+    fun `lowercase word after a greeting is never taken as the other speaker's name`() {
+        // "hello, my name is Sara" used to hand "my" to SPEAKER_01 because
+        // the whole pattern was IGNORE_CASE; the name must be capitalised.
+        val rows = listOf(
+            row("SPEAKER_00", "hello, my name is Sara", start = 0.0),
+            row("SPEAKER_01", "nice to meet you", start = 2.0),
+        )
+        val result = applyInferredSpeakerNames(rows)
+        org.junit.Assert.assertEquals("Sara", result.first { it.speaker == "SPEAKER_00" }.speakerName)
+        org.junit.Assert.assertNull(result.first { it.speaker == "SPEAKER_01" }.speakerName)
+    }
+
+    @org.junit.Test
+    fun `hi there and hey guys do not produce names`() {
+        val rows = listOf(
+            row("SPEAKER_00", "hi there, how are you", start = 0.0),
+            row("SPEAKER_01", "Hey guys, welcome back", start = 2.0),
+        )
+        val result = applyInferredSpeakerNames(rows)
+        org.junit.Assert.assertTrue(result.all { it.speakerName == null })
+    }
+
+    @org.junit.Test
+    fun `lowercase greeting still names a capitalised addressee`() {
+        val rows = listOf(
+            row("SPEAKER_00", "hi Lana, how are you?", start = 0.0),
+            row("SPEAKER_01", "I'm good, thanks", start = 2.0),
+        )
+        val result = applyInferredSpeakerNames(rows)
+        org.junit.Assert.assertEquals("Lana", result.first { it.speaker == "SPEAKER_01" }.speakerName)
+    }
+}

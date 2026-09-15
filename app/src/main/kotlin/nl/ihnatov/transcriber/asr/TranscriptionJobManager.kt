@@ -8,11 +8,13 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import nl.ihnatov.transcriber.data.PendingTask
 import nl.ihnatov.transcriber.data.PendingTaskDao
 import nl.ihnatov.transcriber.data.RecordingRepository
@@ -86,13 +88,9 @@ class TranscriptionJobManager(
         /**
          * Super mode (Phase 3 of the 2026-09 plan): run [superPairA] and
          * [superPairB] together and vote-merge instead of just [backend].
-         * Deliberately NOT persisted to the `pending_tasks` Room row (see
-         * [toEntity]) — adding columns there means a schema version bump,
-         * and the plan's own Phase 4 migration is numbered "3 to 4"
-         * assuming no schema churn before it. A charger-parked or FIFO-
-         * queued task that survives a process death replays as plain
-         * single-engine [backend] instead of Super — a minor, honest
-         * degradation, not data loss.
+         * Persisted on the `pending_tasks` row (schema 7) — every start,
+         * even an immediate one, round-trips through that row, so these
+         * have to survive it or Super mode never runs.
          */
         val superMode: Boolean = false,
         val superPairA: AsrBackendKind? = null,
@@ -108,6 +106,8 @@ class TranscriptionJobManager(
     private var runningId: Long? = null
     private var runningParams: Params? = null
     private var currentJob: Job? = null
+    /** Set by [checkpointRunning]; cleared (and its row deleted) when that job ends in-process. */
+    @Volatile private var checkpointedId: Long? = null
 
     init {
         // Restore queued + charger-parked tasks from the DB so a process
@@ -265,6 +265,21 @@ class TranscriptionJobManager(
                         updateStatus(recordingId) { it.copy(running = false) }
                     }
                 }
+                // A checkpointRunning() call (FGS timeout) re-inserts this
+                // job's row so a process kill can resume it. If we got
+                // here, the job ended in-process (done, failed, or
+                // cancelled by the user) — drop the row, otherwise the
+                // tryStartNext() below would immediately re-run the same
+                // recording and overwrite the transcript it just wrote.
+                // NonCancellable: this finally also runs on user Stop, and
+                // a cancelled coroutine can't otherwise suspend into Room.
+                if (checkpointedId == recordingId) {
+                    checkpointedId = null
+                    withContext(NonCancellable) {
+                        runCatching { pendingTasks.delete(recordingId) }
+                            .onFailure { Log.e(TAG, "failed to clear checkpoint row for $recordingId", it) }
+                    }
+                }
                 TranscriptionService.stop(context)
                 // Drain the next FIFO task (non-charger-parked). Runs on
                 // appScope, not this child coroutine, so a cancellation of
@@ -357,6 +372,7 @@ class TranscriptionJobManager(
         runBlocking {
             runCatching {
                 pendingTasks.upsert(params.toEntity(id, waitForCharger = false))
+                checkpointedId = id
             }.onFailure { Log.e(TAG, "checkpoint failed for $id", it) }
         }
         Log.w(TAG, "checkpointed running recording=$id ahead of FGS timeout kill")
@@ -396,6 +412,10 @@ class TranscriptionJobManager(
         hybridDiarize = hybridDiarize,
         waitForCharger = waitForCharger,
         queuedAtMillis = System.currentTimeMillis(),
+        superMode = superMode,
+        superPairA = superPairA?.name,
+        superPairB = superPairB?.name,
+        maxQuality = maxQuality,
     )
 
     private fun PendingTask.toParams(): Params = Params(
@@ -406,6 +426,10 @@ class TranscriptionJobManager(
         diarize = diarize,
         expectedSpeakers = expectedSpeakers,
         hybridDiarize = hybridDiarize,
+        superMode = superMode,
+        superPairA = superPairA?.let { n -> runCatching { AsrBackendKind.valueOf(n) }.getOrNull() },
+        superPairB = superPairB?.let { n -> runCatching { AsrBackendKind.valueOf(n) }.getOrNull() },
+        maxQuality = maxQuality,
     )
 
     companion object {

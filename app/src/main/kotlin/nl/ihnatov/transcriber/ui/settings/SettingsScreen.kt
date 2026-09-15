@@ -494,15 +494,17 @@ private fun InstalledModelsCard(
             val byKind = remember(installedFiles, selectionTick) {
                 installedFiles.groupBy { factory.kindForFile(it) ?: factory.kindForDirectory(it) }
             }
+            // resolveModel reflects the current pin (or biggest-first
+            // default). It lists/stat()s the models dir, so compute it once
+            // per list/selection change rather than per row per frame.
+            val activeNameByKind = remember(installedFiles, selectionTick) {
+                byKind.keys.filterNotNull().associateWith { factory.resolveModel(it)?.name }
+            }
             installedFiles.forEach { f ->
                 val kind = factory.kindForFile(f) ?: factory.kindForDirectory(f)
                 val groupSize = kind?.let { byKind[it]?.size } ?: 1
                 val selectable = kind != null && groupSize > 1
-                // resolveModel reflects the current pin (or biggest-first
-                // default). Recomputed each composition; selectionTick
-                // forces it after a tap.
-                val active = selectable &&
-                    factory.resolveModel(kind!!)?.name == f.name
+                val active = selectable && activeNameByKind[kind] == f.name
                 ModelRow(
                     file = f,
                     showRadio = selectable,

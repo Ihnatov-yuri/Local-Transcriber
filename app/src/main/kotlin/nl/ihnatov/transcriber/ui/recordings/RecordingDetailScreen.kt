@@ -135,10 +135,22 @@ fun RecordingDetailScreen(
     // selected — see AsrBackend.defaultEngineFor. Tracks the language pick
     // automatically until the user taps ENGINE to override it explicitly;
     // after that we stop overwriting their choice.
-    var backend by remember { mutableStateOf(defaultEngineFor(lastLangs)) }
+    // If the policy's pick has no model installed yet (fresh install with
+    // only Gemma/Whisper, before Parakeet was ever downloaded), fall back
+    // to an engine that DOES have one — otherwise auto-run after recording
+    // silently never fires and RUN just says "no model installed".
+    fun autoEngineFor(langs: Set<String>): AsrBackendKind {
+        val preferred = defaultEngineFor(langs)
+        val fallbacks = listOf(
+            preferred, AsrBackendKind.Gemma4, AsrBackendKind.WhisperCpp,
+            AsrBackendKind.Parakeet, AsrBackendKind.Omnilingual,
+        )
+        return fallbacks.firstOrNull { container.asrFactory.listModels(it).isNotEmpty() } ?: preferred
+    }
+    var backend by remember { mutableStateOf(autoEngineFor(lastLangs)) }
     var backendManuallySet by remember { mutableStateOf(false) }
     LaunchedEffect(selectedLangs) {
-        if (!backendManuallySet) backend = defaultEngineFor(selectedLangs)
+        if (!backendManuallySet) backend = autoEngineFor(selectedLangs)
     }
     // Super mode (Phase 3): run two engines and vote-merge instead of just
     // `backend`. Pair is a small curated list, not two free pickers — most
@@ -1134,12 +1146,17 @@ private fun RunOptionsSheetContent(
             onClick = onPickLanguages,
             onHelp = { helpFor = RunOptionHelp.LANG },
         )
-        RunOptionLine(
-            label = "TRANSLATE",
-            value = (translateTo?.uppercase() ?: "OFF"),
-            onClick = onCycleTranslate,
-            onHelp = { helpFor = RunOptionHelp.TRANSLATE },
-        )
+        // Only whisper.cpp and Gemma can translate; the sherpa-onnx engines
+        // (and a Super pair) transcribe as-is, so don't offer a target the
+        // runner would have to ignore.
+        if (backend.supportsTranslation && !superMode) {
+            RunOptionLine(
+                label = "TRANSLATE",
+                value = (translateTo?.uppercase() ?: "OFF"),
+                onClick = onCycleTranslate,
+                onHelp = { helpFor = RunOptionHelp.TRANSLATE },
+            )
+        }
         RunOptionLine(
             label = "DIARIZE",
             value = if (diarize) "ON" else "OFF",

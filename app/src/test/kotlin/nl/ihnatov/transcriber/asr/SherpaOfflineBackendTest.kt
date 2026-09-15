@@ -54,3 +54,32 @@ class SherpaOfflineBackendTest {
         assertTrue("first cut ($firstCutSec s) should land near the 30s target", firstCutSec in 25.0..35.0)
     }
 }
+
+class InMemoryCutPointSilenceTest {
+    @org.junit.Test
+    fun `a 25 ms dip inside speech does not attract the cut`() {
+        // 40 s of loud "speech" with a single 25 ms quiet window at 29.9 s
+        // (never a qualifying ≥250 ms silence) — the cut must land at the
+        // nominal 30 s target, not snap to the dip.
+        val sr = 16_000
+        val n = 40 * sr
+        val samples = FloatArray(n) { i -> if (i % 2 == 0) 0.3f else -0.3f }
+        val dipStart = (29.9 * sr).toInt()
+        for (i in dipStart until dipStart + sr * 25 / 1000) samples[i] = 0f
+        val cuts = SherpaOfflineBackend.computeInMemoryCutPoints(samples, sr)
+        val firstEnd = cuts.first().endSample.toDouble() / sr
+        org.junit.Assert.assertEquals(30.0, firstEnd, 0.03)
+    }
+
+    @org.junit.Test
+    fun `a real 300 ms silence inside the flex window attracts the cut`() {
+        val sr = 16_000
+        val n = 40 * sr
+        val samples = FloatArray(n) { i -> if (i % 2 == 0) 0.3f else -0.3f }
+        val silStart = (28.0 * sr).toInt()
+        for (i in silStart until silStart + sr * 300 / 1000) samples[i] = 0f
+        val cuts = SherpaOfflineBackend.computeInMemoryCutPoints(samples, sr)
+        val firstEnd = cuts.first().endSample.toDouble() / sr
+        org.junit.Assert.assertEquals(28.125, firstEnd, 0.05)
+    }
+}

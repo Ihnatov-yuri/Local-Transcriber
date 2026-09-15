@@ -36,6 +36,10 @@ class RecordingRepository(
     fun observeLibrary(folderId: Long? = null, tagId: Long? = null, query: String = ""): Flow<List<Recording>> {
         val trimmed = query.trim()
         val pattern = if (trimmed.isEmpty()) null else "%${escapeLikePattern(trimmed)}%"
+        // No tag and no search: use the recordings-only query so the
+        // Library list doesn't subscribe to `segments` (which a streaming
+        // run rewrites once per chunk) or pay the JOIN + DISTINCT at all.
+        if (tagId == null && pattern == null) return recordings.observeByFolder(folderId)
         return recordings.observeFiltered(folderId, tagId, pattern)
     }
 
@@ -142,10 +146,12 @@ class RecordingRepository(
      */
     suspend fun allTranscriptsForHarvest(): List<nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem> =
         withContext(Dispatchers.IO) {
-            recordings.listAll().map { rec ->
-                val text = segments.list(rec.id).sortedBy { it.startSeconds }.joinToString("\n") { it.text }
-                nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem(rec.id, text)
-            }
+            // One query for the whole library instead of one per recording.
+            segments.listAllOrdered()
+                .groupBy { it.recordingId }
+                .map { (id, segs) ->
+                    nl.ihnatov.transcriber.asr.VocabularyHarvester.HarvestItem(id, segs.joinToString("\n") { it.text })
+                }
         }
 
     fun observeVersions(recordingId: Long): Flow<List<TranscriptVersion>> = versions.observe(recordingId)
@@ -154,6 +160,13 @@ class RecordingRepository(
     private suspend fun snapshotIfNonEmpty(recordingId: Long, engineId: String, engineLabel: String) {
         val current = segments.list(recordingId)
         if (current.isEmpty()) return
+        val json = encodeSegments(current)
+        // Byte-identical to the newest stored version → nothing changed
+        // since it was taken (e.g. a run that failed pre-flight, or a
+        // restore of the version that's already live). Don't add a
+        // duplicate row to the history sheet.
+        val latest = versions.latest(recordingId)
+        if (latest != null && latest.segmentsJson == json) return
         versions.insert(
             TranscriptVersion(
                 recordingId = recordingId,
@@ -161,7 +174,7 @@ class RecordingRepository(
                 engineLabel = engineLabel,
                 createdAtMillis = System.currentTimeMillis(),
                 segmentCount = current.size,
-                segmentsJson = encodeSegments(current),
+                segmentsJson = json,
             )
         )
     }
@@ -201,8 +214,19 @@ class RecordingRepository(
         currentEngineLabel: String,
     ): List<Segment>? = withContext(Dispatchers.IO) {
         val version = versions.get(versionId) ?: return@withContext null
-        snapshotIfNonEmpty(version.recordingId, currentEngineId, currentEngineLabel)
         val restored = decodeSegments(version.segmentsJson).map { it.toSegment(version.recordingId) }
+        // decodeSegments maps a corrupt blob to an empty list. Restoring
+        // "nothing" over a live transcript would be silent data loss (and
+        // the caller rewrites the sidecars from what we return), so refuse
+        // when the stored count says the version wasn't empty.
+        if (restored.isEmpty() && version.segmentCount > 0) {
+            android.util.Log.w(
+                "RecordingRepository",
+                "restoreVersion($versionId): segmentsJson unreadable (expected ${version.segmentCount} rows); refusing",
+            )
+            return@withContext null
+        }
+        snapshotIfNonEmpty(version.recordingId, currentEngineId, currentEngineLabel)
         segments.replaceAll(version.recordingId, restored)
         restored
     }

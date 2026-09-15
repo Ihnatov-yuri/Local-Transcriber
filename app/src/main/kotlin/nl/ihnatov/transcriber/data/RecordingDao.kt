@@ -56,6 +56,12 @@ interface RecordingDao {
             "ORDER BY r.createdAtMillis DESC"
     )
     fun observeFiltered(folderId: Long?, tagId: Long?, pattern: String?): Flow<List<Recording>>
+
+    /** Fast path for the default Library view (optional folder filter only) — observes `recordings` alone. */
+    @Query(
+        "SELECT * FROM recordings WHERE (:folderId IS NULL OR folderId = :folderId) ORDER BY createdAtMillis DESC"
+    )
+    fun observeByFolder(folderId: Long?): Flow<List<Recording>>
 }
 
 @Dao
@@ -66,6 +72,10 @@ interface SegmentDao {
 
     @Query("SELECT * FROM segments WHERE recordingId = :recordingId ORDER BY startSeconds ASC")
     suspend fun list(recordingId: Long): List<Segment>
+
+    /** Every segment in the library, grouped by recording in time order — for the learned-names harvest. */
+    @Query("SELECT * FROM segments ORDER BY recordingId ASC, startSeconds ASC")
+    suspend fun listAllOrdered(): List<Segment>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(segments: List<Segment>)
@@ -131,6 +141,9 @@ interface TranscriptVersionDao {
 
     @Query("SELECT * FROM transcript_versions WHERE id = :id")
     suspend fun get(id: Long): TranscriptVersion?
+
+    @Query("SELECT * FROM transcript_versions WHERE recordingId = :recordingId ORDER BY createdAtMillis DESC LIMIT 1")
+    suspend fun latest(recordingId: Long): TranscriptVersion?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(version: TranscriptVersion): Long

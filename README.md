@@ -2,7 +2,7 @@
 
 Standalone open-source Android transcription app. Records or imports audio (WAV / MP3 / M4A / AAC / OGG / FLAC), runs on-device ASR through Whisper.cpp or Gemma 4, diarizes speakers, and surfaces a Material 3 UI with post-processing presets. APK-distributed (no Play Store).
 
-**Status: feature-complete v1.** Recording, file import, transcription (Whisper or Gemma 4 — Gemma is the default), diarization (sherpa-onnx OR Gemma prompt-based), auto-titling, inline segment editing, four post-processing presets (Summary / Context-aware rewrite / Clean / Translate-polish), custom vocabulary, tone styles, snippets, multi-select constrained-auto language picker (Arabic / Ukrainian / English / Dutch), live transcription, and a Settings page with Gemma 4 compute knobs (GPU/CPU, context window, CPU threads).
+**Status: 1.0.0.** Recording, file import, transcription (Parakeet by default, Omnilingual for Arabic, whisper.cpp and Gemma 4 as alternatives, plus a Super mode that runs two engines and vote-merges), diarization (sherpa-onnx OR Gemma prompt-based), auto-titling, inline segment editing, four post-processing presets (Summary / Context-aware rewrite / Clean / Translate-polish), custom vocabulary, tone styles, snippets, multi-select constrained-auto language picker (Arabic / Ukrainian / English / Dutch), live transcription, and a Settings page with Gemma 4 compute knobs (GPU/CPU, context window, CPU threads).
 
 The current roadmap — a research-backed plan to bring this app to parity with the Mac app — lives at [docs/PLAN-2026-09.md](docs/PLAN-2026-09.md). Superseded planning notes are in [NEXT_STEPS.md](NEXT_STEPS.md).
 
@@ -234,18 +234,27 @@ Three sidecars next to every transcribed audio: `<stem>.txt`, `<stem>.srt`, `<st
 ## Build a release APK
 
 ```bash
-./gradlew :app:bundleRelease     # AAB for Play
-./gradlew :app:assembleRelease   # APK for sideload / F-Droid
+scripts/release.sh             # tests → assembleRelease → apksigner/zipalign checks → app/build/outputs/release/transcriber-<version>-arm64.apk
+scripts/release.sh --publish   # same, then `gh release create v<version>` with the APK + sha256
 ```
 
-Release builds need signing. Generate a keystore once:
+Release builds are signed from a keystore that never enters git. Generate it once:
 
 ```bash
 keytool -genkeypair -v -keystore ~/.android/transcriber.jks \
   -alias transcriber -keyalg RSA -keysize 4096 -validity 36500
 ```
 
-Then add a `signingConfigs` block to `app/build.gradle.kts`. Don't commit the keystore.
+then point `app/build.gradle.kts` at it via `local.properties` (gitignored):
+
+```
+release.storeFile=/Users/you/.android/transcriber.jks
+release.storePassword=…
+release.keyAlias=transcriber
+release.keyPassword=…
+```
+
+Without those keys `assembleRelease` still builds (as `app-release-unsigned.apk`) but the script refuses to publish. Back up the `.jks` and the passwords — a lost key means every existing install has to be uninstalled before it can take an update. Bump `versionName`/`versionCode` in `app/build.gradle.kts` for every shipped build; the procedure is in [docs/PLAN-2026-09.md](docs/PLAN-2026-09.md) §6.
 
 ---
 

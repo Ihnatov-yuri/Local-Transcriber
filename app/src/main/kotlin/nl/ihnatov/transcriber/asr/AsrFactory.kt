@@ -104,10 +104,15 @@ class AsrFactory(
      * Priority:
      *   1. The filename the user explicitly selected via [setSelectedModel].
      *      If that file no longer exists, fall through.
-     *   2. The largest matching file under [modelsDir] (large-v3 > tiny).
-     *   3. null if no compatible file is installed.
+     *   2. A language-specialised catalog model whose language is in
+     *      [languages] (e.g. the Ukrainian Whisper fine-tune for a `uk` run).
+     *   3. The largest GENERAL model under [modelsDir] (large-v3 > tiny) —
+     *      specialised models are skipped here so they can't hijack runs
+     *      in other languages just by being the biggest file.
+     *   4. Any installed model at all.
+     *   5. null if no compatible file is installed.
      */
-    fun resolveModel(kind: AsrBackendKind): File? {
+    fun resolveModel(kind: AsrBackendKind, languages: Collection<String> = emptyList()): File? {
         val installed = listModels(kind)
         if (installed.isEmpty()) return null
         val pinned = getSelectedModel(kind)
@@ -115,7 +120,10 @@ class AsrFactory(
             val match = installed.firstOrNull { it.name == pinned }
             if (match != null) return match
         }
-        return installed.first()
+        fun specialisation(f: File): Set<String>? =
+            ModelCatalog.entries.firstOrNull { it.filename == f.name }?.languages
+        installed.firstOrNull { f -> specialisation(f)?.any { it in languages } == true }?.let { return it }
+        return installed.firstOrNull { specialisation(it) == null } ?: installed.first()
     }
 
     fun getSelectedModel(kind: AsrBackendKind): String? =

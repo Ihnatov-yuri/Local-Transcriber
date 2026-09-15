@@ -47,6 +47,15 @@ data class CatalogEntry(
     val requiredAfterMillis: Long? = null,
     /** Short reason shown next to the Update affordance. */
     val updateReason: String? = null,
+    /**
+     * Languages this model is SPECIALISED for (null = general-purpose).
+     * [AsrFactory.resolveModel] uses it when no model is pinned: a
+     * specialised model is auto-picked only when one of its languages is
+     * being transcribed, and otherwise passed over in favour of a general
+     * one — so installing the Ukrainian fine-tune (the largest Whisper
+     * .bin) doesn't hijack every English or Arabic Whisper run.
+     */
+    val languages: Set<String>? = null,
 )
 
 /**
@@ -108,6 +117,7 @@ object ModelCatalog {
             // convert-h5-to-ggml.py then quantized to q5_0.
             // SHA256: 842c2f2104884a14d34ff0e936a5aa2d26b039a688c75a6cb4ce68f41829aa6e
             url = "https://github.com/Ihnatov-yuri/Local-Transcriber/releases/download/Ukrainian_model/ggml-large-uk-q5_0.bin",
+            languages = setOf("uk"),
         ),
         CatalogEntry(
             id = "gemma-4-e2b",

@@ -268,17 +268,19 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
                 val targetWindow = (targetSec * sampleRate / windowSamples).toInt()
                 val flexWindows = (FLEX_SEC * sampleRate / windowSamples).toInt()
                 var bestQuietStart = -1
+                var runStart = -1
                 var runLen = 0
                 var scanFrom = (targetWindow - flexWindows).coerceAtLeast(0)
                 for (i in scanFrom..targetWindow.coerceAtMost(w - 1)) {
                     if (windowRms[i] < threshold) {
-                        if (runLen == 0) bestQuietStart = i
+                        if (runLen == 0) runStart = i
                         runLen++
+                        // Only a run that reaches MIN_SILENCE_MS qualifies;
+                        // keep scanning — a later qualifying run closer to
+                        // the target wins.
+                        if (runLen == minSilenceWindows) bestQuietStart = runStart
                     } else {
                         runLen = 0
-                    }
-                    if (runLen >= minSilenceWindows) {
-                        // Keep scanning — a later quiet run closer to target wins.
                     }
                 }
                 val cutWindow = if (bestQuietStart >= 0) {

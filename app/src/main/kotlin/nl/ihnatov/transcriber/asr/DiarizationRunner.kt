@@ -700,8 +700,9 @@ fun coalesceBackchannels(
     return result.toList()
 }
 
-/** Pure-filler words that carry no content on their own (a breath that tripped VAD). */
-private val FILLER_ONLY_WORDS = setOf("uh", "um", "mm", "mmm", "mhm", "mmhmm", "hmm", "erm", "hm")
+/** Pure-filler words that carry no content on their own (a breath that tripped VAD). One list, shared with [TextDestutter]. */
+private val FILLER_ONLY_WORDS: Set<String> get() = TextDestutter.FILLERS
+private val FILLER_TOKEN_SPLIT = Regex("[^\\p{L}]+")
 
 /**
  * Drop segments whose text is nothing but filler words (and no digits —
@@ -716,7 +717,7 @@ fun dropPureFillerSegments(
 ): List<Pair<RawSegment, Int?>> = assigned.filterNot { (seg, _) ->
     val hasDigits = seg.text.any { it.isDigit() }
     if (hasDigits) return@filterNot false
-    val tokens = seg.text.lowercase().split(Regex("[^\\p{L}]+")).filter { it.isNotEmpty() }
+    val tokens = seg.text.lowercase().split(FILLER_TOKEN_SPLIT).filter { it.isNotEmpty() }
     tokens.isEmpty() || tokens.all { it in FILLER_ONLY_WORDS }
 }
 

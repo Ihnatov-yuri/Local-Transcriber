@@ -33,6 +33,8 @@ class EnsembleBackend(
     private val factory: AsrFactory,
     /** "Max quality" RUN sheet toggle — enables the constrained-JSON arbitration second pass on low-agreement chunks. */
     private val arbitrationEnabled: Boolean = false,
+    /** Languages of this run — lets each sub-engine's [AsrFactory.resolveModel] prefer a matching specialised model. */
+    private val languages: List<String> = emptyList(),
 ) : AsrBackend {
 
     init {
@@ -86,7 +88,7 @@ class EnsembleBackend(
     }
 
     private suspend fun loadSub(kind: AsrBackendKind): AsrBackend? {
-        val modelFile = factory.resolveModel(kind) ?: return null
+        val modelFile = factory.resolveModel(kind, languages) ?: return null
         val backend = factory.create(kind)
         val res = backend.load(modelFile.absolutePath)
         return if (res.isSuccess) backend else null

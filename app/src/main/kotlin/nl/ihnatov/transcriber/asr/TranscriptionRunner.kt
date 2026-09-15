@@ -175,23 +175,18 @@ class TranscriptionRunner(
         // string. Promote the list: single → force, multi → resolve at-detect
         // time, empty → null.
         val primaryLanguage = languages.singleOrNull()
+        val runSuper = superMode && superPairA != null && superPairB != null && superPairA != superPairB
+        // Engines that can't translate (the sherpa-onnx ones, and a Super
+        // pair — its two halves would disagree) get no target at all;
+        // otherwise the output would be stamped with a language it isn't
+        // in. Shadows the parameter on purpose so every later use sees it.
+        @Suppress("NAME_SHADOWING")
+        val translateTo = translateTo?.takeIf { !runSuper && backend.supportsTranslation }
         val recording = repository.get(recordingId)
         if (recording == null) {
             send(AsrEvent.Failed("Recording $recordingId not found"))
             return@channelFlow
         }
-
-        // Snapshot whatever transcript already exists BEFORE this run
-        // overwrites it — once per run, not once per incremental save (the
-        // Gemma streaming loop calls replaceSegments many times per chunk).
-        // Labeled with whichever engine actually PRODUCED those existing
-        // segments (recording.transcribedWithBackend/Model — set at the
-        // end of the PREVIOUS run, see below), not the one about to run;
-        // a no-op when there's nothing to snapshot yet (first-ever run).
-        val snapshotEngineId = recording.transcribedWithBackend ?: "unknown"
-        val snapshotEngineLabel = recording.transcribedWithModel ?: snapshotEngineId
-        runCatching { repository.snapshotCurrentTranscript(recordingId, snapshotEngineId, snapshotEngineLabel) }
-            .onFailure { Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it) }
 
         if (diarize && !diarizer.isEmbeddingModelPresent()) {
             send(AsrEvent.Failed(
@@ -233,7 +228,7 @@ class TranscriptionRunner(
 
         val modelFile: File
         val asr: AsrBackend
-        if (superMode && superPairA != null && superPairB != null && superPairA != superPairB) {
+        if (runSuper) {
             if ((superPairA == AsrBackendKind.Gemma4 || superPairB == AsrBackendKind.Gemma4)) {
                 checkGemmaE4BMemory()?.let { send(it); return@channelFlow }
             }
@@ -242,7 +237,7 @@ class TranscriptionRunner(
             // is never read from disk, only used for logging/display
             // (transcribedWithModel) the same way a real model's name is.
             modelFile = File(factory.modelsDir(), "super-${superPairA.name.lowercase()}-${superPairB.name.lowercase()}")
-            asr = EnsembleBackend(superPairA, superPairB, factory, arbitrationEnabled = maxQuality)
+            asr = EnsembleBackend(superPairA!!, superPairB!!, factory, arbitrationEnabled = maxQuality, languages = languages)
             send(AsrEvent.Stage("Loading Super mode engines", 0.05f))
             val loadRes = asr.load(modelFile.absolutePath)
             if (loadRes.isFailure) {
@@ -251,7 +246,7 @@ class TranscriptionRunner(
                 return@channelFlow
             }
         } else {
-            val resolved = factory.resolveModel(backend)
+            val resolved = factory.resolveModel(backend, languages)
             if (resolved == null) {
                 val dir = factory.modelsDir()
                 val expected = factory.expectedExtensionsHint(backend)
@@ -280,6 +275,21 @@ class TranscriptionRunner(
             }
         }
 
+        // Snapshot whatever transcript already exists BEFORE this run
+        // overwrites it — once per run, not once per incremental save (the
+        // Gemma streaming loop calls replaceSegments many times per chunk),
+        // and only now that pre-flight (models present, engine loaded) has
+        // passed: a run that fails before touching the transcript must not
+        // leave a duplicate version behind. Labeled with whichever engine
+        // actually PRODUCED those existing segments
+        // (recording.transcribedWithBackend/Model — set at the end of the
+        // PREVIOUS run, see below), not the one about to run; a no-op when
+        // there's nothing to snapshot yet (first-ever run).
+        val snapshotEngineId = recording.transcribedWithBackend ?: "unknown"
+        val snapshotEngineLabel = recording.transcribedWithModel ?: snapshotEngineId
+        runCatching { repository.snapshotCurrentTranscript(recordingId, snapshotEngineId, snapshotEngineLabel) }
+            .onFailure { Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it) }
+
         send(AsrEvent.Stage("Reading audio", 0.1f))
         // For Gemma we stream-decode: a 1-hour MP3 is ~230 MB as float32 and
         // doubling-grow allocators push peak heap well past device limits.
@@ -288,6 +298,10 @@ class TranscriptionRunner(
         val gemma = asr as? Gemma4Backend
         val rawSegments: List<RawSegment>
         val mono: FloatArray
+        // Set by the long-file non-Gemma path: the file was too big to hold
+        // as one buffer for ASR, so diarization must use the windowed
+        // (file-streaming) path too instead of decoding it whole after all.
+        var diarizeWindowed = false
         // Sherpa pre-pass results, populated inside the Gemma branch when
         // hybrid diarization is on. Reused by the reconcile block below.
         var sherpaSegmentsFromPrepass: List<DiarizationRunner.SpeakerSegment>? = null
@@ -966,7 +980,11 @@ class TranscriptionRunner(
                         // De-chunk: the ~28s chunk windows are an implementation
                         // detail — the transcript should read as speaker TURNS.
                         // Ports the Mac app's coalesceBySpeaker (default 30s gap).
-                        val coalescedPartial = coalesceTurnSegments(dedupedPartial, turnCoalesceGapSec)
+                        // Diarized runs only, as on the Mac: without speakers
+                        // every row has speaker == null and the whole
+                        // transcript would merge into one row.
+                        val coalescedPartial =
+                            if (diarize) coalesceTurnSegments(dedupedPartial, turnCoalesceGapSec) else dedupedPartial
                         val rowsWithNames = applyInferredSpeakerNames(coalescedPartial)
                         repository.replaceSegments(recordingId, rowsWithNames)
                     }
@@ -1130,16 +1148,12 @@ class TranscriptionRunner(
                     return@channelFlow
                 }
                 rawSegments = out
-                // Diarization (if requested) still needs the full waveform
-                // resident — a pre-existing, separate constraint (same
-                // shape as Gemma's own non-hybrid diarization path),
-                // unrelated to this chunking fix. Decoding twice only
-                // happens in this long-file + diarize combination.
-                mono = if (diarize) {
-                    runCatching { AudioDecoder.decode(audioFile).samples }.getOrElse { FloatArray(0) }
-                } else {
-                    FloatArray(0)
-                }
+                // Diarization (if requested) goes through the windowed,
+                // file-streaming path below — decoding the whole file into
+                // one buffer here would reintroduce exactly the OOM this
+                // chunked ASR pass exists to avoid.
+                mono = FloatArray(0)
+                diarizeWindowed = diarize
             }
         }
 
@@ -1181,7 +1195,32 @@ class TranscriptionRunner(
             }
         } else if (diarize && rawSegments.isNotEmpty()) {
             send(AsrEvent.Stage("Identifying speakers", 0.7f))
-            val diarRes = diarizer.run(
+            val diarRes = if (diarizeWindowed) {
+                runCatching {
+                    diarizer.runChunked(
+                        file = File(audioPath),
+                        numClusters = expectedSpeakers,
+                        threshold = clusterThreshold,
+                        minDurationOn = minDurationOn,
+                        minDurationOff = minDurationOff,
+                        durationSec = recording.durationSeconds,
+                        onProgress = { fraction ->
+                            val pct = (fraction * 100f).toInt().coerceIn(0, 99)
+                            trySend(AsrEvent.Stage(
+                                "Identifying speakers · $pct%",
+                                (0.7f + 0.25f * fraction).coerceAtMost(0.95f),
+                            ))
+                        },
+                        onOverSegmented = {
+                            trySend(AsrEvent.Stage(
+                                "Lots of speakers detected — if you know how many, " +
+                                    "set Expected Speakers in the RUN sheet",
+                                0.9f,
+                            ))
+                        },
+                    ).getOrThrow()
+                }
+            } else diarizer.run(
                 samples = mono,
                 numClusters = expectedSpeakers,
                 threshold = clusterThreshold,
@@ -1237,29 +1276,63 @@ class TranscriptionRunner(
         // as the incremental path — this final pass also coalesces
         // whatever the per-chunk passes couldn't (e.g. Whisper's single
         // full-file run never went through the incremental path at all).
-        val coalescedRows = coalesceTurnSegments(dedupedRows, turnCoalesceGapSec)
+        // Diarized runs only (see the incremental call for why).
+        val coalescedRows =
+            if (diarize) coalesceTurnSegments(dedupedRows, turnCoalesceGapSec) else dedupedRows
         val rowsWithNames = applyInferredSpeakerNames(coalescedRows)
         repository.replaceSegments(recordingId, rowsWithNames)
+        // Re-read the row: the user may have re-titled, re-filed
+        // (folderId) or categorised the recording while this run was in
+        // flight, and Room's @Update replaces the WHOLE row — writing back
+        // the copy we fetched at the start would silently revert that.
+        val fresh = repository.get(recordingId) ?: recording
         // The Recording row keeps a boolean "was translated?" — the actual
         // target lives in Segment.language. Avoids a Room migration while
         // still letting the UI surface "Translated to {target}" by looking
         // at the segments. See RecordingsListScreen / TranscriptExporter.
-        var updated = recording.copy(
+        var updated = fresh.copy(
             transcribedWithBackend = asr.id,
             transcribedWithModel = modelFile.name,
             translateToEnglish = translateTo != null,
-            sourceLanguage = recording.sourceLanguage ?: primaryLanguage,
+            sourceLanguage = fresh.sourceLanguage ?: primaryLanguage,
         )
 
+        // Text work (auto-title, auto-classify) is Gemma's job regardless
+        // of which engine transcribed — with Parakeet as the default ASR
+        // engine, gating this on `gemma != null` would mean it almost never
+        // runs. Reuse the ASR engine when it IS Gemma; otherwise release
+        // the ASR engine first (memory) and load a standalone Gemma for
+        // the two short prompts, if one is installed and fits.
+        val wantsTitle = rows.isNotEmpty() && looksLikeDefaultTitle(updated.title)
+        val wantsCategory = rows.isNotEmpty() && updated.category == null
+        var asrReleased = false
+        var standaloneTextGemma: Gemma4Backend? = null
+        val textGemma: Gemma4Backend? = gemma ?: run {
+            if (!wantsTitle && !wantsCategory) return@run null
+            val gModel = factory.resolveModel(AsrBackendKind.Gemma4) ?: return@run null
+            if (checkGemmaE4BMemory() != null) return@run null
+            asr.release()
+            asrReleased = true
+            send(AsrEvent.Stage("Loading Gemma for naming", 0.975f))
+            val g = factory.create(AsrBackendKind.Gemma4) as? Gemma4Backend ?: return@run null
+            val res = g.load(gModel.absolutePath)
+            if (res.isFailure) {
+                Log.w(TAG, "standalone Gemma for text work failed to load; skipping title/classify", res.exceptionOrNull())
+                g.release()
+                null
+            } else {
+                standaloneTextGemma = g
+                g
+            }
+        }
+
         // Auto-title: if the recording still has the default timestamp-style
-        // title and we have a Gemma engine loaded, ask Gemma for a short
-        // descriptive title. This is the biggest single Library improvement —
-        // "Recording_2026-05-17_14-23-30" is useless, "Q3 planning with
-        // Ahmed and Sara" is actually findable. `gemma` was bound at the
-        // start of the function for the streaming-decode path; reuse it.
-        if (gemma != null && rows.isNotEmpty() && looksLikeDefaultTitle(updated.title)) {
+        // title, ask Gemma for a short descriptive title. This is the
+        // biggest single Library improvement — "Recording_2026-05-17_14-23-30"
+        // is useless, "Q3 planning with Ahmed and Sara" is actually findable.
+        if (textGemma != null && wantsTitle) {
             send(AsrEvent.Stage("Naming the recording", 0.98f))
-            val title = generateTitle(gemma, rows)
+            val title = generateTitle(textGemma, rows)
             if (!title.isNullOrBlank()) {
                 updated = updated.copy(title = title)
             }
@@ -1270,15 +1343,16 @@ class TranscriptionRunner(
         // a re-transcription leaves it alone rather than silently
         // re-guessing. New to the Android app; see RecordingCategory's doc
         // comment.
-        if (gemma != null && rows.isNotEmpty() && updated.category == null) {
-            val category = classifyRecording(gemma, rows)
+        if (textGemma != null && wantsCategory) {
+            val category = classifyRecording(textGemma, rows)
             if (category != null) {
                 updated = updated.copy(category = category.id)
             }
         }
+        standaloneTextGemma?.release()
 
         repository.update(updated)
-        asr.release()
+        if (!asrReleased) asr.release()
 
         // Sidecar files (.txt / .srt / .json) next to the audio. Cheap to
         // write, lets the user share the transcript via the OS share sheet
@@ -1569,6 +1643,11 @@ private val SPEAKER_NAME_STOPLIST = setOf(
     // here rather than special-casing the addressee regex. isStoplistedName
     // only looks at the first word, so "i'm"/"i" cover "I'm"/"I am" both.
     "i'm", "i", "im",
+    // Words that follow a greeting far more often than a name does —
+    // "hello, my name is", "hi there", "hey guys/everyone/all/again".
+    "my", "there", "guys", "everyone", "everybody", "all", "again", "you",
+    "team", "folks", "friends", "dear", "and", "so", "yes", "no", "hi",
+    "hello", "hey", "welcome", "thanks", "thank",
     // Dutch — same role as the English list above, for "Ik ben X" etc.
     "moe", "hier", "daar", "klaar", "blij", "boos", "bang", "trots",
     "verdrietig", "zeker", "best", "nu", "nog", "ook", "zo", "sorry",
@@ -1591,11 +1670,14 @@ private fun isStoplistedName(candidate: String): Boolean {
  * self-introduction patterns — this one captures the person being
  * addressed, not the speaker.
  */
+// The greeting word is case-insensitive (inline `(?iu:…)`); the captured
+// NAME is not — a whole-pattern IGNORE_CASE would let "hello, my name is…"
+// hand "my" to the other speaker as their name. Arabic has no case, so
+// its branch relies on the stoplist instead.
 private val GREETING_NAME_PATTERN = Regex(
-    "(?:привіт|вітаю|добрий день|здравствуй|привет|hi|hello|hey|hoi|hallo" +
+    "(?iu:привіт|вітаю|добрий день|здравствуй|привет|hi|hello|hey|hoi|hallo" +
         "|مرحبا|أهلا|السلام عليكم|صباح الخير|مساء الخير)[,!]?\\s+" +
         "([A-ZА-ЯІЇЄҐ][a-zа-яіїєґё'’\\-]{1,30}|[؀-ۿ]{2,30})",
-    RegexOption.IGNORE_CASE,
 )
 
 internal fun findIntroducedName(text: String): String? {

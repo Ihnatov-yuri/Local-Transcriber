@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -16,8 +17,11 @@ android {
         applicationId = "nl.ihnatov.transcriber"
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-mvp"
+        // Bump both per shipped build (docs/PLAN-2026-09.md §6). versionCode
+        // must stay monotonic — Obtainium and the OS use it to decide
+        // whether an APK is an upgrade.
+        versionCode = 100
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -51,6 +55,41 @@ android {
         }
     }
 
+    // Release signing. The keystore and its secrets never enter git: they
+    // are read from local.properties (gitignored) —
+    //   release.storeFile=/Users/you/.android/transcriber.jks
+    //   release.storePassword=…
+    //   release.keyAlias=transcriber
+    //   release.keyPassword=…
+    // When the keys are absent the release build is produced UNSIGNED
+    // (app-release-unsigned.apk), which still compiles and lets CI/R8
+    // run; scripts/release.sh refuses to publish an unsigned APK.
+    val localProps = Properties().apply {
+        val f = rootProject.file("local.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    val releaseStoreFile = localProps.getProperty("release.storeFile")?.let { file(it) }
+    val hasReleaseSigning = releaseStoreFile?.exists() == true &&
+        localProps.getProperty("release.storePassword") != null &&
+        localProps.getProperty("release.keyAlias") != null &&
+        localProps.getProperty("release.keyPassword") != null
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = localProps.getProperty("release.storePassword")
+                keyAlias = localProps.getProperty("release.keyAlias")
+                keyPassword = localProps.getProperty("release.keyPassword")
+                // v1 is irrelevant at minSdk 29; v2 + v3 (key rotation) as
+                // the plan asks. v4 is only for incremental installs.
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -61,6 +100,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

@@ -40,6 +40,8 @@ import org.commonmark.node.Emphasis
 import org.commonmark.node.FencedCodeBlock
 import org.commonmark.node.HardLineBreak
 import org.commonmark.node.Heading
+import org.commonmark.node.HtmlBlock
+import org.commonmark.node.HtmlInline
 import org.commonmark.node.IndentedCodeBlock
 import org.commonmark.node.Link
 import org.commonmark.node.ListItem
@@ -147,8 +149,15 @@ private fun RenderBlock(node: Node) {
                 .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)),
         )
         is TableBlock -> MarkdownTable(node)
-        // Unknown/unhandled block (e.g. an HTML block the model emitted) —
-        // recurse into its children rather than silently dropping content.
+        // Raw HTML the model emitted (`<p>…</p>`, `<details>`, …). It's a
+        // leaf node — its content lives in `literal`, not in children —
+        // so show it verbatim rather than rendering nothing.
+        is HtmlBlock -> Text(
+            text = node.literal.orEmpty().trimEnd(),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        // Unknown/unhandled block — recurse into its children rather than
+        // silently dropping content.
         else -> RenderChildren(node)
     }
 }
@@ -243,6 +252,13 @@ private fun AnnotatedString.Builder.appendInlineNode(node: Node) {
         }
         is SoftLineBreak -> append(' ')
         is HardLineBreak -> append('\n')
+        // Inline HTML is a leaf; `<br>` is by far the most common thing a
+        // model emits here, so render it as a line break and anything else
+        // verbatim (the old hand-rolled renderer showed raw text too).
+        is HtmlInline -> {
+            val lit = node.literal.orEmpty()
+            if (lit.matches(Regex("(?i)<br\\s*/?>"))) append('\n') else append(lit)
+        }
         else -> appendInlineChildren(node)
     }
 }

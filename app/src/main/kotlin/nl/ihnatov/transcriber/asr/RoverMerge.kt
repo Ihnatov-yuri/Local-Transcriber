@@ -152,9 +152,12 @@ object RoverMerge {
 
     /** [diceSimilarity] over two plain-text strings, tokenized on non-alphanumeric boundaries. */
     fun tokenSimilarity(a: String, b: String): Double {
-        fun tokens(s: String) = s.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
+        fun tokens(s: String) = s.lowercase().split(WORD_SPLIT).filter { it.isNotEmpty() }
         return diceSimilarity(tokens(a), tokens(b))
     }
+
+    /** Word boundary = any run of non-letter/non-digit characters. Precompiled: called once per Super chunk. */
+    private val WORD_SPLIT = Regex("[^\\p{L}\\p{N}]+")
 
     /** One disputed alignment position, for the constrained-JSON arbitration second pass. */
     data class Dispute(

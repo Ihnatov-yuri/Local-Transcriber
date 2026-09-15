@@ -1,5 +1,6 @@
 package nl.ihnatov.transcriber.data
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
@@ -121,4 +122,14 @@ data class PendingTask(
     /** True = wait for AC. False = plain FIFO queued behind the running job. */
     val waitForCharger: Boolean,
     val queuedAtMillis: Long,
+    /**
+     * Super mode intent (schema 7). Persisted so a queued, charger-parked,
+     * or checkpointed run replays with the SAME engines the user picked —
+     * and, since [TranscriptionJobManager.start] round-trips every run
+     * through this row, so that an immediate start keeps them at all.
+     */
+    @ColumnInfo(defaultValue = "0") val superMode: Boolean = false,
+    val superPairA: String? = null,
+    val superPairB: String? = null,
+    @ColumnInfo(defaultValue = "0") val maxQuality: Boolean = false,
 )

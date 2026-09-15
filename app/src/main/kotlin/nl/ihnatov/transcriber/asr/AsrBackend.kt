@@ -72,15 +72,24 @@ data class RawSegment @JvmOverloads constructor(
     val words: List<Word>? = null,
 )
 
-enum class AsrBackendKind {
-    WhisperCpp,
-    Gemma4,
+enum class AsrBackendKind(
+    /**
+     * Can this engine honour a `translateTo` target? whisper.cpp (to
+     * English only) and Gemma 4 (any target) can; the sherpa-onnx engines
+     * are transcribe-only and silently ignore the flag, so the RUN sheet
+     * hides TRANSLATE for them and the runner never stamps a target
+     * language on their output.
+     */
+    val supportsTranslation: Boolean,
+) {
+    WhisperCpp(supportsTranslation = true),
+    Gemma4(supportsTranslation = true),
     /** sherpa-onnx offline transducer — Parakeet TDT 0.6B v3. English, Dutch, Ukrainian; not Arabic. */
-    Parakeet,
+    Parakeet(supportsTranslation = false),
     /** sherpa-onnx offline CTC — Meta Omnilingual ASR 300M. Broad language coverage including Gulf Arabic (`afb`). */
-    Omnilingual,
+    Omnilingual(supportsTranslation = false),
     /** sherpa-onnx online (streaming) NeMo CTC — Nemotron 3.5 ASR streaming 0.6B. Record screen / dictation only. */
-    NemotronStream,
+    NemotronStream(supportsTranslation = false),
 }
 
 /**
