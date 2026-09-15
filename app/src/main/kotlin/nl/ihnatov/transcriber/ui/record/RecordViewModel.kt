@@ -3,6 +3,7 @@ package nl.ihnatov.transcriber.ui.record
 import android.Manifest
 import android.app.Application
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -174,6 +175,7 @@ class RecordViewModel(
                 if (container.uiPrefs.autoBackupEnabled.value && backupUri != null) {
                     container.appScope.launch {
                         container.backupManager.exportOne(android.net.Uri.parse(backupUri), id)
+                            .onFailure { Log.w(TAG, "auto-backup failed for recording $id", it) }
                     }
                 }
                 // Drop the recorder out of its Saved state immediately,
@@ -345,20 +347,27 @@ class RecordViewModel(
      * onCycleEngine — Parakeet/Omnilingual/Nemotron aren't wired into
      * LiveTranscriber yet). Gemma4 is preferred when installed (same
      * engine as file transcription, so prompts/vocabulary carry over),
-     * but defaulting to it unconditionally — the previous behavior —
-     * meant a phone with only Whisper installed would start every
-     * recording showing "GEMMA 4 E2B" with live transcription unable to
-     * produce anything until the user noticed and manually cycled
-     * ENGINE. Mirrors RecordingDetailViewModel's autoEngineFor.
+     * WhisperCpp next, and only once BOTH are confirmed absent does this
+     * fall back to WhisperCpp anyway as a last resort — the RUN strip's
+     * own "NO MODEL INSTALLED" warning covers that case, same as it does
+     * elsewhere in the app; there's no live-capable engine left to pick
+     * that would do better. An earlier version of this function defaulted
+     * to WhisperCpp unconditionally whenever Gemma4 was missing, without
+     * checking Whisper was actually there either — a phone with, say,
+     * only Parakeet installed (not live-capable at all) reproduced the
+     * exact "engine shows something that isn't installed" bug this
+     * function exists to prevent, just with a different missing model.
+     * Mirrors RecordingDetailViewModel's autoEngineFor.
      */
-    private fun defaultLiveEngine(): AsrBackendKind =
-        if (container.asrFactory.listModels(AsrBackendKind.Gemma4).isNotEmpty()) {
-            AsrBackendKind.Gemma4
-        } else {
-            AsrBackendKind.WhisperCpp
-        }
+    private fun defaultLiveEngine(): AsrBackendKind = when {
+        container.asrFactory.listModels(AsrBackendKind.Gemma4).isNotEmpty() -> AsrBackendKind.Gemma4
+        container.asrFactory.listModels(AsrBackendKind.WhisperCpp).isNotEmpty() -> AsrBackendKind.WhisperCpp
+        else -> AsrBackendKind.WhisperCpp
+    }
 
     companion object {
+        private const val TAG = "RecordViewModel"
+
         fun factory(container: AppContainer): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

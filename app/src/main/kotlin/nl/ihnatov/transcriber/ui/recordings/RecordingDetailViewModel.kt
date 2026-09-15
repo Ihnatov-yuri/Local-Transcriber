@@ -275,6 +275,20 @@ class RecordingDetailViewModel(
         }
     }
 
+    /**
+     * Creates a new folder and files this recording into it in one step.
+     * Suspend (not fire-and-forget like [moveToFolder]) so the caller can
+     * catch [RecordingRepository.EmptyNameException] /
+     * [RecordingRepository.DuplicateNameException] and show it inline —
+     * this is reached from FolderMenu's "+ NEW FOLDER…" item, the fallback
+     * for a recording with no folders to move into yet.
+     */
+    suspend fun createFolderAndMove(name: String) {
+        val folder = container.repository.createFolder(name)
+        val rec = ui.value.recording ?: return
+        container.repository.moveToFolder(rec, folder.id)
+    }
+
     /** Find-or-create by name, attach to this recording. Mirrors the Mac's inline tag editor (commits on Return/comma in the UI). */
     fun addTag(name: String) {
         viewModelScope.launch { container.repository.addTag(name, recordingId) }

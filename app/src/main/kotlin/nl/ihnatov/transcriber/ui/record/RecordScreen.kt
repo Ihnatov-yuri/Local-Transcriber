@@ -40,7 +40,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -114,6 +116,16 @@ fun RecordScreen(
     }
 
     var langDialogOpen by remember { mutableStateOf(false) }
+
+    // Measured height of the floating RecordFooter, so the scrollable
+    // content below can reserve exactly enough clearance instead of a
+    // guessed constant — the footer's own height varies with font scale,
+    // locale (longer translated labels wrap to a 3rd line), and idle vs.
+    // active state. Seeded to a reasonable guess so there's no visible
+    // jump on the very first frame, before onSizeChanged reports the
+    // real value.
+    val density = LocalDensity.current
+    var footerHeightPx by remember { mutableStateOf(with(density) { 110.dp.roundToPx() }) }
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Sheet(modifier = Modifier.fillMaxSize()) {
@@ -203,18 +215,22 @@ fun RecordScreen(
                 },
                 onPickLanguages = { langDialogOpen = true },
             )
-            // Fixed clearance for the floating footer below (idle-state
-            // InverseFooter runs ~90dp with its two-line body; the
-            // active-recording bar is shorter but we reserve for the
-            // taller one). A weight(1f) spacer can't do this job here —
+            // Clearance for the floating footer below, sized to its
+            // actual measured height (see footerHeightPx) plus a little
+            // breathing room. A weight(1f) spacer can't do this job here —
             // weight requires a bounded max height from the parent, which
             // a verticalScroll() Column doesn't have.
-            Spacer(Modifier.height(110.dp))
+            Spacer(Modifier.height(with(density) { footerHeightPx.toDp() } + 12.dp))
             }
         }
 
         // Inverse footer pinned to the bottom.
-        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+        Box(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .onSizeChanged { footerHeightPx = it.height },
+        ) {
             RecordFooter(
                 state = ui.state,
                 hasMicPermission = ui.hasMicPermission,

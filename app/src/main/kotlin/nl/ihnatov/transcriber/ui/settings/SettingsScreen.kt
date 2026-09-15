@@ -42,7 +42,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -1603,7 +1602,6 @@ private fun BackupCard(container: AppContainer) {
     val uiPrefs = container.uiPrefs
     val folderUriString by uiPrefs.backupFolderUri.collectAsStateWithLifecycle()
     val autoBackup by uiPrefs.autoBackupEnabled.collectAsStateWithLifecycle()
-    val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var exporting by remember { mutableStateOf(false) }
     var resultMessage by remember { mutableStateOf<String?>(null) }
@@ -1667,7 +1665,14 @@ private fun BackupCard(container: AppContainer) {
                     val uri = folderUriString ?: return@Button
                     exporting = true
                     resultMessage = null
-                    scope.launch {
+                    // container.appScope (process-lifetime), not
+                    // rememberCoroutineScope() — a full backup of every
+                    // recording can run long enough that the user taps
+                    // over to another tab before it finishes, and a scope
+                    // tied to this composable would cancel the copy
+                    // mid-flight the moment BackupCard leaves composition,
+                    // silently leaving some recordings un-backed-up.
+                    container.appScope.launch {
                         val result = container.backupManager.exportAll(android.net.Uri.parse(uri))
                         exporting = false
                         resultMessage = result.fold(

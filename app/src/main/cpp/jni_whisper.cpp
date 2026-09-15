@@ -1,9 +1,10 @@
 // Thin JNI wrapper around whisper.cpp.
 //
-// Exposes five entry points to Kotlin:
+// Exposes six entry points to Kotlin:
 //   nativeInit(modelPath) -> long  (opaque handle, see WhisperHandle below)
 //   nativeTranscribe(handle, samples[], sampleRate, langTag, translate, initialPrompt) -> Segment[]
 //   nativeRequestCancel(handle)  (flips the abort flag whisper_full polls)
+//   nativeResetCancel(handle)  (Kotlin calls this before each new transcribe, see its own doc comment)
 //   nativeRelease(handle)
 //   nativeSystemInfo() -> String
 //
@@ -108,6 +109,21 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeRequestCancel(
     reinterpret_cast<WhisperHandle*>(handle)->cancelRequested.store(true, std::memory_order_relaxed);
 }
 
+// Called from Kotlin BEFORE arming invokeOnCancellation for a new
+// nativeTranscribe call, not from inside nativeTranscribe itself. Doing
+// the reset there (as an earlier version of this file did) raced against
+// invokeOnCancellation firing synchronously for an already-cancelled Job:
+// if invokeOnCancellation ran (setting the flag) before nativeTranscribe's
+// own entry-reset, that reset would silently wipe the pending cancel.
+// Resetting here, strictly before Kotlin registers the cancellation
+// handler, closes that window.
+extern "C" JNIEXPORT void JNICALL
+Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeResetCancel(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    if (handle == 0) return;
+    reinterpret_cast<WhisperHandle*>(handle)->cancelRequested.store(false, std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     JNIEnv* env, jobject /*thiz*/,
@@ -122,9 +138,6 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     if (!ensureSegmentBinding(env)) return nullptr;
     auto* h = reinterpret_cast<WhisperHandle*>(handle);
     auto* ctx = h->ctx;
-    // Fresh call, fresh flag — a previous cancelled run must not poison
-    // this one.
-    h->cancelRequested.store(false, std::memory_order_relaxed);
 
     jsize n = env->GetArrayLength(samplesArr);
     if (n <= 0) {
@@ -171,10 +184,17 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
 
     int rc = whisper_full(ctx, params, samples.data(), n);
     if (rc != 0) {
+        // Always log at ERROR so a logcat/crash-triage filter on
+        // "whisper_full failed" never misses a genuine failure — whisper.cpp
+        // has several internal failure paths (mel-spectrogram, language
+        // auto-detect, decoder/audio_ctx validation) that return non-zero
+        // without ever consulting abort_callback, so a cancel request being
+        // in flight at the same moment doesn't mean THIS rc is just a clean
+        // abort. Log the cancel as separate, additional context instead of
+        // downgrading or replacing the error.
+        LOGE("whisper_full failed: %d", rc);
         if (h->cancelRequested.load(std::memory_order_relaxed)) {
-            LOGI("whisper_full aborted by user cancel");
-        } else {
-            LOGE("whisper_full failed: %d", rc);
+            LOGI("(a cancel was also requested for this call)");
         }
         return nullptr;
     }

@@ -3,6 +3,7 @@ package nl.ihnatov.transcriber.asr
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -63,6 +64,17 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
             if (h == 0L) return@withLock Result.failure(IllegalStateException("model not loaded"))
             try {
                 progress?.invoke(0.05f)
+                // Reset the cancel flag BEFORE arming invokeOnCancellation
+                // below, not inside nativeTranscribe itself. If this call's
+                // Job is already cancelled by the time we reach this point,
+                // invokeOnCancellation fires synchronously the moment it's
+                // registered — resetting the flag afterward (as
+                // nativeTranscribe used to do at its own entry) would wipe
+                // out that already-set cancellation before whisper_full
+                // ever saw it, silently discarding a legitimate Stop.
+                // Resetting first means nothing can overwrite a
+                // cancellation set after this point.
+                nativeResetCancel(h)
                 // nativeTranscribe is one long blocking JNI call — whisper_full
                 // has no suspension points of its own, so plain coroutine
                 // cancellation can't interrupt it. suspendCancellableCoroutine
@@ -83,7 +95,12 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
                         translate,
                         promptStore?.whisperPrompt(language) ?: "",
                     )
-                    if (cont.isActive) cont.resume(result)
+                    // `result` is a plain array, not a resource (file/native
+                    // handle) that would need releasing if this resume loses
+                    // a race with cancellation — the native whisper_context
+                    // is already managed separately via release() — so the
+                    // onCancellation callback has nothing to do.
+                    if (cont.isActive) cont.resume(result) { _, _, _ -> }
                 }
                 if (raw == null) {
                     Result.failure(IllegalStateException("whisper_full returned null"))
@@ -103,7 +120,15 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
         }
     }
 
-    override suspend fun release(): Unit = withContext(Dispatchers.IO) {
+    // NonCancellable: release() exists to free the native whisper_context
+    // (can hold the full model weights, hundreds of MB) and is very
+    // commonly called from a catch block right after the caller's own Job
+    // was cancelled — e.g. TranscriptionRunner's cancel-cleanup paths. A
+    // plain withContext there throws immediately on an already-cancelled
+    // Job without ever running this body, silently no-op'ing the "cleanup"
+    // and leaking the context. A close/release operation should always
+    // run to completion regardless of why the caller is unwinding.
+    override suspend fun release(): Unit = withContext(NonCancellable + Dispatchers.IO) {
         mutex.withLock {
             if (handle != 0L) {
                 nativeRelease(handle)
@@ -126,6 +151,7 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
     private external fun nativeRelease(handle: Long)
     private external fun nativeSystemInfo(): String
     private external fun nativeRequestCancel(handle: Long)
+    private external fun nativeResetCancel(handle: Long)
 
     companion object {
         private const val TAG = "WhisperCppBackend"

@@ -20,8 +20,8 @@ android {
         // Bump both per shipped build (docs/PLAN-2026-09.md §6). versionCode
         // must stay monotonic — Obtainium and the OS use it to decide
         // whether an APK is an upgrade.
-        versionCode = 101
-        versionName = "1.1.0"
+        versionCode = 102
+        versionName = "1.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

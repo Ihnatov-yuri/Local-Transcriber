@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -38,7 +39,12 @@ class BackupManager(
      * (or on a schedule) doesn't redo work or duplicate files.
      */
     suspend fun exportAll(destTreeUri: Uri): Result<ExportResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        // Plain try/catch, not runCatching — runCatching's catch(Throwable)
+        // would swallow a CancellationException (e.g. the app process
+        // winding down mid-backup) and turn it into an ordinary
+        // Result.failure, leaving this coroutine looking like it completed
+        // normally instead of actually honoring the cancellation.
+        try {
             val root = openRoot(destTreeUri)
             val recordings = repository.observeLibrary().first()
             var exported = 0
@@ -51,7 +57,11 @@ class BackupManager(
                     Outcome.FAILED -> failed++
                 }
             }
-            ExportResult(exported, failed, skipped)
+            Result.success(ExportResult(exported, failed, skipped))
+        } catch (t: CancellationException) {
+            throw t
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 
@@ -61,11 +71,23 @@ class BackupManager(
      * unprotected until the next manual "back up now".
      */
     suspend fun exportOne(destTreeUri: Uri, recordingId: Long): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val root = openRoot(destTreeUri)
             val rec = repository.get(recordingId) ?: error("Recording not found")
-            exportOneInternal(root, rec)
-            Unit
+            // exportOneInternal reports FAILED by swallowing its own
+            // exception internally (see below) rather than throwing — it
+            // has to, since exportAll needs to keep going past one bad
+            // recording. That means the failure has to be re-raised here
+            // explicitly, or this always-Unit body would report
+            // Result.success even when the copy never happened.
+            if (exportOneInternal(root, rec) == Outcome.FAILED) {
+                error("Failed to back up recording ${rec.id}")
+            }
+            Result.success(Unit)
+        } catch (t: CancellationException) {
+            throw t
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 
@@ -105,6 +127,8 @@ class BackupManager(
             out.use { it.write(text.toByteArray()) }
 
             if (alreadyBackedUp) Outcome.SKIPPED else Outcome.EXPORTED
+        } catch (t: CancellationException) {
+            throw t
         } catch (t: Throwable) {
             Outcome.FAILED
         }

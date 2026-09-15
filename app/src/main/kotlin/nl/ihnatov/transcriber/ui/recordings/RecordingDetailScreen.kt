@@ -56,7 +56,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -336,6 +338,7 @@ fun RecordingDetailScreen(
                     allFolders = ui.allFolders,
                     tags = ui.tags,
                     onMoveToFolder = vm::moveToFolder,
+                    onCreateFolderAndMove = vm::createFolderAndMove,
                     onAddTag = vm::addTag,
                     onRemoveTag = vm::removeTag,
                 )
@@ -468,7 +471,19 @@ fun RecordingDetailScreen(
                     .weight(1f)
                     .hazeSource(hazeState),
             ) {
-                when (val tab = tabs[selectedTab]) {
+                // DetailPlayerBar (44dp + 4dp top padding = 48dp) is a
+                // same-Box overlay, not a sibling with its own reserved
+                // layout space — without this top inset on the actual tab
+                // content, its first row renders directly underneath the
+                // bar. Worse than a purely visual overlap: the bar's own
+                // seek area is a large tap target spanning most of its
+                // width/height, so it was WINNING touch hit-testing there
+                // too, making the first transcript segment (or the Output
+                // tab's Share/Delete row) unseekable/untappable until
+                // scrolled or auto-scrolled away.
+                val playerClearance = if (ui.segments.isNotEmpty()) 52.dp else 0.dp
+                Box(Modifier.fillMaxSize().padding(top = playerClearance)) {
+                    when (val tab = tabs[selectedTab]) {
                     is DocTab.Transcript -> TranscriptBody(
                         segments = ui.segments,
                         speakerColors = speakerKeys.mapIndexed { idx, k -> k to speakerColor(idx) }.toMap(),
@@ -497,6 +512,7 @@ fun RecordingDetailScreen(
                             context.startActivity(Intent.createChooser(intent, "Share ${tab.doc.title}"))
                         },
                     )
+                    }
                 }
                 if (ui.segments.isNotEmpty()) {
                     DetailPlayerBar(
@@ -774,11 +790,17 @@ private fun OrganizeRow(
     allFolders: List<Folder>,
     tags: List<Tag>,
     onMoveToFolder: (Long?) -> Unit,
+    onCreateFolderAndMove: suspend (String) -> Unit,
     onAddTag: (String) -> Unit,
     onRemoveTag: (Long) -> Unit,
 ) {
     Row(verticalAlignment = Alignment.Top) {
-        FolderMenu(currentFolderId = currentFolderId, allFolders = allFolders, onMoveToFolder = onMoveToFolder)
+        FolderMenu(
+            currentFolderId = currentFolderId,
+            allFolders = allFolders,
+            onMoveToFolder = onMoveToFolder,
+            onCreateFolderAndMove = onCreateFolderAndMove,
+        )
         Spacer(Modifier.width(Spacing.m))
         TagEditorRow(
             tags = tags,
@@ -789,15 +811,28 @@ private fun OrganizeRow(
     }
 }
 
-/** "FOLDER: NAME ▾" — every other folder, plus "Remove from Folder" when filed. Mirrors the Mac's `folderMenu()`. */
+/**
+ * "FOLDER: NAME ▾" — every other folder, plus "Remove from Folder" when
+ * filed. Mirrors the Mac's `folderMenu()`.
+ *
+ * Always offers "+ NEW FOLDER…" too — on a fresh install (zero folders)
+ * with this recording unfiled, the dropdown used to have nothing in it
+ * at all: no other folders to move to, and no "remove" option since it
+ * isn't filed. Same fix as RecordingsListScreen.kt's RecordingRow, which
+ * hit the identical empty-menu bug for the same reason.
+ */
 @Composable
 private fun FolderMenu(
     currentFolderId: Long?,
     allFolders: List<Folder>,
     onMoveToFolder: (Long?) -> Unit,
+    onCreateFolderAndMove: suspend (String) -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
+    val scope = rememberCoroutineScope()
     var menuOpen by remember { mutableStateOf(false) }
+    var newFolderOpen by remember { mutableStateOf(false) }
+    var newFolderError by remember { mutableStateOf<String?>(null) }
     val currentName = allFolders.find { it.id == currentFolderId }?.name
     Box {
         Mono(
@@ -822,8 +857,60 @@ private fun FolderMenu(
                     onClick = { menuOpen = false; onMoveToFolder(null) },
                 )
             }
+            DropdownMenuItem(
+                text = { Mono("+ NEW FOLDER…", color = ink) },
+                onClick = { menuOpen = false; newFolderError = null; newFolderOpen = true },
+            )
+        }
+        if (newFolderOpen) {
+            DetailNewFolderDialog(
+                error = newFolderError,
+                onDismiss = { newFolderOpen = false },
+                onConfirm = { name ->
+                    scope.launch {
+                        runCatching { onCreateFolderAndMove(name) }
+                            .onSuccess { newFolderError = null; newFolderOpen = false }
+                            .onFailure { newFolderError = it.message ?: "Couldn't create folder" }
+                    }
+                },
+            )
         }
     }
+}
+
+/** Name-input dialog for FolderMenu's "+ NEW FOLDER…" — same shape as RecordingsListScreen.kt's NewFolderDialog, a separate (private, different file) instance rather than a shared one. */
+@Composable
+private fun DetailNewFolderDialog(
+    error: String?,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.background,
+        title = { Mono("NEW FOLDER", color = MaterialTheme.colorScheme.onBackground) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    singleLine = true,
+                    placeholder = { Text("Folder name") },
+                )
+                if (error != null) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(error, color = Accent, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(draft) }) { Mono("CREATE") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Mono("CANCEL") }
+        },
+    )
 }
 
 /**

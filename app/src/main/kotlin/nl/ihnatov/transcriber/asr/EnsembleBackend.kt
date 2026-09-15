@@ -1,6 +1,7 @@
 package nl.ihnatov.transcriber.asr
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -132,6 +133,8 @@ class EnsembleBackend(
                 progress?.invoke((i + 1).toFloat() / cuts.size)
             }
             Result.success(out)
+        } catch (t: CancellationException) {
+            throw t
         } catch (t: Throwable) {
             Log.e(TAG, "ensemble transcribe failed", t)
             Result.failure(t)
@@ -150,8 +153,19 @@ class EnsembleBackend(
         val b = backendB!!
         // Sequential — the plan calls for this explicitly (no ANE/GPU split
         // to exploit on a phone the way the Mac's concurrent call has).
-        val resultA = runCatching { a.transcribe(slice, sampleRate, language, translate, null) }.getOrNull()
-        val resultB = runCatching { b.transcribe(slice, sampleRate, language, translate, null) }.getOrNull()
+        //
+        // kotlin.runCatching catches CancellationException the same as any
+        // other Throwable — .getOrNull() alone would turn a cancelled
+        // Whisper call (WhisperCppBackend.transcribe now throws on Stop)
+        // into a plain null result, and this per-chunk loop would just
+        // treat it as "that engine produced nothing" and carry on to the
+        // next chunk instead of stopping. onFailure rethrows it first.
+        val resultA = runCatching { a.transcribe(slice, sampleRate, language, translate, null) }
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull()
+        val resultB = runCatching { b.transcribe(slice, sampleRate, language, translate, null) }
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull()
         val segsA = resultA?.getOrNull()
         val segsB = resultB?.getOrNull()
         trackWedge(engineFailed = kindA == AsrBackendKind.Gemma4 && segsA == null)

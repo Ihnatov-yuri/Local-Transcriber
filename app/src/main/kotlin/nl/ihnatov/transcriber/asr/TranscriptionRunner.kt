@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -1044,13 +1045,26 @@ class TranscriptionRunner(
                     }
                 mono = decoded.samples
                 send(AsrEvent.Stage("Transcribing", 0.2f))
-                val tx = asr.transcribe(
-                    samples = mono,
-                    sampleRate = decoded.sampleRate,
-                    language = primaryLanguage,
-                    translate = whisperTranslate,
-                    progress = null,
-                )
+                val tx = try {
+                    asr.transcribe(
+                        samples = mono,
+                        sampleRate = decoded.sampleRate,
+                        language = primaryLanguage,
+                        translate = whisperTranslate,
+                        progress = null,
+                    )
+                } catch (t: CancellationException) {
+                    // WhisperCppBackend.transcribe throws (not Result.failure)
+                    // on cancellation so TranscriptionJobManager's cooperative-
+                    // cancellation handling paints "Cancelled" correctly — but
+                    // that means this call can exit via exception instead of
+                    // a Result, skipping the tx.isFailure cleanup below
+                    // entirely. Release explicitly before re-throwing so a
+                    // cancelled short-file run doesn't leak the native
+                    // whisper_context.
+                    asr.release()
+                    throw t
+                }
                 if (tx.isFailure) {
                     asr.release()
                     send(AsrEvent.Failed(tx.exceptionOrNull()?.message ?: "transcription failed"))
@@ -1142,6 +1156,19 @@ class TranscriptionRunner(
                     asr.release()
                     send(b.failure)
                     return@channelFlow
+                } catch (t: CancellationException) {
+                    // Must come before catch (t: Throwable) below — without
+                    // this, a cancelled long-file Whisper run got painted as
+                    // "Failed to decode/transcribe" instead of "Cancelled"
+                    // (TranscriptionJobManager's cooperative-cancellation
+                    // handling never saw the CancellationException, since
+                    // catching Throwable here converted it into a normal
+                    // AsrEvent.Failed + return@channelFlow instead of letting
+                    // it propagate). release() is safe to call here even
+                    // though the Job is already cancelled — see its own
+                    // NonCancellable doc comment.
+                    asr.release()
+                    throw t
                 } catch (t: Throwable) {
                     asr.release()
                     send(AsrEvent.Failed("Failed to decode/transcribe $audioPath: ${t.message}"))
