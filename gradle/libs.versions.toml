@@ -20,6 +20,13 @@ serializationJson = "1.11.0"
 documentfile = "1.0.1"
 commonsCompress = "1.28.0"
 commonmark = "0.30.0"
+# Backdrop blur for the one Lit Field "veil" glass surface (PlayerBar).
+# Auto-selects RuntimeShader (API33+) / multiple-GraphicsLayers (API32) /
+# a flat semi-transparent scrim (<=API31, this app's minSdk 29 included) —
+# see memory: project-design-migration-lit-field-2026-09. Pinned to the
+# last stable release, not the 2.0 RC that shipped days before this was
+# written.
+haze = "1.7.3"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
 espresso = "3.6.1"
@@ -74,6 +81,9 @@ commonmark-ext-gfm-tables = { module = "org.commonmark:commonmark-ext-gfm-tables
 # Replaces the older com.google.mediapipe:tasks-genai which doesn't yet load
 # Gemma 4's litertlm format.
 litertlm-android = { module = "com.google.ai.edge.litertlm:litertlm-android", version.ref = "litertlm" }
+
+# Frosted-glass backdrop blur (Compose Multiplatform, Maven Central).
+haze = { module = "dev.chrisbanes.haze:haze", version.ref = "haze" }
 
 # Tests
 junit = { module = "junit:junit", version.ref = "junit" }

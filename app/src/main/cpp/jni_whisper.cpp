@@ -1,8 +1,9 @@
 // Thin JNI wrapper around whisper.cpp.
 //
-// Exposes four entry points to Kotlin:
-//   nativeInit(modelPath) -> long  (opaque context handle)
+// Exposes five entry points to Kotlin:
+//   nativeInit(modelPath) -> long  (opaque handle, see WhisperHandle below)
 //   nativeTranscribe(handle, samples[], sampleRate, langTag, translate, initialPrompt) -> Segment[]
+//   nativeRequestCancel(handle)  (flips the abort flag whisper_full polls)
 //   nativeRelease(handle)
 //   nativeSystemInfo() -> String
 //
@@ -12,6 +13,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -24,6 +26,22 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+// Wraps the whisper_context so a cancel flag can travel alongside the
+// opaque jlong handle Kotlin holds. whisper_full() has no suspension
+// points of its own — it's one long blocking call — so Kotlin-side
+// coroutine cancellation can't interrupt it on its own. Instead, Kotlin
+// sets this flag (nativeRequestCancel) and whisper's own abort_callback
+// (polled during ggml graph computation, much finer-grained than a whole
+// 30s chunk) picks it up and unwinds whisper_full() early.
+struct WhisperHandle {
+    whisper_context* ctx = nullptr;
+    std::atomic<bool> cancelRequested{false};
+};
+
+bool checkAbort(void* data) {
+    return static_cast<WhisperHandle*>(data)->cancelRequested.load(std::memory_order_relaxed);
+}
 
 // Cached Kotlin class + method handles for emitting Segment objects.
 struct SegmentBinding {
@@ -65,15 +83,29 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeInit(
         LOGE("whisper_init_from_file_with_params returned null");
         return 0;
     }
-    return reinterpret_cast<jlong>(ctx);
+    auto* handle = new WhisperHandle{ctx};
+    return reinterpret_cast<jlong>(handle);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeRelease(
     JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     if (handle == 0) return;
-    auto* ctx = reinterpret_cast<whisper_context*>(handle);
-    whisper_free(ctx);
+    auto* h = reinterpret_cast<WhisperHandle*>(handle);
+    whisper_free(h->ctx);
+    delete h;
+}
+
+// Called from Kotlin's CancellableContinuation.invokeOnCancellation while
+// nativeTranscribe is still blocked on whisper_full() in another call —
+// this only flips a flag, it never touches the whisper_context itself, so
+// it's safe to call concurrently from a different thread than the one
+// running the transcription.
+extern "C" JNIEXPORT void JNICALL
+Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeRequestCancel(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    if (handle == 0) return;
+    reinterpret_cast<WhisperHandle*>(handle)->cancelRequested.store(true, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
@@ -88,7 +120,11 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
 
     if (handle == 0) return nullptr;
     if (!ensureSegmentBinding(env)) return nullptr;
-    auto* ctx = reinterpret_cast<whisper_context*>(handle);
+    auto* h = reinterpret_cast<WhisperHandle*>(handle);
+    auto* ctx = h->ctx;
+    // Fresh call, fresh flag — a previous cancelled run must not poison
+    // this one.
+    h->cancelRequested.store(false, std::memory_order_relaxed);
 
     jsize n = env->GetArrayLength(samplesArr);
     if (n <= 0) {
@@ -105,6 +141,8 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     params.translate      = translate == JNI_TRUE;
     params.no_context     = true;
     params.suppress_blank = true;
+    params.abort_callback           = checkAbort;
+    params.abort_callback_user_data = h;
 
     std::string lang;
     if (langTag) {
@@ -133,7 +171,11 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
 
     int rc = whisper_full(ctx, params, samples.data(), n);
     if (rc != 0) {
-        LOGE("whisper_full failed: %d", rc);
+        if (h->cancelRequested.load(std::memory_order_relaxed)) {
+            LOGI("whisper_full aborted by user cancel");
+        } else {
+            LOGE("whisper_full failed: %d", rc);
+        }
         return nullptr;
     }
 

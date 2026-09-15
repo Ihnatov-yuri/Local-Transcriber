@@ -4,9 +4,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /**
- * The editorial spacing scale. Tighter than typical M3 because the design
- * has no cards — there are no 24-dp gaps between containers. All vertical
- * rhythm comes from hairlines, not whitespace.
+ * The spacing scale. Kept from the old editorial system rather than
+ * widened to match Material 3 Expressive's airier defaults — panels
+ * (see [nl.ihnatov.transcriber.ui.components.Panel]) now provide their own
+ * internal padding, so tightening/loosening this shared scale would touch
+ * every screen at once for a benefit that's better delivered locally.
  */
 object Spacing {
     val xs: Dp = 4.dp
@@ -21,9 +23,3 @@ object Spacing {
     /** Vertical padding for ledger-style rows. */
     val rowVPad: Dp = 11.dp
 }
-
-/** Top-level rule between header / list / section blocks. */
-val InkRuleStroke: Dp = 1.5.dp
-
-/** Interior divider between rows. */
-val HairlineStroke: Dp = 1.dp

@@ -10,6 +10,24 @@
 # into the path above before invoking the Gradle build.
 
 cmake_minimum_required(VERSION 3.22.1)
+
+# Force optimized compilation for the native build, independent of the
+# Gradle build variant. AGP's CMake integration passes
+# -DCMAKE_BUILD_TYPE=Debug for a `debug` Gradle build, which compiles
+# ggml/whisper.cpp at -O0 — no auto-vectorization, no loop unrolling.
+# For compute-bound numerical code that's not "a slower debug build," it's
+# 10-50x+ slower: observed multi-minute whisper.cpp inference on a 10s
+# clip on a current flagship phone (Galaxy S24 Ultra), where a couple of
+# seconds is normal. whisper.cpp's and ggml's own CMakeLists.txt each try
+# to default CMAKE_BUILD_TYPE to Release, but only `if (NOT
+# CMAKE_BUILD_TYPE)` — AGP has already set it to "Debug" by the time
+# those run, so that guard never fires. Force it here, before
+# add_subdirectory() pulls whisper.cpp in, so their guard sees it already
+# set and leaves it alone. Nobody single-steps through ggml's matmul
+# kernels in the Kotlin-focused Android Studio debugger anyway — only our
+# thin JNI shim and the Kotlin/Compose side benefit from being "debug".
+set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+
 project(transcriber_native LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)

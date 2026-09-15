@@ -57,8 +57,10 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -67,8 +69,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,6 +76,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import nl.ihnatov.transcriber.asr.AsrBackendKind
 import nl.ihnatov.transcriber.asr.TextDestutter
 import nl.ihnatov.transcriber.asr.TranscriptExporter
@@ -87,29 +90,25 @@ import nl.ihnatov.transcriber.data.Folder
 import nl.ihnatov.transcriber.data.Tag
 import nl.ihnatov.transcriber.ui.KeepScreenOn
 import nl.ihnatov.transcriber.ui.MarkdownText
-import nl.ihnatov.transcriber.ui.components.Hairline
+import nl.ihnatov.transcriber.ui.components.GlassPanel
 import nl.ihnatov.transcriber.ui.components.HairlineSoft
-import nl.ihnatov.transcriber.ui.components.InkRule
 import nl.ihnatov.transcriber.ui.components.Mono
 import nl.ihnatov.transcriber.ui.components.Sheet
 import nl.ihnatov.transcriber.ui.theme.Accent
-import nl.ihnatov.transcriber.ui.theme.Fraunces
-import nl.ihnatov.transcriber.ui.theme.IbmPlexMono
-import nl.ihnatov.transcriber.ui.theme.Inter
-import nl.ihnatov.transcriber.ui.theme.SairaCondensed
 import nl.ihnatov.transcriber.ui.theme.Spacing
 
 /**
- * Recording-detail screen — design `03A · SESSION` (segment-ledger
- * variant) from `screen-detail.jsx`.
+ * Recording-detail screen (segment-ledger variant).
  *
- * Outer chrome is editorial paper-and-ink: a back link + meta row, an
- * ink rule, a section index, a Fraunces italic title, a mono-caps
- * metadata strip, a manual tab strip with an Accent underline, then
- * the transcript ledger. The Transcribe RUN controls collapse behind a
- * mono-caps "RUN ▾" expander so they don't fight the title for weight.
- * Post-processing presets are kept as a 2×2 inverse-block grid — the
- * only chip surface in the app, by design exception (§5.4).
+ * Outer chrome: a back link + meta row, a section index, a large
+ * statement-style title, a mono-caps metadata strip, a manual tab strip
+ * with an Accent underline, then the transcript ledger. The Transcribe
+ * RUN controls collapse behind a mono-caps "RUN ▾" expander so they don't
+ * fight the title for weight. [DetailPlayerBar] floats over the
+ * transcript/output as this screen's one Haze glass surface (see
+ * memory: project-design-migration-lit-field-2026-09). Post-processing
+ * presets are kept as a 2×2 inverse-block grid — the only chip-like
+ * surface in the app, by design exception.
  *
  * The underlying [RecordingDetailViewModel] is unchanged.
  */
@@ -275,6 +274,10 @@ fun RecordingDetailScreen(
     KeepScreenOn(enabled = ui.running)
 
     val speakerKeys = remember(ui.segments) { ui.segments.mapNotNull { it.speaker }.distinct() }
+    // Shared between the tab-content Box (hazeSource, below) and
+    // DetailPlayerBar (hazeEffect) so the player's glass surface blurs
+    // whatever transcript/output content is actually scrolled behind it.
+    val hazeState = rememberHazeState()
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Sheet(modifier = Modifier.fillMaxSize()) {
@@ -299,9 +302,7 @@ fun RecordingDetailScreen(
                 onShowHistory = { historySheetOpen = true },
                 onDelete = { vm.delete(onBack) },
             )
-            Spacer(Modifier.height(10.dp))
-            InkRule()
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(26.dp))
 
             if (!fullscreen) {
                 Mono(
@@ -309,16 +310,15 @@ fun RecordingDetailScreen(
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Spacer(Modifier.height(8.dp))
+                // The one-per-screen "voice" moment — was a Fraunces
+                // italic title; Lit Field carries no serif/italic voice,
+                // so this is now the larger/lighter statement cut of the
+                // text face (see ui/theme/Type.kt headlineLarge), same
+                // move as RecordScreen's LastHeardBlock.
                 Text(
                     text = ui.recording?.title ?: "Untitled",
                     color = MaterialTheme.colorScheme.onBackground,
-                    style = TextStyle(
-                        fontFamily = Fraunces,
-                        fontStyle = FontStyle.Italic,
-                        fontSize = 26.sp,
-                        lineHeight = 30.sp,
-                        letterSpacing = (-0.38).sp,
-                    ),
+                    style = MaterialTheme.typography.headlineLarge,
                 )
                 Spacer(Modifier.height(12.dp))
                 HairlineSoft()
@@ -457,17 +457,17 @@ fun RecordingDetailScreen(
             )
             Spacer(Modifier.height(8.dp))
 
-            // Player bar — kept from prior build.
-            if (ui.segments.isNotEmpty()) {
-                EditorialPlayer(
-                    controller = playerController,
-                    waveform = waveform,
-                )
-                Spacer(Modifier.height(8.dp))
-            }
-
-            // Body: transcript ledger / prose / output.
-            Box(Modifier.fillMaxWidth().weight(1f)) {
+            // Body: transcript ledger / prose / output, with the player
+            // floating over its top edge as a glass bar — this app's one
+            // Haze-backed surface (see GlassPanel's doc comment). Content
+            // scrolls underneath the translucent/blurred bar rather than
+            // reserving space for it, same as a music app's mini-player.
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .hazeSource(hazeState),
+            ) {
                 when (val tab = tabs[selectedTab]) {
                     is DocTab.Transcript -> TranscriptBody(
                         segments = ui.segments,
@@ -496,6 +496,17 @@ fun RecordingDetailScreen(
                             }
                             context.startActivity(Intent.createChooser(intent, "Share ${tab.doc.title}"))
                         },
+                    )
+                }
+                if (ui.segments.isNotEmpty()) {
+                    DetailPlayerBar(
+                        controller = playerController,
+                        waveform = waveform,
+                        hazeState = hazeState,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
                     )
                 }
             }
@@ -933,6 +944,7 @@ private fun RunStrip(
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     val paper = MaterialTheme.colorScheme.background
+    val inverseShape = RoundedCornerShape(14.dp)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier
@@ -974,6 +986,7 @@ private fun RunStrip(
             Column(
                 Modifier
                     .fillMaxWidth()
+                    .clip(inverseShape)
                     .background(ink)
                     .let { if (job.stopping) it else it.clickable(onClick = onCancel) }
                     .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -1006,6 +1019,7 @@ private fun RunStrip(
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .clip(inverseShape)
                     .background(ink)
                     .clickable(onClick = onRun)
                     .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -1429,6 +1443,7 @@ private fun PresetGrid(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
+                            .clip(RoundedCornerShape(12.dp))
                             .background(ink)
                             .clickable(enabled = !running) { onRun(preset.id) }
                             .padding(horizontal = cellHPad, vertical = cellVPad),
@@ -1584,10 +1599,10 @@ private fun TranscriptBody(
                     modifier = Modifier
                         .fillMaxWidth()
                         // Active-segment highlight. 7% orange was invisible
-                        // against PaperDark (the tint had nothing to lift
-                        // against on a near-black background). 16% reads
-                        // clearly on both surfaces without becoming a
-                        // shouty bar on the cream paper.
+                        // against the dark-mode background (the tint had
+                        // nothing to lift against on a near-black surface).
+                        // 16% reads clearly in both light and dark mode
+                        // without becoming a shouty bar in light mode.
                         .background(if (isActive) Accent.copy(alpha = 0.16f) else Color.Transparent)
                         .combinedClickable(
                             onClick = { if (!isEditing) onSegmentSeek(seg) },
@@ -1724,22 +1739,30 @@ private fun OutputBody(
 
 // ─── Player ──────────────────────────────────────────────────────────
 
+/**
+ * Floating player bar — this app's one [GlassPanel] (real backdrop blur
+ * via Haze over the scrolling transcript/output beneath it). Was an
+ * opaque `surfaceVariant` row pushed above the scroll area; now overlays
+ * its top edge instead, per the design-migration research: native
+ * Android's own blur stays scoped to a single persistent floating
+ * surface, and a mini-player docked over scrolling content is exactly
+ * that idiom (see RecordingDetailScreen's tab-content Box).
+ */
 @Composable
-private fun EditorialPlayer(
+private fun DetailPlayerBar(
     controller: AudioPlayerController,
     waveform: FloatArray?,
+    hazeState: HazeState,
+    modifier: Modifier = Modifier,
 ) {
     val isPlaying by controller.isPlaying.collectAsStateWithLifecycle()
     val positionMs by controller.positionMs.collectAsStateWithLifecycle()
     val durationMs by controller.durationMs.collectAsStateWithLifecycle()
     val ink = MaterialTheme.colorScheme.onBackground
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(44.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    GlassPanel(
+        hazeState = hazeState,
+        modifier = modifier.height(44.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
     ) {
         Mono(
             if (isPlaying) "▌▌" else "▶",
@@ -1781,7 +1804,7 @@ private fun EditorialPlayer(
             } else {
                 // Fallback timeline while the waveform extractor is
                 // still running (or if it errored). Earlier ink-alpha
-                // 0.25 was nearly invisible on the dark surfaceVariant;
+                // 0.25 was nearly invisible against the glass panel;
                 // bumped to 0.55 and thickened to 3 px so the user
                 // can see and tap the scrubber immediately, before
                 // the waveform finishes loading.
@@ -1808,7 +1831,7 @@ private fun EditorialPlayer(
         Text(
             "${formatPlayerTime(positionMs)} / ${formatPlayerTime(durationMs)}",
             color = ink.copy(alpha = 0.75f),
-            style = MaterialTheme.typography.labelSmall.copy(fontFamily = IbmPlexMono),
+            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
         )
         Spacer(Modifier.width(6.dp))
     }
@@ -1947,7 +1970,7 @@ private fun VersionRow(
             Spacer(Modifier.height(2.dp))
             Text(
                 "${formatStampMono(version.createdAtMillis)} · ${version.segmentCount} turns",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = IbmPlexMono),
+                style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
                 color = ink.copy(alpha = 0.55f),
             )
         }
@@ -1988,12 +2011,15 @@ private fun formatPlayerTime(ms: Long): String {
 private fun speakerColor(index: Int): Color = speakerPalette[index % speakerPalette.size]
 
 /**
- * Speaker palette tuned for legibility on BOTH paper (light) and
- * dark-warm backgrounds. The 8th entry was previously `#4F4F4F`
- * graphite, which sat at near-zero contrast against `PaperDark`
- * (`#16130F`) — the speaker chip and segment label became invisible
- * in dark mode. Replaced with a warm tan that reads against both
- * the cream paper and the dark warm.
+ * Speaker palette tuned for legibility on BOTH the light and dark mode
+ * backgrounds ([nl.ihnatov.transcriber.ui.theme.BaseLight] /
+ * [nl.ihnatov.transcriber.ui.theme.BaseDark]). The 8th entry was
+ * previously `#4F4F4F` graphite, which sat at near-zero contrast against
+ * the dark background — the speaker chip and segment label became
+ * invisible in dark mode. Replaced with a warm tan that reads against
+ * both backgrounds. Independent of the Lit Field migration — these are
+ * functional per-speaker colors, not brand colors, so they weren't
+ * touched when the palette moved to Lit Field's tokens.
  */
 private val speakerPalette = listOf(
     Color(0xFFFF4726), // accent orange
@@ -2039,7 +2065,11 @@ private fun buildAnnotatedProse(
             }
             lastSpeakerKey = speakerKey
         } else if (!anyEmitted && showTimestamps && speakerKey == null) {
-            builder.pushStyle(SpanStyle(color = mutedColor, fontFamily = IbmPlexMono))
+            // No fontFamily override needed — the surrounding Text already
+            // renders at MaterialTheme.typography.headlineSmall, which is
+            // Schibsted Grotesk; Lit Field has no separate mono voice to
+            // switch to for a timestamp the way the old system did.
+            builder.pushStyle(SpanStyle(color = mutedColor))
             builder.append(timestamp(seg.startSeconds))
             builder.pop()
             builder.append("\n")

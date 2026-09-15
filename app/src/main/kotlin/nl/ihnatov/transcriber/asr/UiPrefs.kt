@@ -158,6 +158,33 @@ class UiPrefs(context: Context) {
         saveNullableFloat(KEY_TURN_COALESCE_GAP, value)
     }
 
+    // ---- Backup destination (Settings → Backup) ----
+    //
+    // A Storage Access Framework tree URI the user picked to back
+    // recordings up to, outside the app's private storage — see
+    // BackupManager. Persisted as a plain string; the actual SAF grant
+    // survives independently via takePersistableUriPermission (done at
+    // the point the user picks the folder), which is what lets this URI
+    // still resolve after a process restart.
+    private val _backupFolderUri = MutableStateFlow(prefs.getString(KEY_BACKUP_FOLDER_URI, null))
+    val backupFolderUri: StateFlow<String?> = _backupFolderUri.asStateFlow()
+
+    fun setBackupFolderUri(uri: String?) {
+        _backupFolderUri.value = uri
+        val editor = prefs.edit()
+        if (uri == null) editor.remove(KEY_BACKUP_FOLDER_URI) else editor.putString(KEY_BACKUP_FOLDER_URI, uri)
+        editor.apply()
+    }
+
+    /** Copy each new recording to [backupFolderUri] right after it finishes, not just on manual "back up now". */
+    private val _autoBackupEnabled = MutableStateFlow(prefs.getBoolean(KEY_AUTO_BACKUP, false))
+    val autoBackupEnabled: StateFlow<Boolean> = _autoBackupEnabled.asStateFlow()
+
+    fun setAutoBackupEnabled(value: Boolean) {
+        _autoBackupEnabled.value = value
+        prefs.edit().putBoolean(KEY_AUTO_BACKUP, value).apply()
+    }
+
     private fun loadNullableFloat(key: String): Float? {
         val v = prefs.getFloat(key, Float.NaN)
         return if (v.isNaN()) null else v
@@ -179,5 +206,7 @@ class UiPrefs(context: Context) {
         private const val KEY_MIN_DURATION_ON = "diar_min_duration_on"
         private const val KEY_MIN_DURATION_OFF = "diar_min_duration_off"
         private const val KEY_TURN_COALESCE_GAP = "turn_coalesce_gap_sec"
+        private const val KEY_BACKUP_FOLDER_URI = "backup_folder_uri"
+        private const val KEY_AUTO_BACKUP = "auto_backup_enabled"
     }
 }

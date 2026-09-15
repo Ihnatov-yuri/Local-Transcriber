@@ -20,8 +20,8 @@ android {
         // Bump both per shipped build (docs/PLAN-2026-09.md §6). versionCode
         // must stay monotonic — Obtainium and the OS use it to decide
         // whether an APK is an upgrade.
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 101
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -154,6 +154,11 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     implementation(libs.androidx.navigation.compose)
+
+    // Frosted-glass backdrop blur for the PlayerBar "veil" — see
+    // ui/theme/Type.kt / Primitives.kt header comments and
+    // memory: project-design-migration-lit-field-2026-09.
+    implementation(libs.haze)
 
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

@@ -13,23 +13,34 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 
 /**
- * The editorial theme. Material 3 stays as the engine (theming, scaffolds,
- * navigation) but the look is overridden almost everywhere — no rounded
- * corners, no elevation, hairlines instead of cards, paper background, the
- * one accent. Per design principle #1: the page is a sheet of paper, not
- * a screen.
+ * The Lit Field theme. Material 3 stays the engine (theming, scaffolds,
+ * navigation) but the shape and depth language flip from the old editorial
+ * system: pills and generous corner radii instead of `RectangleShape`
+ * everywhere, real shadow-lifted surfaces instead of hairline-only
+ * division. This is a convergence with where Android's own Material 3
+ * Expressive direction already went (pill buttons and large radii are
+ * first-class M3 tokens as of 2025), not a departure from it the way the
+ * old flat/hairline look deliberately was.
  *
- * Specifically removed from M3 defaults:
- *   - dynamic color (we want brand-specific paper/ink, not wallpaper)
- *   - rounded corners on every shape slot (RectangleShape across the board)
- *   - bright system bars (status + nav painted with the paper color so the
- *     sheet feels continuous from edge to edge)
+ * Specifically changed from the old editorial theme:
+ *   - shape slots are a real radius scale (10/14/18/22/26dp), not zero
+ *   - `error` now maps to a dedicated status-red, not the brand accent —
+ *     the source CSS calls this out explicitly: a status color sitting
+ *     close to the brand hue reads as brand, not as state
+ *   - `tertiary` and `secondaryContainer` are now actually wired (the old
+ *     theme left them unset, so anything reading those slots — Settings'
+ *     `Pill()`, the model-update-reason text — silently fell back to M3's
+ *     default purple-ish roles, quietly breaking the "one accent" rule)
  *
  * The optional [dynamicColor] parameter is accepted (and ignored) for
- * backward compatibility with the previous TranscriberTheme signature.
+ * backward compatibility with the previous TranscriberTheme signature —
+ * per the 2026-09 Android-conventions research, a strong single custom
+ * accent (not per-wallpaper dynamic color) is the normal, accepted pattern
+ * for a branded app in 2026, so this app deliberately never turns it on.
  */
 @Composable
 fun TranscriberTheme(
@@ -39,50 +50,57 @@ fun TranscriberTheme(
 ) {
     val colors = if (darkTheme) {
         darkColorScheme(
-            background = PaperDark,
-            surface = PaperDark,
-            // Lifted surface uses PaperRaisedDark (slightly LIGHTER than
-            // PaperDark) so the bottom nav, player bar, and other
-            // "raised" chrome reads as on top of the paper sheet rather
-            // than sunken into a darker hole. Light mode uses
-            // PaperEdgeLight (slightly DARKER than PaperLight) for the
-            // same "edge of the sheet" effect — the polarity flips
-            // between modes, the visual hierarchy is consistent.
-            surfaceVariant = PaperRaisedDark,
+            background = BaseDark,
+            surface = BaseDark,
+            // Lifted surface uses BaseDeepDark (== --night-2, slightly
+            // LIGHTER than BaseDark) so raised chrome reads as on top of
+            // the page rather than sunken into a darker hole. Light mode
+            // uses BaseDeepLight (slightly DARKER than BaseLight) for the
+            // same "edge of the page" effect — the polarity flips between
+            // modes, the visual hierarchy stays consistent. See Color.kt.
+            surfaceVariant = BaseDeepDark,
             onBackground = InkDark,
             onSurface = InkDark,
-            onSurfaceVariant = InkSoftDark,
+            onSurfaceVariant = Ink3Dark,
             primary = Accent,
-            onPrimary = PaperDark,
+            onPrimary = BaseDark,
             secondary = InkDark,
-            onSecondary = PaperDark,
-            error = Accent,
-            onError = PaperDark,
-            outline = HairlineDark,
-            outlineVariant = HairlineSoftDark,
+            onSecondary = BaseDark,
+            secondaryContainer = BaseDeepDark,
+            onSecondaryContainer = InkDark,
+            tertiary = StatusWarningDark,
+            onTertiary = BaseDark,
+            error = StatusErrorDark,
+            onError = BaseDark,
+            outline = HairDark,
+            outlineVariant = HairStrongDark,
         )
     } else {
         lightColorScheme(
-            background = PaperLight,
-            surface = PaperLight,
-            surfaceVariant = PaperEdgeLight,
+            background = BaseLight,
+            surface = BaseLight,
+            surfaceVariant = BaseDeepLight,
             onBackground = InkLight,
             onSurface = InkLight,
-            onSurfaceVariant = InkSoftLight,
+            onSurfaceVariant = Ink3Light,
             primary = Accent,
-            onPrimary = PaperLight,
+            onPrimary = BaseLight,
             secondary = InkLight,
-            onSecondary = PaperLight,
-            error = Accent,
-            onError = PaperLight,
-            outline = HairlineLight,
-            outlineVariant = HairlineSoftLight,
+            onSecondary = BaseLight,
+            secondaryContainer = BaseDeepLight,
+            onSecondaryContainer = InkLight,
+            tertiary = StatusWarningLight,
+            onTertiary = BaseLight,
+            error = StatusErrorLight,
+            onError = BaseLight,
+            outline = HairLight,
+            outlineVariant = HairStrongLight,
         )
     }
 
-    // Make system bars paper-colored so the sheet metaphor extends edge
-    // to edge. SideEffect re-applies on every recomposition, which is
-    // fine for window colors.
+    // Make system bars page-colored so the atmosphere/page extends edge to
+    // edge. SideEffect re-applies on every recomposition, which is fine
+    // for window colors.
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
@@ -100,18 +118,17 @@ fun TranscriberTheme(
     MaterialTheme(
         colorScheme = colors,
         typography = TR,
-        // Every shape slot is rectangular — no rounded corners anywhere
-        // by default. Components that explicitly want a curve override
-        // their own shape parameter.
+        // A real radius scale — the shape-language reversal from the old
+        // zero-radius editorial theme. Values match the source CSS's own
+        // anchors (10dp control-radius, 14dp radius-sm, 26dp radius) with
+        // two interpolated mid-steps since M3 wants five slots where the
+        // CSS only names three.
         shapes = Shapes(
-            // RoundedCornerShape(0) is a CornerBasedShape (which M3's
-            // Shapes slot requires) that's functionally identical to
-            // RectangleShape — zero corner radius across the board.
-            extraSmall = RoundedCornerShape(0),
-            small = RoundedCornerShape(0),
-            medium = RoundedCornerShape(0),
-            large = RoundedCornerShape(0),
-            extraLarge = RoundedCornerShape(0),
+            extraSmall = RoundedCornerShape(10.dp),
+            small = RoundedCornerShape(14.dp),
+            medium = RoundedCornerShape(18.dp),
+            large = RoundedCornerShape(22.dp),
+            extraLarge = RoundedCornerShape(26.dp),
         ),
     ) {
         // M3 ripples default to a bright cyan-tinted splash. Replace

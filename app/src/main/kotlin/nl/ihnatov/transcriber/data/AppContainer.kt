@@ -59,6 +59,9 @@ class AppContainer(private val appContext: Context) {
 
     val recorder: WavRecorder by lazy { WavRecorder(appContext) }
 
+    /** Copies recordings to a user-chosen folder outside app-private storage. See BackupManager's doc comment for why this exists. */
+    val backupManager: BackupManager by lazy { BackupManager(appContext, repository) }
+
     val promptStore: PromptStore by lazy { PromptStore(appContext) }
 
     val presetStore: PresetStore by lazy { PresetStore(appContext) }

@@ -6,6 +6,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
@@ -33,12 +36,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -51,15 +53,13 @@ import nl.ihnatov.transcriber.data.AppContainer
 import nl.ihnatov.transcriber.ui.KeepScreenOn
 import nl.ihnatov.transcriber.ui.components.BigNumber
 import nl.ihnatov.transcriber.ui.components.BrandStrip
-import nl.ihnatov.transcriber.ui.components.Hairline
-import nl.ihnatov.transcriber.ui.components.InkRule
 import nl.ihnatov.transcriber.ui.components.InverseFooter
 import nl.ihnatov.transcriber.ui.components.Mono
+import nl.ihnatov.transcriber.ui.components.Panel
 import nl.ihnatov.transcriber.ui.components.PulseDot
 import nl.ihnatov.transcriber.ui.components.SectionIndex
 import nl.ihnatov.transcriber.ui.components.Sheet
 import nl.ihnatov.transcriber.ui.theme.Accent
-import nl.ihnatov.transcriber.ui.theme.Fraunces
 import nl.ihnatov.transcriber.ui.theme.Spacing
 
 /**
@@ -117,6 +117,19 @@ fun RecordScreen(
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Sheet(modifier = Modifier.fillMaxSize()) {
+            // RecordFooter below is a BottomCenter overlay, not part of
+            // this Column's layout flow — nothing here reserves space for
+            // it automatically. Without scrolling, tall content (esp. with
+            // LIVE on, which adds two extra OPTIONS rows) could render
+            // right up against or under the footer. Scrollable + explicit
+            // bottom padding guarantees every row can be scrolled fully
+            // clear of it instead.
+            val scrollState = rememberScrollState()
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(scrollState),
+            ) {
             BrandStrip(
                 right = {
                     if (isActive) {
@@ -142,8 +155,6 @@ fun RecordScreen(
                     }
                 },
             )
-            Spacer(Modifier.height(14.dp))
-            InkRule()
             Spacer(Modifier.height(18.dp))
             SectionIndex(
                 n = 2,
@@ -152,33 +163,31 @@ fun RecordScreen(
             )
             Spacer(Modifier.height(18.dp))
 
-            // Timer + level strip — top + bottom hairlines.
-            Hairline()
-            TimerLevelStrip(elapsedMs = ui.elapsedMs, level = ui.level)
-            Hairline()
-            Spacer(Modifier.height(12.dp))
-
-            // Waveform.
-            WaveformBars(
-                levels = levels.value,
-                active = isActive,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(72.dp),
-            )
-            Spacer(Modifier.height(6.dp))
-            WaveformAxis(elapsedMs = ui.elapsedMs)
-            Spacer(Modifier.height(14.dp))
-            Hairline()
+            // Timer + level + waveform grouped in one panel — was three
+            // hairline-separated blocks; Lit Field groups related content
+            // in a panel rather than ruling between sections.
+            Panel(modifier = Modifier.fillMaxWidth()) {
+                TimerLevelStrip(elapsedMs = ui.elapsedMs, level = ui.level)
+                Spacer(Modifier.height(12.dp))
+                WaveformBars(
+                    levels = levels.value,
+                    active = isActive,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+                WaveformAxis(elapsedMs = ui.elapsedMs)
+            }
             Spacer(Modifier.height(14.dp))
 
             // Last heard.
-            LastHeardBlock(
-                liveStatus = ui.liveStatus,
-                lastLine = ui.liveLines.lastOrNull(),
-            )
-            Spacer(Modifier.height(14.dp))
-            Hairline()
+            Panel(modifier = Modifier.fillMaxWidth()) {
+                LastHeardBlock(
+                    liveStatus = ui.liveStatus,
+                    lastLine = ui.liveLines.lastOrNull(),
+                )
+            }
             Spacer(Modifier.height(14.dp))
 
             // Options as flowing tag strip (no chips).
@@ -194,7 +203,14 @@ fun RecordScreen(
                 },
                 onPickLanguages = { langDialogOpen = true },
             )
-            Spacer(Modifier.weight(1f))
+            // Fixed clearance for the floating footer below (idle-state
+            // InverseFooter runs ~90dp with its two-line body; the
+            // active-recording bar is shorter but we reserve for the
+            // taller one). A weight(1f) spacer can't do this job here —
+            // weight requires a bounded max height from the parent, which
+            // a verticalScroll() Column doesn't have.
+            Spacer(Modifier.height(110.dp))
+            }
         }
 
         // Inverse footer pinned to the bottom.
@@ -336,17 +352,14 @@ private fun LastHeardBlock(
         }
         Mono(statusLabel, color = ink.copy(alpha = 0.55f))
         val text = lastLine?.text ?: "Tap RECORD below. Live transcript will appear as you speak."
-        // Fraunces italic statement — the one-per-screen "voice" moment.
+        // The one-per-screen "voice" moment — was a Fraunces italic
+        // statement; Lit Field carries no serif/italic voice, so this is
+        // now just the larger, lighter cut of the text face reserved for
+        // exactly this role (see ui/theme/Type.kt headlineMedium).
         Text(
             text = text,
             color = ink,
-            style = TextStyle(
-                fontFamily = Fraunces,
-                fontStyle = FontStyle.Italic,
-                fontSize = 22.sp,
-                lineHeight = 28.sp,
-                letterSpacing = (-0.3).sp,
-            ),
+            style = MaterialTheme.typography.headlineMedium,
         )
         if (lastLine != null) {
             Mono(
@@ -477,9 +490,21 @@ private fun RecordFooter(
         }
         is WavRecorder.State.Recording, is WavRecorder.State.Paused -> {
             val paused = state is WavRecorder.State.Paused
+            // Same rounded-top-corners + shadow treatment as InverseFooter
+            // (which this replaces while a recording is active) — the two
+            // states need to read as the same floating bar, not a rounded
+            // bar that suddenly turns into a sharp rectangle on tap.
+            val shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp)
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .shadow(
+                        elevation = 18.dp,
+                        shape = shape,
+                        ambientColor = ink.copy(alpha = 0.22f),
+                        spotColor = ink.copy(alpha = 0.34f),
+                    )
+                    .clip(shape)
                     .background(ink),
             ) {
                 // Pause/Resume square — hairline border on paper bg.

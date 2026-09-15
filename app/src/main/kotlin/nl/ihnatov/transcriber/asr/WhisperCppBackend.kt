@@ -1,7 +1,9 @@
 package nl.ihnatov.transcriber.asr
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -61,20 +63,40 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
             if (h == 0L) return@withLock Result.failure(IllegalStateException("model not loaded"))
             try {
                 progress?.invoke(0.05f)
-                val raw = nativeTranscribe(
-                    h,
-                    samples,
-                    sampleRate,
-                    language ?: "auto",
-                    translate,
-                    promptStore?.whisperPrompt(language) ?: "",
-                )
+                // nativeTranscribe is one long blocking JNI call — whisper_full
+                // has no suspension points of its own, so plain coroutine
+                // cancellation can't interrupt it. suspendCancellableCoroutine
+                // lets us bridge the two: invokeOnCancellation fires on
+                // whatever thread calls Job.cancel() (e.g. the user tapping
+                // Stop), even while THIS thread is still blocked inside
+                // nativeTranscribe below — it just flips a flag that
+                // whisper.cpp's abort_callback polls internally, so the
+                // native call itself unwinds early instead of running to
+                // completion regardless of Stop.
+                val raw = suspendCancellableCoroutine<Array<RawSegment>?> { cont ->
+                    cont.invokeOnCancellation { nativeRequestCancel(h) }
+                    val result = nativeTranscribe(
+                        h,
+                        samples,
+                        sampleRate,
+                        language ?: "auto",
+                        translate,
+                        promptStore?.whisperPrompt(language) ?: "",
+                    )
+                    if (cont.isActive) cont.resume(result)
+                }
                 if (raw == null) {
                     Result.failure(IllegalStateException("whisper_full returned null"))
                 } else {
                     progress?.invoke(1f)
                     Result.success(raw.toList())
                 }
+            } catch (t: CancellationException) {
+                // Let cooperative cancellation propagate — TranscriptionJobManager's
+                // catch (t: CancellationException) paints "Cancelled", not an
+                // error. Catching Throwable below would otherwise swallow this
+                // into a Result.failure and break that contract.
+                throw t
             } catch (t: Throwable) {
                 Result.failure(t)
             }
@@ -103,6 +125,7 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
 
     private external fun nativeRelease(handle: Long)
     private external fun nativeSystemInfo(): String
+    private external fun nativeRequestCancel(handle: Long)
 
     companion object {
         private const val TAG = "WhisperCppBackend"

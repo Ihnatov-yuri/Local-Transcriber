@@ -71,7 +71,7 @@ class RecordViewModel(
     private val _finished = MutableStateFlow<Long?>(null)
     private val _autoTranscribe = MutableStateFlow(true)
     private val _liveEnabled = MutableStateFlow(true)
-    private val _liveEngine = MutableStateFlow(AsrBackendKind.Gemma4)
+    private val _liveEngine = MutableStateFlow(defaultLiveEngine())
     // Seed the live picker from the last picks the user made anywhere in the
     // app (Record or Detail). They both write through to UiPrefs.lastLanguages.
     private val _liveLanguages = MutableStateFlow(container.uiPrefs.lastLanguages.value)
@@ -164,6 +164,18 @@ class RecordViewModel(
                     container.repository.replaceSegments(id, seeded)
                 }
                 _finished.value = id
+                // Auto-backup: copy the freshly recorded audio out to the
+                // user's chosen folder right away, before there's any
+                // transcript yet, rather than waiting for the next manual
+                // "back up now" — the audio itself is the irreplaceable
+                // part. appScope (not viewModelScope) so navigating away
+                // from Record doesn't cancel a copy mid-flight.
+                val backupUri = container.uiPrefs.backupFolderUri.value
+                if (container.uiPrefs.autoBackupEnabled.value && backupUri != null) {
+                    container.appScope.launch {
+                        container.backupManager.exportOne(android.net.Uri.parse(backupUri), id)
+                    }
+                }
                 // Drop the recorder out of its Saved state immediately,
                 // before the UI gets a chance to navigate away. Previously
                 // we relied on the Record screen's LaunchedEffect to call
@@ -326,6 +338,25 @@ class RecordViewModel(
         getApplication(),
         Manifest.permission.RECORD_AUDIO,
     ) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Live transcription only supports Gemma4/WhisperCpp today (see
+     * [nl.ihnatov.transcriber.ui.record.RecordScreen]'s engineLabel /
+     * onCycleEngine — Parakeet/Omnilingual/Nemotron aren't wired into
+     * LiveTranscriber yet). Gemma4 is preferred when installed (same
+     * engine as file transcription, so prompts/vocabulary carry over),
+     * but defaulting to it unconditionally — the previous behavior —
+     * meant a phone with only Whisper installed would start every
+     * recording showing "GEMMA 4 E2B" with live transcription unable to
+     * produce anything until the user noticed and manually cycled
+     * ENGINE. Mirrors RecordingDetailViewModel's autoEngineFor.
+     */
+    private fun defaultLiveEngine(): AsrBackendKind =
+        if (container.asrFactory.listModels(AsrBackendKind.Gemma4).isNotEmpty()) {
+            AsrBackendKind.Gemma4
+        } else {
+            AsrBackendKind.WhisperCpp
+        }
 
     companion object {
         fun factory(container: AppContainer): ViewModelProvider.Factory =

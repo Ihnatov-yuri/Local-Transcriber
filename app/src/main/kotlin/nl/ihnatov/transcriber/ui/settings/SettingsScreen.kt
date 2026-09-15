@@ -32,6 +32,7 @@ import androidx.compose.material3.Button
 // Card / CardDefaults intentionally not imported — every Settings
 // section uses SettingsSection (plain Column + ledger hairlines)
 // rather than M3 cards per the editorial design spec §5.6.
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -41,6 +42,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -61,6 +63,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import java.io.File
+import kotlinx.coroutines.launch
 import nl.ihnatov.transcriber.asr.CatalogEntry
 import nl.ihnatov.transcriber.asr.GemmaBackendChoice
 import nl.ihnatov.transcriber.asr.GemmaSettingsStore
@@ -108,9 +111,7 @@ fun SettingsScreen(container: AppContainer) {
                 )
             },
         )
-        Spacer(Modifier.height(8.dp))
-        nl.ihnatov.transcriber.ui.components.InkRule()
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(20.dp))
         nl.ihnatov.transcriber.ui.components.SectionIndex(
             n = 4,
             label = "settings",
@@ -121,6 +122,7 @@ fun SettingsScreen(container: AppContainer) {
         // ── RELIABILITY ───────────────────────────────────────────────
         SectionHeader("Reliability")
         BatteryOptimizationCard()
+        BackupCard(container)
 
         // ── MODELS ────────────────────────────────────────────────────
         SectionHeader("Models")
@@ -382,23 +384,26 @@ private fun Pill(
 
 /**
  * Section divider for the Settings vertical scroll. Small uppercase label
- * with subdued colour and ~16dp top padding so cards in the previous
+ * with subdued colour and generous top padding so cards in the previous
  * section get visual breathing room. Cheaper than wrapping each section in
- * a Card-with-header (which nests containers and adds visual clutter).
+ * a Panel (which nests containers and adds visual clutter across the ~12
+ * sections on this screen — most of Settings already gets Lit Field's
+ * look for free via M3 defaults reading the new theme, this is the one
+ * deliberately flat exception).
  */
 @Composable
 private fun SectionHeader(text: String) {
-    // Editorial "A · RELIABILITY" pattern — running letter index plus
-    // mono-caps label. Letter cycles A..E by call order via a Compose-
-    // local counter held in a remember; resets on each composition pass
-    // so the order stays stable across rebuilds.
+    // "A · RELIABILITY" pattern — running letter index plus mono-caps
+    // label. Letter cycles A..E by call order via a Compose-local counter
+    // held in a remember; resets on each composition pass so the order
+    // stays stable across rebuilds. No rule above it any more (Lit Field
+    // has no top-level structural rule) — the label plus top padding
+    // alone carries the section break.
     val letter = nextSectionLetter()
     Column(
-        modifier = Modifier.padding(top = 18.dp, bottom = 4.dp),
+        modifier = Modifier.padding(top = 26.dp, bottom = 4.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        nl.ihnatov.transcriber.ui.components.InkRule()
-        Spacer(Modifier.height(2.dp))
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             nl.ihnatov.transcriber.ui.components.Mono(
                 letter,
@@ -527,7 +532,6 @@ private fun InstalledModelsCard(
                 onClick = onImport,
                 modifier = Modifier.fillMaxWidth(),
                 contentPadding = PaddingValues(vertical = 12.dp, horizontal = 16.dp),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp),
             ) {
                 Icon(Icons.Outlined.FileOpen, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
@@ -837,7 +841,6 @@ private fun SnippetsCard(snippetStore: nl.ihnatov.transcriber.asr.SnippetStore) 
             OutlinedButton(
                 onClick = { adding = true },
                 modifier = Modifier.fillMaxWidth(),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp),
             ) {
                 Text("Add snippet")
             }
@@ -1574,11 +1577,130 @@ private fun BatteryOptimizationCard() {
                     BatteryOptimization.requestIntent(ctx)?.let { launcher.launch(it) }
                 },
                 modifier = Modifier.fillMaxWidth(),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp),
             ) {
                 Icon(Icons.Outlined.BatteryAlert, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("Allow background execution")
+            }
+        }
+    }
+}
+
+/**
+ * Recordings live only in this app's private storage and are explicitly
+ * excluded from Android's own Auto Backup (see res/xml/backup_rules.xml —
+ * a deliberate choice to avoid silently eating the user's cloud quota on
+ * audio). That means there has never been any safety net for this data:
+ * an app uninstall — including an incidental one, e.g. a debug tool
+ * resolving a version-downgrade install conflict by uninstalling first —
+ * erases every recording permanently, with nothing to restore from. This
+ * card is that safety net, under the user's own control: pick a folder
+ * via SAF, optionally auto-copy every new recording there, and back up
+ * on demand.
+ */
+@Composable
+private fun BackupCard(container: AppContainer) {
+    val uiPrefs = container.uiPrefs
+    val folderUriString by uiPrefs.backupFolderUri.collectAsStateWithLifecycle()
+    val autoBackup by uiPrefs.autoBackupEnabled.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    var exporting by remember { mutableStateOf(false) }
+    var resultMessage by remember { mutableStateOf<String?>(null) }
+
+    val pickFolder = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) {
+            // Without this the grant only lasts until the app process
+            // dies — the whole point here is a destination that outlives
+            // even an app reinstall, so the permission needs to too.
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            uiPrefs.setBackupFolderUri(uri.toString())
+            resultMessage = null
+        }
+    }
+
+    SettingsSection(
+        title = "BACKUP",
+        subtitle = "Recordings are NOT covered by Android's own backup — an " +
+            "uninstall erases them permanently. Pick a folder to keep your own copy.",
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    if (folderUriString != null) "Backup folder set" else "No backup folder chosen",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (folderUriString != null) FontWeight.Medium else FontWeight.Normal,
+                )
+                folderUriString?.let { uriStr ->
+                    val label = remember(uriStr) {
+                        runCatching {
+                            androidx.documentfile.provider.DocumentFile
+                                .fromTreeUri(context, android.net.Uri.parse(uriStr))?.name
+                        }.getOrNull() ?: uriStr
+                    }
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    )
+                }
+            }
+            OutlinedButton(onClick = { pickFolder.launch(null) }) {
+                Text(if (folderUriString != null) "Change" else "Choose folder")
+            }
+        }
+        if (folderUriString != null) {
+            ToggleRow(
+                title = "Auto-backup new recordings",
+                subtitle = "Copy each recording's audio to the backup folder right after it finishes.",
+                checked = autoBackup,
+                onChange = { uiPrefs.setAutoBackupEnabled(it) },
+            )
+            Button(
+                onClick = {
+                    val uri = folderUriString ?: return@Button
+                    exporting = true
+                    resultMessage = null
+                    scope.launch {
+                        val result = container.backupManager.exportAll(android.net.Uri.parse(uri))
+                        exporting = false
+                        resultMessage = result.fold(
+                            onSuccess = { r ->
+                                buildString {
+                                    append("Backed up ${r.exported} of ${r.total}")
+                                    if (r.skipped > 0) append(" (${r.skipped} already up to date)")
+                                    if (r.failed > 0) append(" — ${r.failed} failed")
+                                }
+                            },
+                            onFailure = { "Backup failed: ${it.message}" },
+                        )
+                    }
+                },
+                enabled = !exporting,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (exporting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(if (exporting) "Backing up…" else "Back up all recordings now")
+            }
+            resultMessage?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                )
             }
         }
     }

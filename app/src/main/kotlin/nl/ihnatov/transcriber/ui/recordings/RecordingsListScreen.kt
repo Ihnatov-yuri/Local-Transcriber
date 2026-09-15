@@ -57,37 +57,35 @@ import nl.ihnatov.transcriber.data.Recording
 import nl.ihnatov.transcriber.data.TagWithCount
 import nl.ihnatov.transcriber.ui.components.BigNumber
 import nl.ihnatov.transcriber.ui.components.BrandStrip
-import nl.ihnatov.transcriber.ui.components.Hairline
 import nl.ihnatov.transcriber.ui.components.HairlineSoft
-import nl.ihnatov.transcriber.ui.components.InkRule
 import nl.ihnatov.transcriber.ui.components.InverseFooter
 import nl.ihnatov.transcriber.ui.components.Mono
+import nl.ihnatov.transcriber.ui.components.Panel
 import nl.ihnatov.transcriber.ui.components.PulseDot
 import nl.ihnatov.transcriber.ui.components.SectionIndex
 import nl.ihnatov.transcriber.ui.components.Sheet
 import nl.ihnatov.transcriber.ui.theme.Accent
-import nl.ihnatov.transcriber.ui.theme.SairaCondensed
+import nl.ihnatov.transcriber.ui.theme.Archivo
 import nl.ihnatov.transcriber.ui.theme.Spacing
 
 /**
- * Library screen — design `01 · LIBRARY` from `screen-library.jsx`.
- *
- * Layout, top to bottom:
+ * Library screen. Layout, top to bottom:
  *   1. BrandStrip with version label on the right
- *   2. InkRule
- *   3. SectionIndex(1, "library", summary sentence)
- *   4. Three-up metric strip (recordings · duration · languages)
- *   5. Eyebrow row: RECORDINGS / + IMPORT / NEWEST ↓
- *   6. Inline search field (substring match across title + segments)
- *   7. LazyColumn of recording rows
- *   8. Bottom inverse footer: "RECORD A NEW SESSION" CTA
+ *   2. SectionIndex(1, "library", summary sentence)
+ *   3. Three-up metric strip (recordings · duration · languages), in a Panel
+ *   4. Eyebrow row: RECORDINGS / + IMPORT / NEWEST ↓
+ *   5. Inline search field (substring match across title + segments)
+ *   6. LazyColumn of recording rows, in one Panel with soft interior dividers
+ *   7. Bottom inverse footer: "RECORD A NEW SESSION" CTA
  *
  * Notes:
- *   - No `Card`, no rounded corners. Row separation is hairline only.
+ *   - Lit Field: no top-level ink rule, structure comes from grouping
+ *     content in [nl.ihnatov.transcriber.ui.components.Panel] instead —
+ *     see the migration notes in `ui/theme/Color.kt`.
  *   - The import affordance moved out of the FAB (no FAB per spec) and
  *     into the eyebrow row as a mono-caps "+ IMPORT" link.
  *   - Search is preserved from the previous build but restyled as a
- *     paper-on-paper text field with a single hairline border.
+ *     text field with a single hairline underline.
  */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 @Composable
@@ -150,8 +148,6 @@ fun RecordingsListScreen(
                     )
                 },
             )
-            Spacer(Modifier.height(14.dp))
-            InkRule()
             Spacer(Modifier.height(18.dp))
             SectionIndex(
                 n = 1,
@@ -159,10 +155,10 @@ fun RecordingsListScreen(
                 summary = summarySentence(recordings),
             )
             Spacer(Modifier.height(20.dp))
-            MetricStrip(recordings)
+            Panel(modifier = Modifier.fillMaxWidth()) {
+                MetricStrip(recordings)
+            }
             Spacer(Modifier.height(18.dp))
-            InkRule()
-            Spacer(Modifier.height(14.dp))
             EyebrowRow(
                 onImport = { importLauncher.launch(arrayOf("audio/*")) },
             )
@@ -196,11 +192,16 @@ fun RecordingsListScreen(
             SearchField(query) { query = it }
             Spacer(Modifier.height(6.dp))
             // List + inverse footer share the remaining vertical space.
-            // LazyColumn with weight(1f) so the footer pins to the bottom
-            // and the rows scroll within. Bottom padding leaves room for
-            // the footer height; the footer itself sits in the Box's
-            // BottomCenter overlay.
-            Box(Modifier.weight(1f)) {
+            // Panel(weight(1f)) so the footer pins to the bottom and the
+            // rows scroll within — the whole list is now one veil surface
+            // with soft interior dividers, rather than rows floating
+            // directly on the bare page.
+            Panel(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
+            ) {
                 if (recordings.isEmpty()) {
                     EmptyState(query)
                 } else {
@@ -215,6 +216,10 @@ fun RecordingsListScreen(
                                 onClick = { onOpen(rec.id) },
                                 onMoveToFolder = { folderId ->
                                     scope.launch { container.repository.moveToFolder(rec, folderId) }
+                                },
+                                onCreateFolderAndMove = { name ->
+                                    val folder = container.repository.createFolder(name)
+                                    container.repository.moveToFolder(rec, folder.id)
                                 },
                             )
                         }
@@ -578,10 +583,14 @@ private fun RecordingRow(
     allFolders: List<FolderWithCount>,
     onClick: () -> Unit,
     onMoveToFolder: (Long?) -> Unit,
+    onCreateFolderAndMove: suspend (String) -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     val isToday = isToday(rec.createdAtMillis)
+    val scope = rememberCoroutineScope()
     var moveMenuOpen by remember { mutableStateOf(false) }
+    var newFolderOpen by remember { mutableStateOf(false) }
+    var newFolderError by remember { mutableStateOf<String?>(null) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -599,6 +608,13 @@ private fun RecordingRow(
         ) {
             // Mirrors the Mac's "Move to Folder…" context-menu submenu:
             // every OTHER folder, plus "Remove from Folder" when filed.
+            // "+ NEW FOLDER…" is always present — previously, a recording
+            // with no folders created yet (and not already filed) opened
+            // an EMPTY menu with nothing to tap, which read as "you can't
+            // change the folder" (a real reported bug, not just a
+            // discoverability gap): there was no path from "long-press a
+            // recording" to "file it somewhere" without first noticing
+            // the unrelated "+ NEW" chip up in the filter strip.
             for (f in allFolders.filter { it.folder.id != rec.folderId }) {
                 DropdownMenuItem(
                     text = { Text(f.folder.name) },
@@ -611,13 +627,30 @@ private fun RecordingRow(
                     onClick = { moveMenuOpen = false; onMoveToFolder(null) },
                 )
             }
+            DropdownMenuItem(
+                text = { Mono("+ NEW FOLDER…", color = ink) },
+                onClick = { moveMenuOpen = false; newFolderError = null; newFolderOpen = true },
+            )
+        }
+        if (newFolderOpen) {
+            NewFolderDialog(
+                error = newFolderError,
+                onDismiss = { newFolderOpen = false },
+                onConfirm = { name ->
+                    scope.launch {
+                        runCatching { onCreateFolderAndMove(name) }
+                            .onSuccess { newFolderError = null; newFolderOpen = false }
+                            .onFailure { newFolderError = it.message ?: "Couldn't create folder" }
+                    }
+                },
+            )
         }
         // Date column (54 dp). Time stamp ink + day mono-caps soft.
         Column(Modifier.width(54.dp)) {
             Text(
                 formatTime(rec.createdAtMillis),
                 style = androidx.compose.ui.text.TextStyle(
-                    fontFamily = SairaCondensed,
+                    fontFamily = Archivo,
                     fontSize = 14.sp,
                     fontFeatureSettings = "tnum",
                     color = ink,
@@ -708,16 +741,28 @@ private fun RecordingRow(
             }
         }
         Spacer(Modifier.width(Spacing.m))
-        // Right column: duration in Saira Condensed tabular.
+        // Right column: duration in Archivo tabular.
         Text(
             formatDuration(rec.durationSeconds.toInt()),
             style = androidx.compose.ui.text.TextStyle(
-                fontFamily = SairaCondensed,
+                fontFamily = Archivo,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
                 fontSize = 16.sp,
                 fontFeatureSettings = "tnum, lnum",
                 color = ink,
             ),
+        )
+        Spacer(Modifier.width(6.dp))
+        // Visible affordance for the same folder menu the long-press
+        // opens — long-press alone has no on-screen hint that it does
+        // anything, which read as "there's no way to change the folder"
+        // even though the gesture worked.
+        Mono(
+            "⋯",
+            color = ink.copy(alpha = 0.45f),
+            modifier = Modifier
+                .clickable { moveMenuOpen = true }
+                .padding(horizontal = 4.dp, vertical = 2.dp),
         )
     }
 }

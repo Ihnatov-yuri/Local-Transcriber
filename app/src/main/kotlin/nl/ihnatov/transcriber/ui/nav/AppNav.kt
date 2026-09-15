@@ -6,20 +6,25 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.List
+import androidx.compose.material.icons.outlined.Mic
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -29,6 +34,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import nl.ihnatov.transcriber.data.AppContainer
 import nl.ihnatov.transcriber.ui.components.Mono
+import nl.ihnatov.transcriber.ui.components.Panel
 import nl.ihnatov.transcriber.ui.record.RecordScreen
 import nl.ihnatov.transcriber.ui.recordings.RecordingDetailScreen
 import nl.ihnatov.transcriber.ui.recordings.RecordingsListScreen
@@ -40,16 +46,19 @@ import nl.ihnatov.transcriber.ui.theme.Accent
  * Settings) plus a recording-detail destination pushed onto the stack
  * from Library.
  *
- * Per the editorial design spec, the bottom navigation is the spec's
- * "if you keep BottomNavigation, restyle..." fallback — paper background,
- * single hairline top border, mono-caps labels in ink with an Accent
- * underline on the active tab. No M3 NavigationBar elevation, ripple
- * splash, or pill indicator.
+ * The bottom nav is a floating pill [Panel] rather than the old full-
+ * width hairline-topped bar — converges with where Material 3 Expressive
+ * already went (pill shapes, a soft accent "active indicator" behind the
+ * selected icon) instead of the old system's deliberate flat/ruled
+ * departure from Material. Icons are new too: the old editorial system's
+ * "no icons, ever" rule doesn't carry over — Lit Field documents a
+ * first-class `.icon` primitive, so a 3-tab bar with icon + label is now
+ * in-register rather than a decorative violation.
  */
-private sealed class Tab(val route: String, val label: String) {
-    data object Record : Tab("record", "RECORD")
-    data object Library : Tab("library", "LIBRARY")
-    data object Settings : Tab("settings", "SETTINGS")
+private sealed class Tab(val route: String, val label: String, val icon: ImageVector) {
+    data object Record : Tab("record", "RECORD", Icons.Outlined.Mic)
+    data object Library : Tab("library", "LIBRARY", Icons.AutoMirrored.Outlined.List)
+    data object Settings : Tab("settings", "SETTINGS", Icons.Outlined.Settings)
 }
 
 @Composable
@@ -61,7 +70,7 @@ fun AppNav(container: AppContainer) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
-            EditorialBottomBar(
+            LitBottomBar(
                 currentRoute = currentRoute,
                 onTabClick = { route ->
                     nav.navigate(route) {
@@ -122,108 +131,80 @@ fun AppNav(container: AppContainer) {
     }
 }
 
-/**
- * Restyled bottom nav per design spec §6. Paper background, no elevation,
- * a single 1-dp hairline along the top, mono-caps labels. The active tab
- * label is full-ink and gets a 1.5-dp Accent underline; inactive tabs are
- * ink-soft. No M3 NavigationBar ripple/pill — just `clickable`.
- */
 @Composable
-private fun EditorialBottomBar(
+private fun LitBottomBar(
     currentRoute: String?,
     onTabClick: (String) -> Unit,
 ) {
-    Column(
+    Box(
         Modifier
             .fillMaxWidth()
-            // Subtle paper-edge tint so the nav strip reads as its own
-            // surface and doesn't blur into the inverse footer above it
-            // (the spec wants pure paper, but pure paper on paper meant
-            // users on the Record screen saw the inverse footer's RECORD
-            // label and never noticed the nav row underneath — they
-            // thought RECORD was the only button).
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            // navigationBarsPadding so the tab row sits ABOVE the gesture
-            // bar / nav bar instead of underneath it. Without this the
-            // bottom of the row was getting eaten by Android's home-
-            // indicator inset on modern phones and the row looked
-            // truncated.
-            .navigationBarsPadding(),
+            .navigationBarsPadding()
+            .padding(horizontal = 20.dp, vertical = 10.dp),
     ) {
-        // 1.5-dp ink rule above (was Hairline) — visually heavier than
-        // the row-to-row hairlines elsewhere, so the bottom nav clearly
-        // reads as a top-level joint, distinct from the inverse footer.
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(1.5.dp)
-                .background(MaterialTheme.colorScheme.onBackground),
-        )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 14.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
+        Panel(
+            strong = true,
+            shape = RoundedCornerShape(50),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 6.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
-            listOf(Tab.Record, Tab.Library, Tab.Settings).forEach { tab ->
-                val active = currentRoute == tab.route ||
-                    // Detail screen is pushed from Library — treat as
-                    // Library-active so the underline stays put while
-                    // viewing a recording.
-                    (tab == Tab.Library && currentRoute?.startsWith("recording/") == true)
-                NavTabItem(label = tab.label, active = active, onClick = { onTabClick(tab.route) })
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                listOf(Tab.Record, Tab.Library, Tab.Settings).forEach { tab ->
+                    val active = currentRoute == tab.route ||
+                        // Detail screen is pushed from Library — treat as
+                        // Library-active so the indicator stays put while
+                        // viewing a recording.
+                        (tab == Tab.Library && currentRoute?.startsWith("recording/") == true)
+                    NavTabItem(
+                        icon = tab.icon,
+                        label = tab.label,
+                        active = active,
+                        onClick = { onTabClick(tab.route) },
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-private fun NavTabItem(label: String, active: Boolean, onClick: () -> Unit) {
+private fun NavTabItem(icon: ImageVector, label: String, active: Boolean, onClick: () -> Unit) {
     val ink = MaterialTheme.colorScheme.onBackground
-    val color = if (active) ink else ink.copy(alpha = 0.75f)
     Column(
         modifier = Modifier
+            .clip(RoundedCornerShape(18.dp))
             .clickable(onClick = onClick)
-            // width(IntrinsicSize.Max) constrains the Column to the
-            // widest child's intrinsic width (the label text). Without
-            // this, the underline Box's fillMaxWidth() below propagated
-            // a max-width constraint that absorbed the entire SpaceEvenly
-            // Row — the active tab took 100% of the row and the other
-            // two tabs were pushed past the right edge of the screen.
-            .width(androidx.compose.foundation.layout.IntrinsicSize.Max)
-            .padding(horizontal = 18.dp, vertical = 8.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
+        Box(
+            modifier = Modifier
+                .size(width = 44.dp, height = 26.dp)
+                .clip(RoundedCornerShape(50))
+                .background(if (active) Accent.copy(alpha = 0.16f) else Color.Transparent),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (active) Accent else ink.copy(alpha = 0.55f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
         // Bottom nav is the primary global affordance — users reported
         // both "I only see Record" and "I can't find Settings" with the
-        // editorial labelLarge (10.5sp) size. We explicitly break from
-        // the editorial scale here and use a hand-built TextStyle at
-        // 14.sp Mono SemiBold — large enough to be a button label,
-        // small enough to stay on-brand. Active = full ink + SemiBold,
-        // inactive = 75% alpha so the OTHER tabs don't disappear.
-        Text(
-            text = label,
-            color = color,
-            style = androidx.compose.ui.text.TextStyle(
-                fontFamily = nl.ihnatov.transcriber.ui.theme.IbmPlexMono,
-                fontSize = 14.sp,
-                fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.SemiBold
-                else androidx.compose.ui.text.font.FontWeight.Medium,
-                letterSpacing = 0.6.sp,
-            ),
-        )
-        // Accent underline on the active tab. Bumped to 2.5dp so it's
-        // visible without squinting. Always-rendered Box keeps the
-        // layout stable when toggling; inactive tabs render at
-        // transparent so the row height doesn't shift.
-        Box(
-            Modifier
-                .height(2.5.dp)
-                .padding(horizontal = 2.dp)
-                .background(if (active) Accent else androidx.compose.ui.graphics.Color.Transparent)
-                .fillMaxWidth(),
+        // old, smaller editorial label size. Keep the bump: labelMedium
+        // rather than the default labelLarge-sized Mono, full ink when
+        // active so the OTHER tabs don't disappear at 55% alpha.
+        Mono(
+            label,
+            color = if (active) ink else ink.copy(alpha = 0.55f),
+            style = MaterialTheme.typography.labelMedium,
         )
     }
 }
