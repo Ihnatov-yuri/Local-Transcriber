@@ -82,6 +82,7 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import nl.ihnatov.transcriber.asr.AsrBackendKind
+import nl.ihnatov.transcriber.asr.SuperPairs
 import nl.ihnatov.transcriber.asr.TextDestutter
 import nl.ihnatov.transcriber.asr.TranscriptExporter
 import nl.ihnatov.transcriber.asr.defaultEngineFor
@@ -159,7 +160,17 @@ fun RecordingDetailScreen(
     // two mirror the plan's own default/Arabic split.
     var superMode by remember { mutableStateOf(false) }
     var superPairIdx by remember { mutableIntStateOf(0) }
-    val superPair = SUPER_PAIR_PRESETS[superPairIdx]
+    // Pairs come from what's installed (SuperPairs), so the picker never
+    // defaults to an engine this phone doesn't have.
+    val installedKinds = remember {
+        AsrBackendKind.entries
+            .filter { it != AsrBackendKind.NemotronStream && container.asrFactory.listModels(it).isNotEmpty() }
+            .toSet()
+    }
+    val superPairs = remember(installedKinds) { SuperPairs.presets(installedKinds) }
+    val superPair = superPairs[superPairIdx.mod(superPairs.size)]
+    val superPairText = superPairLabel(superPair) +
+        if (SuperPairs.isReady(superPair, installedKinds)) "" else " · MODEL MISSING"
     var maxQuality by remember { mutableStateOf(false) }
 
     // File-transcription engine cycle. NemotronStream isn't offered here —
@@ -363,7 +374,7 @@ fun RecordingDetailScreen(
                     runOnCharger = runOnCharger,
                     installedModelsEmpty = installedModels.isEmpty(),
                     superMode = superMode,
-                    superPairLabel = superPairLabel(superPair),
+                    superPairLabel = superPairText,
                     onCycleBackend = cycleBackend,
                     onPickLanguages = { langDialogOpen = true },
                     onCycleTranslate = {
@@ -653,8 +664,8 @@ fun RecordingDetailScreen(
                     },
                     superMode = superMode,
                     onToggleSuper = { superMode = !superMode },
-                    superPairLabel = superPairLabel(superPair),
-                    onCyclePair = { superPairIdx = (superPairIdx + 1) % SUPER_PAIR_PRESETS.size },
+                    superPairLabel = superPairText,
+                    onCyclePair = { superPairIdx = (superPairIdx + 1) % superPairs.size },
                     maxQuality = maxQuality,
                     onToggleMaxQuality = { maxQuality = !maxQuality },
                 )
@@ -1925,12 +1936,6 @@ private fun DetailPlayerBar(
 }
 
 // ─── Helpers + dialogs (carried over) ────────────────────────────────
-
-/** Curated Super-mode pairs — see the plan's engine matrix (section 3): Parakeet+Whisper by default, Omnilingual+Gemma 4 for Arabic. */
-private val SUPER_PAIR_PRESETS = listOf(
-    AsrBackendKind.Parakeet to AsrBackendKind.WhisperCpp,
-    AsrBackendKind.Omnilingual to AsrBackendKind.Gemma4,
-)
 
 private fun superPairLabel(pair: Pair<AsrBackendKind, AsrBackendKind>): String =
     "${runSheetEngineLabel(pair.first)} + ${runSheetEngineLabel(pair.second)}"

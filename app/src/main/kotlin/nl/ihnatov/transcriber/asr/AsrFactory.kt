@@ -73,7 +73,7 @@ class AsrFactory(
         val exts = extensionsFor(kind)
         return modelsDir()
             .listFiles()
-            ?.filter { it.isFile && it.extension.lowercase() in exts }
+            ?.filter { it.isFile && it.extension.lowercase() in exts && !isRuntimeSidecar(it.name) }
             ?.sortedByDescending { it.length() }
             ?: emptyList()
     }
@@ -224,6 +224,7 @@ class AsrFactory(
      * or two Whisper sizes — can choose which one transcription uses).
      */
     fun kindForFile(file: File): AsrBackendKind? {
+        if (isRuntimeSidecar(file.name)) return null
         val ext = file.extension.lowercase()
         return AsrBackendKind.entries.firstOrNull { ext.isNotEmpty() && ext in extensionsFor(it) }
     }
@@ -235,6 +236,19 @@ class AsrFactory(
     private fun selectionKey(kind: AsrBackendKind): String = "selected_model_${kind.name}"
 
     companion object {
+        /**
+         * LiteRT-LM writes compiled-kernel caches next to the Gemma model
+         * it loaded, named `<model>.litertlm_<...>_mldrift_program_cache.bin`
+         * and `..._mldrift_weight_cache.bin` (the weight cache is ~780 MB).
+         * They live in [modelsDir] because that's where the model is, and
+         * their `.bin` extension made [listModels] count them as Whisper
+         * models — so Whisper showed up as "installed" (and as a ready
+         * Super pair) on a phone with no Whisper model, and
+         * [resolveModel] would pick the weight cache as the biggest one.
+         */
+        internal fun isRuntimeSidecar(name: String): Boolean =
+            name.contains("_mldrift_") || name.endsWith("_cache.bin")
+
         private val DIRECTORY_BASED_KINDS = setOf(
             AsrBackendKind.Parakeet,
             AsrBackendKind.Omnilingual,

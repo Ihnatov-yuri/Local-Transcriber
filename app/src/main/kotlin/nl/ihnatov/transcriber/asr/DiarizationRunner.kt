@@ -12,9 +12,7 @@ import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import java.io.File
 import java.io.FileOutputStream
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -83,37 +81,29 @@ class DiarizationRunner(
         val segFile = ensureSegmentationModelOnDisk()
 
         try {
+            val threads = diarizationThreads()
             val config = OfflineSpeakerDiarizationConfig(
                 segmentation = OfflineSpeakerSegmentationModelConfig(
                     pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(segFile.absolutePath),
-                    numThreads = 2,
+                    numThreads = threads,
                 ),
                 embedding = SpeakerEmbeddingExtractorConfig(
                     model = embeddingFile.absolutePath,
-                    numThreads = 2,
+                    numThreads = threads,
                 ),
                 clustering = FastClusteringConfig(numClusters = numClusters, threshold = threshold),
                 minDurationOn = minDurationOn,
                 minDurationOff = minDurationOff,
             )
             val diar = OfflineSpeakerDiarization(assetManager = null, config = config)
-            // Cancellation watcher. Sherpa's blocking native `process(samples)`
-            // doesn't respond to Kotlin coroutine cancellation — the call
-            // sits on the JNI thread for minutes. Instead of routing
-            // through `processWithCallback` (which crashes with a JNI
-            // method-lookup error on capturing Kotlin lambdas — sherpa-onnx's
-            // binding to `Function3.invoke(IIJ)Integer;` is broken
-            // for synthetic lambdas that R8/D8 produces), we run a sibling
-            // coroutine that calls `diar.release()` the moment the parent
-            // coroutine is cancelled. The native processing then errors
-            // out instead of hanging.
-            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                try {
-                    awaitCancellation()
-                } finally {
-                    runCatching { diar.release() }
-                }
-            }
+            // Sherpa's blocking native `process(samples)` doesn't respond to
+            // coroutine cancellation and `processWithCallback` crashes the
+            // JNI on capturing Kotlin lambdas, so the call goes through a
+            // DetachedNativeSession: Stop returns at once, the native pass
+            // finishes in the background, and the release waits for it.
+            // (Releasing from a sibling coroutine mid-call, as before,
+            // aborted the whole app — see DetachedNativeSession.)
+            val session = DetachedNativeSession("diarization") { diar.release() }
             // Coarse-grained progress: sherpa doesn't expose total duration
             // synchronously, so we emit a heartbeat from a sibling timer
             // and let the UI show "Identifying speakers · still working"
@@ -138,8 +128,7 @@ class DiarizationRunner(
             } else null
             try {
                 val segs: Array<OfflineSpeakerDiarizationSegment> =
-                    diar.process(samples)
-                runCatching { diar.release() }
+                    session.call { diar.process(samples) }
                 val mapped = segs.map {
                     SpeakerSegment(start = it.start, end = it.end, speakerId = it.speaker, confidence = it.confidence)
                 }
@@ -149,7 +138,9 @@ class DiarizationRunner(
                 Result.success(renumberByFirstAppearance(consolidated))
             } finally {
                 progressTimer?.cancel()
-                cancelWatcher.cancel()
+                // Immediate when idle; deferred to the worker thread when a
+                // cancelled call is still running natively.
+                session.release()
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             Log.i(TAG, "diarization cancelled: ${ce.message}")
@@ -221,14 +212,15 @@ class DiarizationRunner(
         val sampleRate = nl.ihnatov.transcriber.audio.AudioDecoder.TARGET_SR
 
         try {
+            val threads = diarizationThreads()
             val config = OfflineSpeakerDiarizationConfig(
                 segmentation = OfflineSpeakerSegmentationModelConfig(
                     pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(segFile.absolutePath),
-                    numThreads = 2,
+                    numThreads = threads,
                 ),
                 embedding = SpeakerEmbeddingExtractorConfig(
                     model = embeddingFile.absolutePath,
-                    numThreads = 2,
+                    numThreads = threads,
                 ),
                 // Always auto per-window — see the numClusters kdoc above.
                 clustering = FastClusteringConfig(numClusters = -1, threshold = threshold),
@@ -238,16 +230,28 @@ class DiarizationRunner(
             val diar = OfflineSpeakerDiarization(assetManager = null, config = config)
             val extractor = SpeakerEmbeddingExtractor(
                 assetManager = null,
-                config = SpeakerEmbeddingExtractorConfig(model = embeddingFile.absolutePath, numThreads = 2),
+                config = SpeakerEmbeddingExtractorConfig(model = embeddingFile.absolutePath, numThreads = threads),
             )
-            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                try {
-                    awaitCancellation()
-                } finally {
-                    runCatching { diar.release() }
-                    runCatching { extractor.release() }
-                }
+            // Both native objects share one session: neither may be released
+            // while a window is being processed (see DetachedNativeSession
+            // for the crash this prevents), and Stop still returns promptly.
+            val session = DetachedNativeSession("chunked diarization") {
+                runCatching { diar.release() }
+                runCatching { extractor.release() }
             }
+            // Sherpa reports nothing while it works on a window, and one
+            // window can take minutes on a heavy embedding model, so the
+            // bar interpolates inside the current window from the previous
+            // window's wall time and ticks every 5 s.
+            val heartbeat = WindowHeartbeat(durationSec)
+            val heartbeatJob = if (onProgress != null && durationSec > 0) {
+                launch(Dispatchers.Default) {
+                    while (isActive) {
+                        delay(5_000L)
+                        onProgress(heartbeat.fraction(System.currentTimeMillis()))
+                    }
+                }
+            } else null
             try {
                 // One entry per (window, local speaker id) that actually
                 // produced a usable embedding.
@@ -258,10 +262,17 @@ class DiarizationRunner(
                 // labels are known. Local speakers with no usable embedding
                 // go straight into `unmergeable` with their own final id.
                 data class PendingSegment(val windowIdx: Int, val localId: Int, val start: Float, val end: Float, val confidence: Float)
+                // Everything the native thread produces for one window, so
+                // the coroutine side only touches Kotlin state afterwards.
+                class WindowResult(
+                    val byLocalId: Map<Int, List<OfflineSpeakerDiarizationSegment>>,
+                    val embeddings: Map<Int, FloatArray?>,
+                )
                 val pending = mutableListOf<PendingSegment>()
                 var windowIdx = 0
                 var nextFallbackId = -1 // counts down; never collides with cluster-label ids (>=0)
                 val unmergeableIds = HashMap<Pair<Int, Int>, Int>()
+                var lastWindowWallMs = -1L
 
                 nl.ihnatov.transcriber.audio.AudioDecoder.decodeChunked(
                     file,
@@ -269,9 +280,29 @@ class DiarizationRunner(
                     overlapSamples = overlapSamples,
                 ).collect { chunk ->
                     val winStart = chunk.startSeconds
-                    val localSegs = diar.process(chunk.samples)
-                    val byLocalId = localSegs.groupBy { it.speaker }
-                    for ((localId, segs) in byLocalId) {
+                    val winLenSec = chunk.samples.size.toDouble() / sampleRate
+                    heartbeat.beginWindow(winStart, winLenSec, lastWindowWallMs)
+                    val startedAt = System.currentTimeMillis()
+                    val recapSec = chunk.overlapSeconds
+                    val thisWindow = windowIdx
+                    val result = session.call {
+                        val localSegs = diar.process(chunk.samples).toList()
+                        // The first `overlapSec` of every window after the
+                        // first is a replay of the previous window's tail,
+                        // which that window already labelled. Keep only
+                        // what reaches past the recap so the pooled segment
+                        // list doesn't carry a duplicate of every seam.
+                        val fresh = if (thisWindow == 0) localSegs else dropRecapZone(localSegs, recapSec) { it.end }
+                        val byLocalId = fresh.groupBy { it.speaker }
+                        WindowResult(
+                            byLocalId = byLocalId,
+                            embeddings = byLocalId.mapValues { (_, segs) ->
+                                extractCanonicalEmbedding(extractor, chunk.samples, segs, sampleRate)
+                            },
+                        )
+                    }
+                    lastWindowWallMs = System.currentTimeMillis() - startedAt
+                    for ((localId, segs) in result.byLocalId) {
                         for (s in segs) {
                             pending.add(PendingSegment(
                                 windowIdx = windowIdx,
@@ -281,7 +312,7 @@ class DiarizationRunner(
                                 confidence = s.confidence,
                             ))
                         }
-                        val embedding = extractCanonicalEmbedding(extractor, chunk.samples, segs, sampleRate)
+                        val embedding = result.embeddings[localId]
                         if (embedding != null) {
                             clusters.add(LocalCluster(windowIdx, localId, embedding))
                         } else {
@@ -290,15 +321,19 @@ class DiarizationRunner(
                     }
                     windowIdx++
                     if (durationSec > 0) {
-                        onProgress?.invoke((chunk.startSeconds / durationSec).toFloat().coerceIn(0f, 1f))
+                        // Report the END of the window just finished — the
+                        // start of it sat at "0%" for the whole first window.
+                        onProgress?.invoke(((winStart + winLenSec) / durationSec).toFloat().coerceIn(0f, 0.99f))
                     } else {
                         onProgress?.invoke(0f)
                     }
                     Log.i(TAG, "  window $windowIdx @ ${"%.0f".format(winStart)}s → " +
-                        "${byLocalId.size} local speakers (${clusters.size} embedded so far)")
+                        "${result.byLocalId.size} local speakers (${clusters.size} embedded so far, " +
+                        "${lastWindowWallMs / 1000}s wall for ${"%.0f".format(winLenSec)}s audio)")
                 }
-                runCatching { diar.release() }
-                runCatching { extractor.release() }
+                // Idle here, so this releases right away; the finally below
+                // is then a no-op.
+                session.release()
 
                 val labels = if (clusters.isNotEmpty()) {
                     SpeakerClustering.cluster(
@@ -340,7 +375,8 @@ class DiarizationRunner(
                 }
                 Result.success(out)
             } finally {
-                cancelWatcher.cancel()
+                heartbeatJob?.cancel()
+                session.release()
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             Log.i(TAG, "chunked diarization cancelled: ${ce.message}")
@@ -534,6 +570,27 @@ class DiarizationRunner(
     companion object {
         private const val TAG = "DiarizationRunner"
 
+        /**
+         * ONNX Runtime intra-op threads for the segmentation and embedding
+         * sessions. Was hard-coded to 2; the embedding pass dominates wall
+         * time (WeSpeaker ResNet221 runs once per segmentation window per
+         * speaker, hundreds of times per 5-minute window) and scales with
+         * threads on the 8-core phones this runs on. Capped at 4: the two
+         * sessions run back to back, and beyond the big cores the little
+         * ones only add contention.
+         */
+        internal fun diarizationThreads(cores: Int = Runtime.getRuntime().availableProcessors()): Int =
+            cores.coerceIn(2, 4)
+
+        /**
+         * Drop segments that lie entirely inside the first [recapSec] of a
+         * window — audio the previous window already covered. Segments
+         * that start in the recap but reach past it are kept: the previous
+         * window saw them truncated at its own end.
+         */
+        internal fun <T> dropRecapZone(segs: List<T>, recapSec: Double, end: (T) -> Float): List<T> =
+            if (recapSec <= 0.0) segs else segs.filter { end(it).toDouble() > recapSec }
+
         private val EMBEDDING_MODEL_CANDIDATES = listOf(
             "embedding-wespeaker.onnx",
             "embedding-multilingual.onnx",
@@ -603,6 +660,35 @@ class DiarizationRunner(
          * participants.
          */
         private const val MINOR_SPEAKER_FRACTION = 0.08
+    }
+}
+
+/**
+ * Progress interpolation for [DiarizationRunner.runChunked]. Sherpa exposes
+ * no progress inside a window, so between per-window updates the bar
+ * advances on the assumption that this window takes as long as the last
+ * one (1x realtime before the first one has finished), never past 95% of
+ * the window until it really completes.
+ */
+internal class WindowHeartbeat(private val durationSec: Double) {
+    @Volatile private var winStartSec = 0.0
+    @Volatile private var winLenSec = 0.0
+    @Volatile private var startedAtMs = 0L
+    @Volatile private var expectedWallMs = 0L
+
+    fun beginWindow(startSec: Double, lenSec: Double, previousWallMs: Long, nowMs: Long = System.currentTimeMillis()) {
+        winStartSec = startSec
+        winLenSec = lenSec
+        startedAtMs = nowMs
+        expectedWallMs = if (previousWallMs > 0) previousWallMs else (lenSec * 1000).toLong()
+    }
+
+    fun fraction(nowMs: Long): Float {
+        if (durationSec <= 0.0) return 0f
+        val within = if (expectedWallMs > 0) {
+            ((nowMs - startedAtMs).toDouble() / expectedWallMs).coerceIn(0.0, 0.95)
+        } else 0.0
+        return ((winStartSec + within * winLenSec) / durationSec).toFloat().coerceIn(0f, 0.99f)
     }
 }
 

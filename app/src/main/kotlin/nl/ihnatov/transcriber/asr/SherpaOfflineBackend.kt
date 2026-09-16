@@ -9,6 +9,7 @@ import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OfflineTransducerModelConfig
 import java.io.File
 import kotlin.math.sqrt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -58,37 +59,25 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
                         IllegalStateException("Expected a model directory, got: $modelPath")
                     )
                 }
-                val tokens = dir.listFiles()?.firstOrNull { it.name == "tokens.txt" }
-                    ?: return@withContext Result.failure(
-                        IllegalStateException("tokens.txt not found in $modelPath")
-                    )
                 val modelConfig = when (kind) {
                     AsrBackendKind.Parakeet -> {
-                        val encoder = findByPrefix(dir, "encoder")
-                        val decoder = findByPrefix(dir, "decoder")
-                        val joiner = findByPrefix(dir, "joiner")
-                        if (encoder == null || decoder == null || joiner == null) {
-                            return@withContext Result.failure(IllegalStateException(
-                                "Parakeet model incomplete in $modelPath " +
-                                    "(encoder=${encoder?.name}, decoder=${decoder?.name}, joiner=${joiner?.name})"
-                            ))
-                        }
+                        val files = findTransducerFiles(dir)
                         OfflineModelConfig(
                             transducer = OfflineTransducerModelConfig(
-                                encoder = encoder.absolutePath,
-                                decoder = decoder.absolutePath,
-                                joiner = joiner.absolutePath,
+                                encoder = files.encoder.absolutePath,
+                                decoder = files.decoder.absolutePath,
+                                joiner = files.joiner.absolutePath,
                             ),
-                            tokens = tokens.absolutePath,
+                            tokens = files.tokens.absolutePath,
                             numThreads = 2,
                             provider = "cpu",
                         )
                     }
                     AsrBackendKind.Omnilingual -> {
+                        val tokens = dir.listFiles()?.firstOrNull { it.name == "tokens.txt" }
+                            ?: error("tokens.txt not found in $modelPath")
                         val model = findByPrefix(dir, "model")
-                            ?: return@withContext Result.failure(
-                                IllegalStateException("Omnilingual model .onnx not found in $modelPath")
-                            )
+                            ?: error("Omnilingual model .onnx not found in $modelPath")
                         OfflineModelConfig(
                             omnilingual = OfflineOmnilingualAsrCtcModelConfig(model = model.absolutePath),
                             tokens = tokens.absolutePath,
@@ -104,6 +93,8 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
                 )
                 recognizer = OfflineRecognizer(null, config)
                 Result.success(Unit)
+            } catch (t: CancellationException) {
+                throw t
             } catch (t: Throwable) {
                 Log.e(TAG, "load failed for $kind at $modelPath", t)
                 Result.failure(t)
@@ -217,16 +208,49 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
         private const val SAMPLE_RATE = 16_000
         private const val SENTENCEPIECE_WORD_MARKER = "▁" // '▁'
 
-        private fun findByPrefix(dir: File, prefix: String): File? =
+        /** Not private: [LiveTranscriber] reuses this for NemotronStream, which shares
+         *  Parakeet's encoder/decoder/joiner directory shape (see [AsrFactory.isCompleteModelDir]). */
+        fun findByPrefix(dir: File, prefix: String): File? =
             dir.listFiles()?.firstOrNull { it.isFile && it.name.startsWith(prefix) && it.extension == "onnx" }
+
+        /** The 4 files a transducer-shaped sherpa-onnx model directory needs. */
+        internal data class TransducerFiles(
+            val tokens: File,
+            val encoder: File,
+            val decoder: File,
+            val joiner: File,
+        )
+
+        /**
+         * Resolves [TransducerFiles] from [dir], or throws [IllegalStateException]
+         * naming every missing file in one combined message. Shared between this
+         * class's own Parakeet path (above) and [LiveTranscriber]'s Nemotron path
+         * — same directory shape (encoder/decoder/joiner + tokens.txt), see
+         * [AsrFactory.isCompleteModelDir] — so a future change to that shape (a
+         * new required file, a naming exception) only needs updating here.
+         */
+        internal fun findTransducerFiles(dir: File): TransducerFiles {
+            val tokens = dir.listFiles()?.firstOrNull { it.name == "tokens.txt" }
+            val encoder = findByPrefix(dir, "encoder")
+            val decoder = findByPrefix(dir, "decoder")
+            val joiner = findByPrefix(dir, "joiner")
+            if (tokens == null || encoder == null || decoder == null || joiner == null) {
+                error(
+                    "Model incomplete in ${dir.absolutePath} (tokens=${tokens?.name}, " +
+                        "encoder=${encoder?.name}, decoder=${decoder?.name}, joiner=${joiner?.name})"
+                )
+            }
+            return TransducerFiles(tokens, encoder, decoder, joiner)
+        }
 
         /** One silence-aligned (or hard-cut) slice of the buffer, in sample indices. */
         internal data class CutRange(val startSample: Int, val endSample: Int)
 
         // Same defaults as AudioDecoder's file-based scan, reused here for a
         // FloatArray already in memory rather than re-decoding from disk.
-        private const val TARGET_CHUNK_SEC = 30.0
-        private const val FLEX_SEC = 4.0
+        internal const val TARGET_CHUNK_SEC = 30.0
+        /** A cut may land up to this many seconds BEFORE the target, never after, so chunks are at most target + flex long. */
+        internal const val FLEX_SEC = 4.0
         private const val WINDOW_MS = 25
         private const val MIN_SILENCE_MS = 250
         private const val RMS_FLOOR = 0.005f
@@ -240,10 +264,15 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
          * (never cuts PAST the nominal target, only earlier, to avoid growing
          * unboundedly on a long silence-free stretch).
          */
-        internal fun computeInMemoryCutPoints(samples: FloatArray, sampleRate: Int): List<CutRange> {
+        internal fun computeInMemoryCutPoints(
+            samples: FloatArray,
+            sampleRate: Int,
+            /** Nominal chunk length; every chunk is at most this + [FLEX_SEC] long. */
+            targetChunkSec: Double = TARGET_CHUNK_SEC,
+        ): List<CutRange> {
             if (samples.isEmpty()) return emptyList()
             val totalSec = samples.size.toDouble() / sampleRate
-            if (totalSec <= TARGET_CHUNK_SEC + FLEX_SEC) {
+            if (totalSec <= targetChunkSec + FLEX_SEC) {
                 return listOf(CutRange(0, samples.size))
             }
             val windowSamples = (WINDOW_MS / 1000.0 * sampleRate).toInt().coerceAtLeast(1)
@@ -263,7 +292,7 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
             val minSilenceWindows = (MIN_SILENCE_MS / WINDOW_MS.toDouble()).toInt().coerceAtLeast(1)
 
             val cuts = mutableListOf<Int>()
-            var targetSec = TARGET_CHUNK_SEC
+            var targetSec = targetChunkSec
             while (targetSec < totalSec) {
                 val targetWindow = (targetSec * sampleRate / windowSamples).toInt()
                 val flexWindows = (FLEX_SEC * sampleRate / windowSamples).toInt()
@@ -289,7 +318,7 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
                 } else targetWindow
                 val cutSample = (cutWindow * windowSamples).coerceIn(0, samples.size)
                 if (cuts.isEmpty() || cutSample > cuts.last()) cuts.add(cutSample)
-                targetSec = (cutSample.toDouble() / sampleRate) + TARGET_CHUNK_SEC
+                targetSec = (cutSample.toDouble() / sampleRate) + targetChunkSec
             }
             val ranges = mutableListOf<CutRange>()
             var prev = 0

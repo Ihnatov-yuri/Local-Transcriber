@@ -122,7 +122,17 @@ class EnsembleBackend(
         }
 
         try {
-            val cuts = SherpaOfflineBackend.computeInMemoryCutPoints(samples, sampleRate)
+            // Gemma4Backend.transcribe splits anything longer than
+            // CHUNK_SECONDS into a second inference, so with Gemma in the
+            // pair the target sits low enough that target + flex never
+            // exceeds it: one chunk here means one Gemma call, not a 28 s
+            // call plus a 6 s tail.
+            val targetChunkSec = if (gemmaIsSubEngine) {
+                Gemma4Backend.CHUNK_SECONDS - SherpaOfflineBackend.FLEX_SEC
+            } else {
+                SherpaOfflineBackend.TARGET_CHUNK_SEC
+            }
+            val cuts = SherpaOfflineBackend.computeInMemoryCutPoints(samples, sampleRate, targetChunkSec)
             val out = mutableListOf<RawSegment>()
             for ((i, cut) in cuts.withIndex()) {
                 val slice = samples.copyOfRange(cut.startSample, cut.endSample)

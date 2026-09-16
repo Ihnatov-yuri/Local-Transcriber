@@ -56,6 +56,22 @@ class Gemma4Backend(
     private var engine: Engine? = null
     private val mutex = Mutex()
 
+    /** True when the live [engine] was built on the GPU backend. */
+    @Volatile private var engineOnGpu = false
+
+    /**
+     * Exists from the moment a GPU engine build starts until the first
+     * chunk completes on it. If the process dies in between (a native
+     * crash in the GPU driver, which no catch can see), the file survives
+     * and [load] in Auto mode goes to CPU next time.
+     */
+    private fun gpuCrashMarker(): java.io.File = java.io.File(context.filesDir, GPU_CRASH_MARKER)
+
+    /** First successful inference on a GPU engine: the GPU path is safe on this device, disarm the marker. */
+    private fun markGpuHealthy() {
+        if (engineOnGpu) runCatching { gpuCrashMarker().delete() }
+    }
+
     override val isReady: Boolean
         get() = engine != null
 
@@ -69,10 +85,21 @@ class Gemma4Backend(
             //   Gpu  → GPU only; surface the error if it fails
             //   Cpu  → CPU only; never touch the OpenCL path
             val choice = gemmaSettings?.backend?.value ?: GemmaBackendChoice.Auto
+            // A GPU attempt that kills the process (the Adreno Vulkan
+            // shader compiler segfaults on the S24 Ultra under LiteRT-LM
+            // 0.17, after "engine ready" but before the first chunk) can't
+            // be caught below — the marker file is how the NEXT process
+            // learns about it. Auto then goes straight to CPU.
+            val marker = gpuCrashMarker()
+            val gpuCrashedBefore = marker.exists()
             val attempts = when (choice) {
-                GemmaBackendChoice.Auto -> listOf(true, false)
+                GemmaBackendChoice.Auto -> if (gpuCrashedBefore) listOf(false) else listOf(true, false)
                 GemmaBackendChoice.Gpu -> listOf(true)
                 GemmaBackendChoice.Cpu -> listOf(false)
+            }
+            if (choice == GemmaBackendChoice.Auto && gpuCrashedBefore) {
+                Log.w(TAG, "GPU skipped: a previous GPU attempt crashed the app " +
+                    "(${marker.name} present). Settings → Gemma 4 compute → GPU only re-tries it.")
             }
             // Collect failures across all attempts (typically GPU then CPU
             // in Auto mode) so the final error message names BOTH failures,
@@ -82,12 +109,19 @@ class Gemma4Backend(
             val failures = mutableListOf<String>()
             for (gpu in attempts) {
                 try {
+                    // Armed before the GPU attempt; disarmed by the first
+                    // chunk that completes on it (see runOneChunkLocked).
+                    if (gpu) runCatching { marker.createNewFile() }
                     engine = buildEngine(modelPath, gpu = gpu)
+                    engineOnGpu = gpu
                     Log.i(TAG, "LiteRT-LM engine ready on ${if (gpu) "GPU" else "CPU"} " +
                         "(model=$modelPath, choice=${choice.id})")
                     return@withLock Result.success(Unit)
                 } catch (t: Throwable) {
                     val backend = if (gpu) "GPU" else "CPU"
+                    // A clean failure is not a crash: Auto already falls
+                    // back below, so don't leave the marker armed.
+                    if (gpu) runCatching { marker.delete() }
                     Log.e(TAG, "engine init failed on $backend", t)
                     failures += "$backend: ${t.message ?: t.javaClass.simpleName}"
                 }
@@ -465,6 +499,7 @@ class Gemma4Backend(
                         "${System.currentTimeMillis() - sendStart}ms " +
                         "(${accumulated.length} chars" +
                         (if (cancelled) ", CANCELLED" else "") + ")")
+                    if (!cancelled) markGpuHealthy()
                     // Three-pass cleanup: outer preamble strip first (the
                     // model's "Sure, here's the transcript:" framing),
                     // then a leak scrubber for mid-text fragments of our
@@ -1424,6 +1459,9 @@ class Gemma4Backend(
          * we dare. Lower it if the model starts truncating output.
          */
         const val CHUNK_SECONDS = 28
+
+        /** See [gpuCrashMarker]. Lives in filesDir, next to nothing the user manages. */
+        private const val GPU_CRASH_MARKER = "gemma_gpu_attempt_in_progress"
 
         /**
          * Short tail window for the Speaker-marker loop check. 80 chars

@@ -1191,6 +1191,15 @@ class TranscriptionRunner(
         //   2. Gemma + pure (no sherpa). Trust Gemma's parsed Speaker N labels
         //      as best-effort; cross-chunk consistency is not guaranteed.
         //   3. Whisper + sherpa. Run sherpa post-ASR on the full mono buffer.
+        // Effective output language per segment. If we translated, that's
+        // the target language (or "en" when Whisper degraded a non-English
+        // target). Otherwise it's the source language we transcribed in.
+        val effectiveOutputLang = when {
+            translateTo != null && backend == AsrBackendKind.WhisperCpp ->
+                if (translateTo == "en") "en" else primaryLanguage
+            translateTo != null -> translateTo
+            else -> primaryLanguage
+        }
         val gemmaDiarized = gemma != null && diarize
         val assignedRaw: List<Pair<RawSegment, Int?>> = if (gemmaDiarized && sherpaSegmentsFromPrepass != null) {
             // Hybrid reconcile. Each parsed Gemma piece has chunk-relative
@@ -1221,7 +1230,33 @@ class TranscriptionRunner(
                 seg.copy(text = cleanText) to speakerId
             }
         } else if (diarize && rawSegments.isNotEmpty()) {
-            send(AsrEvent.Stage("Identifying speakers", 0.7f))
+            // Save the plain transcript before the speaker pass. On a long
+            // file that pass runs for many minutes and can't be interrupted
+            // mid-window, and until now nothing was persisted before it
+            // finished — a Stop (or a crash) during it threw away an ASR
+            // pass that had already succeeded. The final replaceSegments
+            // below overwrites these rows with the speaker column filled in.
+            val plainRows = dedupChunkBoundaries(
+                rawSegments.map { raw ->
+                    Segment(
+                        recordingId = recordingId,
+                        startSeconds = raw.startSeconds,
+                        endSeconds = raw.endSeconds,
+                        text = raw.text.trim(),
+                        language = effectiveOutputLang,
+                        speaker = null,
+                    )
+                },
+                chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
+            )
+            try {
+                repository.replaceSegments(recordingId, plainRows)
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                Log.w(TAG, "pre-diarization transcript save failed (non-fatal)", t)
+            }
+            send(AsrEvent.Stage("Transcript saved · identifying speakers", 0.7f))
             val diarRes = if (diarizeWindowed) {
                 runCatching {
                     diarizer.runChunked(
@@ -1276,15 +1311,6 @@ class TranscriptionRunner(
         val assigned = dropPureFillerSegments(coalesceBackchannels(assignedRaw))
 
         send(AsrEvent.Stage("Saving", 0.97f))
-        // Effective output language per segment. If we translated, that's
-        // the target language (or "en" when Whisper degraded a non-English
-        // target). Otherwise it's the source language we transcribed in.
-        val effectiveOutputLang = when {
-            translateTo != null && backend == AsrBackendKind.WhisperCpp ->
-                if (translateTo == "en") "en" else primaryLanguage
-            translateTo != null -> translateTo
-            else -> primaryLanguage
-        }
         val rows = assigned.map { (raw, spkId) ->
             Segment(
                 recordingId = recordingId,
