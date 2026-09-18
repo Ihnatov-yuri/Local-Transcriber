@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PIN="v1.7.4"   # last tag verified against the JNI shim's signatures
+PIN="v1.9.4"   # last tag verified against the JNI shim's signatures
 REPO_URL="https://github.com/ggml-org/whisper.cpp.git"
 DEST_DIR="$(cd "$(dirname "$0")/.." && pwd)/app/src/main/cpp/whisper.cpp"
 

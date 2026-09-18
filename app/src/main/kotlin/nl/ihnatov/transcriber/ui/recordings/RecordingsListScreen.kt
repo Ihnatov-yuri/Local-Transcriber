@@ -142,7 +142,8 @@ fun RecordingsListScreen(
             BrandStrip(
                 right = {
                     Mono(
-                        "V1·0 / ANDROID",
+                        // major·minor of the real build, not a literal that goes stale
+                        "V${nl.ihnatov.transcriber.BuildConfig.VERSION_NAME.split('.').take(2).joinToString("·")} / ANDROID",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.40f),
                     )

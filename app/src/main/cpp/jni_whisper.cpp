@@ -1,8 +1,9 @@
 // Thin JNI wrapper around whisper.cpp.
 //
-// Exposes six entry points to Kotlin:
+// Exposes seven entry points to Kotlin:
 //   nativeInit(modelPath) -> long  (opaque handle, see WhisperHandle below)
 //   nativeTranscribe(handle, samples[], sampleRate, langTag, translate, initialPrompt) -> Segment[]
+//   nativeSegmentTokens(handle, segIndex) -> Object[3]  (raw token bytes / times / probabilities of the LAST transcribe)
 //   nativeRequestCancel(handle)  (flips the abort flag whisper_full polls)
 //   nativeResetCancel(handle)  (Kotlin calls this before each new transcribe, see its own doc comment)
 //   nativeRelease(handle)
@@ -15,6 +16,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <atomic>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -154,6 +156,11 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
     params.translate      = translate == JNI_TRUE;
     params.no_context     = true;
     params.suppress_blank = true;
+    // Per-token t0/t1 for nativeSegmentTokens below. Without this the
+    // token_data timestamps are never computed (whisper.h: "do not use if
+    // you haven't computed token-level timestamps"). max_len stays 0, so
+    // segmentation itself is unchanged.
+    params.token_timestamps = true;
     params.abort_callback           = checkAbort;
     params.abort_callback_user_data = h;
 
@@ -214,6 +221,73 @@ Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeTranscribe(
         env->DeleteLocalRef(jtext);
         env->DeleteLocalRef(seg);
     }
+    return out;
+}
+
+// Per-token data for segment `segIndex` of the most recent nativeTranscribe
+// on this handle (whisper keeps its results in the context until the next
+// whisper_full) — Kotlin calls this under the same Mutex, right after
+// nativeTranscribe returns. Returns Object[3]:
+//   [0] byte[][]  raw token text bytes, one array per token
+//   [1] long[]    t0,t1 interleaved, whisper's 10ms units, chunk-relative
+//   [2] float[]   token probability (whisper_full_get_token_p)
+// Special tokens (>= whisper_token_eot: EOT, SOT, language, timestamps…)
+// are skipped, so all three stay index-aligned.
+//
+// The text goes up as BYTES on purpose: whisper's BPE vocabulary splits
+// multi-byte UTF-8 characters across tokens (routine for Cyrillic/Arabic),
+// and NewStringUTF on half a code point is undefined behaviour in JNI
+// (CheckJNI aborts, release builds emit garbage). Word grouping + decoding
+// happen on the Kotlin side (WhisperWordGrouping.kt) on whole words. Only
+// JDK classes are looked up by name here, so R8 needs no extra keep rule.
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_nl_ihnatov_transcriber_asr_WhisperCppBackend_nativeSegmentTokens(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jint segIndex) {
+    if (handle == 0) return nullptr;
+    auto* ctx = reinterpret_cast<WhisperHandle*>(handle)->ctx;
+    if (segIndex < 0 || segIndex >= whisper_full_n_segments(ctx)) return nullptr;
+
+    const whisper_token eot = whisper_token_eot(ctx);
+    const int nTok = whisper_full_n_tokens(ctx, segIndex);
+    std::vector<int> keep;
+    keep.reserve(nTok > 0 ? nTok : 0);
+    for (int j = 0; j < nTok; ++j) {
+        if (whisper_full_get_token_id(ctx, segIndex, j) < eot) keep.push_back(j);
+    }
+    const jsize n = static_cast<jsize>(keep.size());
+
+    jclass objCls   = env->FindClass("java/lang/Object");
+    jclass bytesCls = env->FindClass("[B");
+    if (!objCls || !bytesCls) return nullptr;
+    jobjectArray texts = env->NewObjectArray(n, bytesCls, nullptr);
+    jlongArray   times = env->NewLongArray(n * 2);
+    jfloatArray  probs = env->NewFloatArray(n);
+    jobjectArray out   = env->NewObjectArray(3, objCls, nullptr);
+    if (!texts || !times || !probs || !out) return nullptr;
+
+    std::vector<jlong>  t(n * 2);
+    std::vector<jfloat> p(n);
+    for (jsize k = 0; k < n; ++k) {
+        const int j = keep[k];
+        const whisper_token_data d = whisper_full_get_token_data(ctx, segIndex, j);
+        t[k * 2]     = static_cast<jlong>(d.t0);
+        t[k * 2 + 1] = static_cast<jlong>(d.t1);
+        p[k]         = d.p;
+        const char* text = whisper_full_get_token_text(ctx, segIndex, j);
+        const jsize len = text ? static_cast<jsize>(strlen(text)) : 0;
+        jbyteArray bytes = env->NewByteArray(len);
+        if (!bytes) return nullptr;
+        if (len > 0) env->SetByteArrayRegion(bytes, 0, len, reinterpret_cast<const jbyte*>(text));
+        env->SetObjectArrayElement(texts, k, bytes);
+        env->DeleteLocalRef(bytes);
+    }
+    if (n > 0) {
+        env->SetLongArrayRegion(times, 0, n * 2, t.data());
+        env->SetFloatArrayRegion(probs, 0, n, p.data());
+    }
+    env->SetObjectArrayElement(out, 0, texts);
+    env->SetObjectArrayElement(out, 1, times);
+    env->SetObjectArrayElement(out, 2, probs);
     return out;
 }
 

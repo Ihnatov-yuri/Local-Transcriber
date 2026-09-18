@@ -16,6 +16,9 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.border
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -127,6 +130,8 @@ fun RecordingDetailScreen(
         factory = RecordingDetailViewModel.factory(container, recordingId)
     )
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val hints by vm.hints.collectAsStateWithLifecycle()
+    val compare by vm.compare.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     // Transcribe-form state (carried over from the previous build).
@@ -206,6 +211,9 @@ fun RecordingDetailScreen(
     // RUN expander.
     var expectedSpeakers by remember { mutableStateOf(-1) }
     var runExpanded by remember { mutableStateOf(false) }
+    // Set by the over-segmentation hint: opens the RUN sheet with its
+    // SPEAKERS row called out. Cleared when the sheet closes.
+    var focusSpeakersRow by remember { mutableStateOf(false) }
     var langDialogOpen by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<String?>(null) }
     var renameDraft by remember { mutableStateOf("") }
@@ -431,6 +439,32 @@ fun RecordingDetailScreen(
                     )
                 }
 
+                // Post-run hints — both only ever appear right after a
+                // run this screen watched finish (see RunHints).
+                hints.overSegmentedSpeakers?.let { count ->
+                    if (expectedSpeakers <= 0) {
+                        Spacer(Modifier.height(8.dp))
+                        OverSegmentedHintRow(
+                            speakerCount = count,
+                            onSetExpected = {
+                                if (diarReady) diarize = true // SPEAKERS row only exists while DIARIZE is on
+                                focusSpeakersRow = true
+                                runExpanded = true
+                            },
+                            onDismiss = { vm.dismissOverSegmentedHint() },
+                        )
+                    }
+                }
+                if (hints.nameSuggestions.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    NameSuggestionRow(
+                        terms = hints.nameSuggestions,
+                        onAdd = vm::addSuggestedName,
+                        onDismissOne = vm::dismissSuggestedName,
+                        onDismissAll = vm::dismissNameSuggestions,
+                    )
+                }
+
                 Spacer(Modifier.height(12.dp))
             }
             // Post-process presets — visible ONLY in READ ⤢ fullscreen
@@ -568,14 +602,23 @@ fun RecordingDetailScreen(
         if (historySheetOpen) {
             val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
             ModalBottomSheet(
-                onDismissRequest = { historySheetOpen = false },
+                onDismissRequest = {
+                    historySheetOpen = false
+                    vm.clearCompare()
+                },
                 sheetState = sheetState,
                 containerColor = MaterialTheme.colorScheme.background,
             ) {
                 VersionHistorySheet(
                     versions = ui.versions,
+                    compare = compare,
+                    onCompare = { vm.compareVersion(it) },
+                    onCloseCompare = { vm.clearCompare() },
                     onRestore = { restoreTarget = it },
-                    onDelete = { vm.deleteVersion(it) },
+                    onDelete = {
+                        if (compare?.versionId == it) vm.clearCompare()
+                        vm.deleteVersion(it)
+                    },
                 )
             }
         }
@@ -601,6 +644,7 @@ fun RecordingDetailScreen(
                         vm.restoreVersion(versionId)
                         restoreTarget = null
                         historySheetOpen = false
+                        vm.clearCompare()
                     }) { Mono("RESTORE") }
                 },
                 dismissButton = {
@@ -614,12 +658,16 @@ fun RecordingDetailScreen(
         if (runExpanded) {
             val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
             ModalBottomSheet(
-                onDismissRequest = { runExpanded = false },
+                onDismissRequest = {
+                    runExpanded = false
+                    focusSpeakersRow = false
+                },
                 sheetState = sheetState,
                 containerColor = MaterialTheme.colorScheme.background,
                 dragHandle = null,
             ) {
                 RunOptionsSheetContent(
+                    highlightSpeakers = focusSpeakersRow,
                     backend = backend,
                     selectedLangs = selectedLangs,
                     translateTo = translateTo,
@@ -1160,6 +1208,8 @@ private fun RunStrip(
  */
 @Composable
 private fun RunOptionsSheetContent(
+    /** Call out the SPEAKERS row — the sheet was opened from the over-segmentation hint. */
+    highlightSpeakers: Boolean = false,
     backend: AsrBackendKind,
     selectedLangs: Set<String>,
     translateTo: String?,
@@ -1299,6 +1349,9 @@ private fun RunOptionsSheetContent(
                 value = if (expectedSpeakers <= 0) "AUTO" else expectedSpeakers.toString(),
                 onClick = onCycleSpeakers,
                 onHelp = { helpFor = RunOptionHelp.SPEAKERS },
+                // Stays lit only until the user has actually picked a count.
+                highlighted = highlightSpeakers && expectedSpeakers <= 0,
+                hint = if (highlightSpeakers && expectedSpeakers <= 0) "TAP TO SET · THEN RE-RUN" else null,
             )
         }
         RunOptionLine(
@@ -1415,19 +1468,26 @@ private fun RunOptionLine(
     value: String,
     onClick: () -> Unit,
     onHelp: (() -> Unit)? = null,
+    highlighted: Boolean = false,
+    hint: String? = null,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .then(if (highlighted) Modifier.background(Accent.copy(alpha = 0.12f)) else Modifier)
             .clickable(onClick = onClick)
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Mono(label, color = ink.copy(alpha = 0.62f), modifier = Modifier.width(84.dp))
+        Mono(
+            label,
+            color = if (highlighted) Accent else ink.copy(alpha = 0.62f),
+            modifier = Modifier.width(84.dp),
+        )
         Spacer(Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Mono(value, color = ink)
+            Mono(if (hint != null) "$value · $hint" else value, color = ink)
             Box(
                 Modifier
                     .height(1.5.dp)
@@ -2010,10 +2070,23 @@ private fun LanguagesDialog(
 @Composable
 private fun VersionHistorySheet(
     versions: List<nl.ihnatov.transcriber.data.TranscriptVersion>,
+    compare: RecordingDetailViewModel.CompareState?,
+    onCompare: (Long) -> Unit,
+    onCloseCompare: () -> Unit,
     onRestore: (Long) -> Unit,
     onDelete: (Long) -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
+    val compared = compare?.let { c -> versions.firstOrNull { it.id == c.versionId } }
+    if (compare != null && compared != null) {
+        VersionCompareContent(
+            version = compared,
+            state = compare,
+            onBack = onCloseCompare,
+            onRestore = { onRestore(compared.id) },
+        )
+        return
+    }
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
         Mono("HISTORY", color = ink)
         Spacer(Modifier.height(4.dp))
@@ -2035,6 +2108,7 @@ private fun VersionHistorySheet(
                 items(versions, key = { it.id }) { version ->
                     VersionRow(
                         version = version,
+                        onCompare = { onCompare(version.id) },
                         onRestore = { onRestore(version.id) },
                         onDelete = { onDelete(version.id) },
                     )
@@ -2049,6 +2123,7 @@ private fun VersionHistorySheet(
 @Composable
 private fun VersionRow(
     version: nl.ihnatov.transcriber.data.TranscriptVersion,
+    onCompare: () -> Unit,
     onRestore: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -2067,6 +2142,11 @@ private fun VersionRow(
             )
         }
         Mono(
+            "COMPARE",
+            color = ink,
+            modifier = Modifier.clickable(onClick = onCompare).padding(6.dp),
+        )
+        Mono(
             "RESTORE",
             color = Accent,
             modifier = Modifier.clickable(onClick = onRestore).padding(6.dp),
@@ -2075,6 +2155,210 @@ private fun VersionRow(
             "DELETE",
             color = ink.copy(alpha = 0.55f),
             modifier = Modifier.clickable(onClick = onDelete).padding(6.dp),
+        )
+    }
+}
+
+/**
+ * COMPARE view of the History sheet: one saved version word-diffed
+ * against the live transcript (see [nl.ihnatov.transcriber.data.TranscriptDiff]).
+ * The Mac's VERSIONS pane only expands a version's full text in place;
+ * on a phone two transcripts don't fit side by side, so this is a single
+ * merged read with the differences marked instead.
+ */
+@Composable
+private fun VersionCompareContent(
+    version: nl.ihnatov.transcriber.data.TranscriptVersion,
+    state: RecordingDetailViewModel.CompareState,
+    onBack: () -> Unit,
+    onRestore: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    val dark = androidx.compose.foundation.isSystemInDarkTheme()
+    val addedColor = if (dark) nl.ihnatov.transcriber.ui.theme.StatusSuccessDark
+        else nl.ihnatov.transcriber.ui.theme.StatusSuccessLight
+    val removedColor = MaterialTheme.colorScheme.error
+    val addedStyle = SpanStyle(color = addedColor, background = addedColor.copy(alpha = 0.14f))
+    val removedStyle = SpanStyle(
+        color = removedColor,
+        background = removedColor.copy(alpha = 0.10f),
+        textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough,
+    )
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Mono(
+                "← HISTORY",
+                color = ink.copy(alpha = 0.62f),
+                modifier = Modifier.clickable(onClick = onBack).padding(end = 10.dp, top = 6.dp, bottom = 6.dp),
+            )
+            Spacer(Modifier.weight(1f))
+            Mono(
+                "RESTORE",
+                color = Accent,
+                modifier = Modifier.clickable(onClick = onRestore).padding(6.dp),
+            )
+        }
+        Mono("COMPARE · ${version.engineLabel}", color = ink, maxLines = 1)
+        Spacer(Modifier.height(2.dp))
+        Text(
+            "${formatStampMono(version.createdAtMillis)} · ${version.segmentCount} turns · against the current transcript",
+            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+            color = ink.copy(alpha = 0.55f),
+        )
+        Spacer(Modifier.height(10.dp))
+        when (state) {
+            is RecordingDetailViewModel.CompareState.Loading -> {
+                Mono("COMPARING…", color = ink.copy(alpha = 0.62f))
+                Spacer(Modifier.height(16.dp))
+            }
+            is RecordingDetailViewModel.CompareState.Failed -> {
+                Text(
+                    state.reason,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+            is RecordingDetailViewModel.CompareState.Ready -> {
+                val diff = state.diff
+                if (diff.identical) {
+                    Text(
+                        "Same words as the current transcript (punctuation and capitalisation aside).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = ink.copy(alpha = 0.62f),
+                    )
+                    Spacer(Modifier.height(16.dp))
+                } else {
+                    // Legend doubles as the change count.
+                    @OptIn(ExperimentalLayoutApi::class)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Mono("− ${diff.removedWords} ONLY IN THIS VERSION", color = removedColor)
+                        Mono("+ ${diff.addedWords} ONLY IN CURRENT", color = addedColor)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    HairlineSoft()
+                    val paragraphs = remember(diff, dark) {
+                        diff.paragraphs.map { spans ->
+                            buildAnnotatedString {
+                                spans.forEachIndexed { idx, span ->
+                                    if (idx > 0) append(' ')
+                                    when (span.op) {
+                                        nl.ihnatov.transcriber.data.TranscriptDiff.Op.Same -> append(span.text)
+                                        nl.ihnatov.transcriber.data.TranscriptDiff.Op.Added ->
+                                            withStyle(addedStyle) { append(span.text) }
+                                        nl.ihnatov.transcriber.data.TranscriptDiff.Op.Removed ->
+                                            withStyle(removedStyle) { append(span.text) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    LazyColumn(modifier = Modifier.heightIn(max = 460.dp)) {
+                        items(paragraphs.size) { idx ->
+                            Text(
+                                paragraphs[idx],
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = ink.copy(alpha = 0.85f),
+                                modifier = Modifier.padding(vertical = 6.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+    }
+}
+
+// ─── Post-run hints ──────────────────────────────────────────────────
+
+/**
+ * Phase 1's one-tap follow-up to the runner's transient "looks
+ * over-segmented" stage text: auto clustering produced more speakers than
+ * a meeting plausibly has, and Expected speakers was left on AUTO.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun OverSegmentedHintRow(
+    speakerCount: Int,
+    onSetExpected: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Mono(
+            "$speakerCount SPEAKERS · LOOKS OVER-SEGMENTED",
+            color = ink.copy(alpha = 0.62f),
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        Mono(
+            "SET EXPECTED SPEAKERS ↗",
+            color = Accent,
+            modifier = Modifier.clickable(onClick = onSetExpected).padding(vertical = 4.dp),
+        )
+        Mono(
+            "✕",
+            color = ink.copy(alpha = 0.40f),
+            modifier = Modifier.clickable(onClick = onDismiss).padding(horizontal = 6.dp, vertical = 4.dp),
+        )
+    }
+}
+
+/**
+ * "+ Name" chips for names the fresh transcript contains but no
+ * vocabulary knows yet — port of the Mac's `DictationView` "New names ·
+ * tap to add to vocabulary" row (accent-outlined chip + × per name).
+ * Spellings are shown verbatim, not mono-capsed: the chip's text is
+ * exactly what lands in the vocabulary.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun NameSuggestionRow(
+    terms: List<nl.ihnatov.transcriber.asr.VocabularyHarvester.Term>,
+    onAdd: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onDismissOne: (nl.ihnatov.transcriber.asr.VocabularyHarvester.Term) -> Unit,
+    onDismissAll: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onBackground
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Mono(
+            "NEW NAMES · TAP TO ADD TO VOCABULARY",
+            color = ink.copy(alpha = 0.40f),
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        for (term in terms) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "+ ${term.spelling}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = ink,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .border(1.dp, Accent)
+                        .clickable { onAdd(term) }
+                        .padding(horizontal = 7.dp, vertical = 3.dp),
+                )
+                Mono(
+                    "✕",
+                    color = ink.copy(alpha = 0.40f),
+                    modifier = Modifier.clickable { onDismissOne(term) }.padding(horizontal = 5.dp, vertical = 4.dp),
+                )
+            }
+        }
+        Mono(
+            "HIDE",
+            color = ink.copy(alpha = 0.45f),
+            modifier = Modifier.clickable(onClick = onDismissAll).padding(vertical = 4.dp),
         )
     }
 }

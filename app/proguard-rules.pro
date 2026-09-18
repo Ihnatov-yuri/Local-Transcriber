@@ -24,3 +24,9 @@
 # is a @JvmOverloads-generated overload nothing on the Kotlin side calls, so
 # R8 strips it (found live: "no non-static method ...RawSegment;.<init>").
 -keep class nl.ihnatov.transcriber.asr.RawSegment { <init>(...); *; }
+# Word-level data (nativeSegmentTokens) deliberately comes back as
+# Object[]{byte[][], long[], float[]} — JDK types only — and is turned into
+# asr.Word on the Kotlin side, so there is no second app class for JNI to
+# look up by name and nothing further to keep here. If that ever changes to
+# constructing Word from C++, it needs the same treatment as RawSegment:
+# -keep class nl.ihnatov.transcriber.asr.Word { <init>(...); *; }

@@ -106,7 +106,7 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
                     Result.failure(IllegalStateException("whisper_full returned null"))
                 } else {
                     progress?.invoke(1f)
-                    Result.success(raw.toList())
+                    Result.success(raw.mapIndexed { i, seg -> seg.copy(words = segmentWords(h, i, seg)) })
                 }
             } catch (t: CancellationException) {
                 // Let cooperative cancellation propagate — TranscriptionJobManager's
@@ -118,6 +118,31 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
                 Result.failure(t)
             }
         }
+    }
+
+    /**
+     * Word timestamps + confidence for segment [index] of the transcribe
+     * that just finished. Must run under [mutex], before anything else
+     * touches the context — whisper keeps its token data only until the
+     * next whisper_full. Best-effort: word data is an extra on top of a
+     * transcript that already succeeded, so any failure here just leaves
+     * [RawSegment.words] null (callers all treat that as "no word data").
+     */
+    private fun segmentWords(h: Long, index: Int, seg: RawSegment): List<Word>? = try {
+        val tokens = nativeSegmentTokens(h, index)
+        if (tokens == null || tokens.size < 3) null else {
+            @Suppress("UNCHECKED_CAST")
+            WhisperWordGrouping.group(
+                tokenBytes = tokens[0] as Array<ByteArray>,
+                tokenTimes = tokens[1] as LongArray,
+                tokenProbs = tokens[2] as FloatArray,
+                segStart = seg.startSeconds,
+                segEnd = seg.endSeconds,
+            ).ifEmpty { null }
+        }
+    } catch (t: Throwable) {
+        Log.w(TAG, "word extraction failed for segment $index; continuing without words", t)
+        null
     }
 
     // NonCancellable: release() exists to free the native whisper_context
@@ -147,6 +172,9 @@ class WhisperCppBackend(private val promptStore: PromptStore? = null) : AsrBacke
         translate: Boolean,
         initialPrompt: String,
     ): Array<RawSegment>?
+
+    /** Object[3] = { byte[][] token text, long[] t0/t1 interleaved (10 ms units), float[] token p } — see jni_whisper.cpp. */
+    private external fun nativeSegmentTokens(handle: Long, segIndex: Int): Array<Any>?
 
     private external fun nativeRelease(handle: Long)
     private external fun nativeSystemInfo(): String

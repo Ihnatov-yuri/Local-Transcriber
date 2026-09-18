@@ -63,18 +63,37 @@ class WavRecorder(context: Context) {
      *   samples — float mono in [-1, 1], `CHUNK_SAMPLES` long
      *   startTimeSeconds — start time of this chunk within the recording
      *
-     * Buffer = 4: live transcribers can fall a few seconds behind without
-     * dropping audio. If a slow consumer is more than 4 chunks behind we drop
-     * the oldest chunk rather than stall the recorder (DROP_OLDEST).
+     * Buffer = 8 (40s of audio at the default 5s CHUNK_SECONDS): live
+     * transcribers can fall behind without dropping audio. If a slow
+     * consumer is more than 8 chunks behind we drop the oldest chunk
+     * rather than stall the recorder (DROP_OLDEST). Each chunk is ~320KB
+     * (CHUNK_SAMPLES floats), so the headroom costs under 3MB.
      */
     data class Chunk(val samples: FloatArray, val startTimeSeconds: Double)
 
     private val _chunks = MutableSharedFlow<Chunk>(
         replay = 0,
-        extraBufferCapacity = 4,
+        extraBufferCapacity = 8,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     val chunks: SharedFlow<Chunk> = _chunks.asSharedFlow()
+
+    /**
+     * The same audio as [chunks], cut into [FRAME_SAMPLES]-long (100 ms)
+     * slices for a genuinely streaming consumer (LiveTranscriber's
+     * NemotronStream path), which needs audio as it arrives to show
+     * partials under a second behind speech — a 5 s [chunks] emission
+     * can't get there no matter how fast the decoder is. Buffer = 600
+     * frames (60 s, under 4 MB) so a consumer that stalls briefly (model
+     * warm-up, a GC pause) doesn't punch a hole in the one persistent
+     * decoder stream; DROP_OLDEST past that rather than stall the recorder.
+     */
+    private val _frames = MutableSharedFlow<Chunk>(
+        replay = 0,
+        extraBufferCapacity = 600,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val frames: SharedFlow<Chunk> = _frames.asSharedFlow()
 
     private val appContext = context.applicationContext
 
@@ -151,6 +170,9 @@ class WavRecorder(context: Context) {
             // bytes have a separate counter (bytesWritten) because they go to
             // the WAV header.
             var samplesEmitted = 0L
+            val frameBuf = FloatArray(FRAME_SAMPLES)
+            var frameFill = 0
+            var frameSamplesEmitted = 0L
             while (!stopRequested) {
                 if (paused) {
                     // Light yield while paused; AudioRecord stays in STOPPED state.
@@ -194,8 +216,16 @@ class WavRecorder(context: Context) {
                         val hi = buf[i + 1].toInt()
                         val sample = (hi shl 8) or lo
                         val signed = if (sample >= 0x8000) sample - 0x10000 else sample
-                        chunkBuf[chunkFill++] = signed / 32768f
+                        val f = signed / 32768f
+                        chunkBuf[chunkFill++] = f
+                        frameBuf[frameFill++] = f
                         i += 2
+                        if (frameFill == FRAME_SAMPLES) {
+                            val startSec = frameSamplesEmitted.toDouble() / SAMPLE_RATE
+                            frameSamplesEmitted += FRAME_SAMPLES
+                            _frames.tryEmit(Chunk(frameBuf.copyOf(), startSec))
+                            frameFill = 0
+                        }
                         if (chunkFill == CHUNK_SAMPLES) {
                             val startSec = samplesEmitted.toDouble() / SAMPLE_RATE
                             samplesEmitted += CHUNK_SAMPLES
@@ -338,5 +368,8 @@ class WavRecorder(context: Context) {
          */
         const val CHUNK_SECONDS = 5
         const val CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
+
+        /** Streaming frame size — 100 ms @ 16 kHz. See [frames]. */
+        const val FRAME_SAMPLES = SAMPLE_RATE / 10
     }
 }

@@ -150,6 +150,56 @@ object VocabularyHarvester {
             .take(limit)
     }
 
+    /**
+     * One-tap suggestions from a SINGLE transcript — what the Detail screen
+     * offers right after a run. Mirrors the Mac's
+     * `DictationController.suggestNames(from:)` (candidates not already
+     * known / learned / dismissed, de-duplicated by key), plus the same
+     * sanity filters [harvest] applies, since a whole recording is far
+     * noisier than one dictated utterance. Most-mentioned first; returns
+     * [Term]s (recordings = 1) so callers can hand them straight to
+     * [addLearnedTerm].
+     */
+    fun suggest(
+        text: String,
+        knownTerms: Collection<String>,
+        dismissedKeys: Set<String>,
+        limit: Int = 6,
+    ): List<Term> {
+        val known = knownTerms.mapTo(HashSet(), ::key)
+        val lowercaseSeen = HashMap<String, Int>()
+        for (w in text.split(WORD_SPLIT_REGEX)) {
+            if (w.isNotEmpty() && w.first().isLowerCase()) {
+                val k = key(w)
+                lowercaseSeen[k] = (lowercaseSeen[k] ?: 0) + 1
+            }
+        }
+        val counts = LinkedHashMap<String, Int>()
+        val spellings = HashMap<String, HashMap<String, Int>>()
+        for (cand in candidates(text)) {
+            val k = key(cand)
+            if (k.length < 3 || k in stop || k in known || k in dismissedKeys) continue
+            if (cand.contains('\'') || cand.contains('’')) continue
+            val parts = cand.split(' ').map(::key)
+            if (parts.size > 3 || parts.any { it in stop }) continue
+            if (parts.size > 1 &&
+                parts.zipWithNext().any { (a, b) -> a == b || b.startsWith(a) || a.startsWith(b) }
+            ) continue
+            counts[k] = (counts[k] ?: 0) + 1
+            val sc = spellings.getOrPut(k) { HashMap() }
+            sc[cand] = (sc[cand] ?: 0) + 1
+        }
+        return counts.entries
+            // Seen lowercase at least as often as capitalized → ordinary word.
+            .filter { (k, occ) -> (lowercaseSeen[k] ?: 0) < occ }
+            .sortedByDescending { it.value } // stable: ties keep first-mention order
+            .take(limit)
+            .mapNotNull { (k, occ) ->
+                val best = spellings[k]?.maxByOrNull { it.value }?.key ?: return@mapNotNull null
+                Term(key = k, spelling = best, recordings = 1, occurrences = occ)
+            }
+    }
+
     private fun looksLikeName(w: String): Boolean {
         val first = w.firstOrNull() ?: return false
         if (!first.isUpperCase() || w.length < 2) return false

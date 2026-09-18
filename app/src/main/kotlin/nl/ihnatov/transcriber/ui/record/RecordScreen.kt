@@ -36,6 +36,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -198,6 +199,7 @@ fun RecordScreen(
                 LastHeardBlock(
                     liveStatus = ui.liveStatus,
                     lastLine = ui.liveLines.lastOrNull(),
+                    partial = ui.livePartial,
                 )
             }
             Spacer(Modifier.height(14.dp))
@@ -208,10 +210,9 @@ fun RecordScreen(
                 onToggleAutoTranscribe = { vm.setAutoTranscribe(!ui.autoTranscribe) },
                 onToggleLive = { vm.setLiveEnabled(!ui.liveEnabled) },
                 onCycleEngine = {
-                    vm.setLiveEngine(
-                        if (ui.liveEngine == AsrBackendKind.Gemma4) AsrBackendKind.WhisperCpp
-                        else AsrBackendKind.Gemma4,
-                    )
+                    val order = AsrBackendKind.LIVE_PRIORITY
+                    val idx = order.indexOf(ui.liveEngine).let { if (it < 0) 0 else it }
+                    vm.setLiveEngine(order[(idx + 1) % order.size])
                 },
                 onPickLanguages = { langDialogOpen = true },
             )
@@ -355,6 +356,7 @@ private fun WaveformAxis(elapsedMs: Long) {
 private fun LastHeardBlock(
     liveStatus: RecordViewModel.LiveStatus,
     lastLine: RecordViewModel.LiveLine?,
+    partial: String,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -363,11 +365,20 @@ private fun LastHeardBlock(
             RecordViewModel.LiveStatus.Loading -> "LAST HEARD · LOADING MODEL"
             RecordViewModel.LiveStatus.Running -> "LAST HEARD · LIVE"
             RecordViewModel.LiveStatus.Stopping -> "LAST HEARD · STOPPING…"
-            RecordViewModel.LiveStatus.ModelMissing -> "LIVE NEEDS GGML-TINY.BIN"
+            // liveStatus.kind, not the separately-mutable ui.liveEngine —
+            // frozen at whatever engine actually reported this, so cycling
+            // ENGINE afterward can't make this claim a different
+            // (actually-installed) engine's model is missing.
+            is RecordViewModel.LiveStatus.ModelMissing -> "LIVE NEEDS ${engineLabel(liveStatus.kind).uppercase()}"
             is RecordViewModel.LiveStatus.Failed -> "LIVE FAILED: ${liveStatus.reason}".take(64)
         }
         Mono(statusLabel, color = ink.copy(alpha = 0.55f))
-        val text = lastLine?.text ?: "Tap RECORD below. Live transcript will appear as you speak."
+        // A streaming engine's in-progress utterance wins over the last
+        // finished line. Either can run to 20 s of speech (the endpoint
+        // detector's hard cap), so show only the tail — the newest words
+        // are the ones that matter here, and the block keeps its height.
+        val heard = partial.ifEmpty { lastLine?.text }
+        val text = heard?.let(::tailWords) ?: "Tap RECORD below. Live transcript will appear as you speak."
         // The one-per-screen "voice" moment — was a Fraunces italic
         // statement; Lit Field carries no serif/italic voice, so this is
         // now just the larger, lighter cut of the text face reserved for
@@ -387,6 +398,13 @@ private fun LastHeardBlock(
     }
 }
 
+/** Last ~[max] chars of [text], cut at a word boundary with a leading ellipsis. */
+private fun tailWords(text: String, max: Int = 140): String {
+    if (text.length <= max) return text
+    val tail = text.takeLast(max)
+    return "… " + tail.substringAfter(' ', tail)
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun OptionsTagStrip(
@@ -397,6 +415,16 @@ private fun OptionsTagStrip(
     onPickLanguages: () -> Unit,
 ) {
     val ink = MaterialTheme.colorScheme.onBackground
+    // Cycling ENGINE only updates the display StateFlow — startLive() no-
+    // ops while a worker is already running, so an already-active
+    // LiveTranscriber keeps transcribing with its original engine
+    // regardless. Letting the tag stay tappable mid-recording used to let
+    // the display silently diverge from what's actually running (and, via
+    // LastHeardBlock's ModelMissing message, even name a DIFFERENT engine
+    // as missing its model than the one that actually reported that).
+    // Disabled instead of hidden so the user can still see which engine
+    // this session is actually using.
+    val isActive = ui.state is WavRecorder.State.Recording || ui.state is WavRecorder.State.Paused
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Mono("OPTIONS", color = ink.copy(alpha = 0.55f))
         FlowRow(
@@ -418,8 +446,9 @@ private fun OptionsTagStrip(
             if (ui.liveEnabled) {
                 TagPair(
                     label = "ENGINE",
-                    value = if (ui.liveEngine == AsrBackendKind.Gemma4) "GEMMA 4 E2B" else "WHISPER TINY",
+                    value = engineLabel(ui.liveEngine),
                     active = true,
+                    enabled = !isActive,
                     onClick = onCycleEngine,
                 )
                 TagPair(
@@ -434,12 +463,22 @@ private fun OptionsTagStrip(
 }
 
 @Composable
-private fun TagPair(label: String, value: String, active: Boolean, onClick: () -> Unit) {
+private fun TagPair(
+    label: String,
+    value: String,
+    active: Boolean,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     val ink = MaterialTheme.colorScheme.onBackground
     Row(
         modifier = Modifier
-            .clickable(onClick = onClick)
-            .padding(vertical = 2.dp),
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 2.dp)
+            // Dimmed + non-interactive while a live session is already
+            // running and this tag's edit would have no effect on it —
+            // see OptionsTagStrip's isActive gate on the ENGINE tag.
+            .alpha(if (enabled) 1f else 0.4f),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Mono(label, color = ink.copy(alpha = 0.55f))
@@ -576,7 +615,6 @@ private fun RecordFooter(
 private fun engineLabel(kind: AsrBackendKind): String = when (kind) {
     AsrBackendKind.Gemma4 -> "Gemma 4 E2B"
     AsrBackendKind.WhisperCpp -> "Whisper tiny"
-    // Not offered as a live/Record-screen engine choice yet — see LiveTranscriber.pickModel.
     AsrBackendKind.Parakeet -> "Parakeet"
     AsrBackendKind.Omnilingual -> "Omnilingual"
     AsrBackendKind.NemotronStream -> "Nemotron 3.5"

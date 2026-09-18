@@ -1,12 +1,12 @@
 package nl.ihnatov.transcriber.asr
 
 /**
- * One transcribed word with its own timestamps. Segment-level ASR backends
- * (whisper.cpp today) don't populate this yet; Phase 2 of the 2026-09 plan
- * wires it up for Parakeet/Omnilingual/Nemotron (native word timestamps)
- * and whisper.cpp (token timestamps via the JNI shim) and adds an optional
- * `words` list to [RawSegment]. The attribution rule below is written and
- * tested against this type now so it's ready the moment real data exists.
+ * One transcribed word with its own timestamps, carried on
+ * [RawSegment.words]. Populated by Parakeet/Omnilingual (sherpa-onnx token
+ * timestamps, no confidence — upstream doesn't expose one yet) and by
+ * whisper.cpp (token timestamps + [confidence] = geometric mean of the
+ * word's token probabilities, see [WhisperWordGrouping]). Gemma has no
+ * word-level data at all.
  */
 data class Word(
     val start: Double,
@@ -62,4 +62,70 @@ fun assignWordSpeakers(
         }
         word to bestSpeaker
     }
+}
+
+/**
+ * A speaker run shorter than this, sandwiched between two runs of the
+ * SAME other speaker inside one segment, is treated as diarization
+ * boundary jitter rather than a real interjection and absorbed. Real
+ * backchannels ("yeah", "так") run ~0.3 s and up, so they survive.
+ */
+private const val MIN_SANDWICHED_RUN_SEC = 0.25
+
+/**
+ * Production entry point for speaker attribution: per WORD where the
+ * engine gave us words ([assignWordSpeakers]), splitting a segment into
+ * consecutive same-speaker runs when its words disagree — an ASR segment
+ * routinely spans a turn change, and per-segment max-overlap
+ * ([assignSpeakers]) hands the whole thing to whoever talked longest.
+ * Segments without word data keep exactly that per-segment rule.
+ *
+ * A split piece takes its text from its words (the segment's own text
+ * can't be cut reliably) and its bounds from them too, except that the
+ * first/last piece keep the segment's outer start/end. Unsplit segments
+ * pass through untouched, text included.
+ */
+fun assignSpeakersPerWord(
+    transcript: List<RawSegment>,
+    speakers: List<DiarizationRunner.SpeakerSegment>,
+): List<Pair<RawSegment, Int?>> {
+    if (speakers.isEmpty()) return transcript.map { it to null }
+    return transcript.flatMap { seg ->
+        val words = seg.words
+        if (words.isNullOrEmpty()) return@flatMap assignSpeakers(listOf(seg), speakers)
+        val runs = speakerRuns(assignWordSpeakers(words, speakers))
+        if (runs.size == 1) return@flatMap listOf(seg to runs[0].second)
+        runs.mapIndexed { i, (runWords, speaker) ->
+            RawSegment(
+                startSeconds = if (i == 0) seg.startSeconds else runWords.first().start,
+                endSeconds = if (i == runs.lastIndex) seg.endSeconds else runWords.last().end,
+                text = RoverMerge.joinSurfaces(runWords.map { it.text }),
+                words = runWords,
+            ) to speaker
+        }
+    }
+}
+
+/** Group consecutive same-speaker words, then absorb sandwiched jitter runs (see [MIN_SANDWICHED_RUN_SEC]). */
+private fun speakerRuns(attributed: List<Pair<Word, Int?>>): List<Pair<List<Word>, Int?>> {
+    fun group(items: List<Pair<Word, Int?>>): MutableList<Pair<MutableList<Word>, Int?>> {
+        val runs = mutableListOf<Pair<MutableList<Word>, Int?>>()
+        for ((word, speaker) in items) {
+            val last = runs.lastOrNull()
+            if (last != null && last.second == speaker) last.first.add(word)
+            else runs.add(mutableListOf(word) to speaker)
+        }
+        return runs
+    }
+    val runs = group(attributed)
+    if (runs.size < 3) return runs
+    val smoothed = mutableListOf<Pair<Word, Int?>>()
+    for ((i, run) in runs.withIndex()) {
+        val (runWords, speaker) = run
+        val sandwiched = i in 1 until runs.lastIndex && runs[i - 1].second == runs[i + 1].second
+        val duration = runWords.last().end - runWords.first().start
+        val effective = if (sandwiched && duration < MIN_SANDWICHED_RUN_SEC) runs[i - 1].second else speaker
+        runWords.forEach { smoothed.add(it to effective) }
+    }
+    return group(smoothed)
 }

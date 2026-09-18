@@ -13,6 +13,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import nl.ihnatov.transcriber.asr.AsrBackendKind
 import nl.ihnatov.transcriber.asr.LiveTranscriber
 import nl.ihnatov.transcriber.audio.RecordingService
@@ -34,7 +36,7 @@ class RecordViewModel(
 ) : AndroidViewModel(application) {
 
     /** One segment from the live worker. */
-    data class LiveLine(val startSec: Double, val text: String)
+    data class LiveLine(val startSec: Double, val endSec: Double, val text: String)
 
     data class UiState(
         val state: WavRecorder.State = WavRecorder.State.Idle,
@@ -56,6 +58,8 @@ class RecordViewModel(
         val liveLanguages: Set<String> = emptySet(),
         val liveStatus: LiveStatus = LiveStatus.Idle,
         val liveLines: List<LiveLine> = emptyList(),
+        /** Streaming engines only: the still-growing current utterance, shown after [liveLines]. */
+        val livePartial: String = "",
     )
 
     sealed interface LiveStatus {
@@ -64,7 +68,9 @@ class RecordViewModel(
         data object Running : LiveStatus
         /** stop() was called but the engine handle hasn't finished releasing yet — see [stopLive]. */
         data object Stopping : LiveStatus
-        data object ModelMissing : LiveStatus
+        /** [kind] is frozen at whatever engine actually reported the model
+         *  missing — doesn't drift if the user cycles ENGINE afterward. */
+        data class ModelMissing(val kind: AsrBackendKind) : LiveStatus
         data class Failed(val reason: String) : LiveStatus
     }
 
@@ -78,6 +84,7 @@ class RecordViewModel(
     private val _liveLanguages = MutableStateFlow(container.uiPrefs.lastLanguages.value)
     private val _liveStatus = MutableStateFlow<LiveStatus>(LiveStatus.Idle)
     private val _liveLines = MutableStateFlow<List<LiveLine>>(emptyList())
+    private val _livePartial = MutableStateFlow("")
 
     /**
      * Combined "live config" subset. Wrapping into a single Flow keeps the
@@ -89,6 +96,7 @@ class RecordViewModel(
         val languages: Set<String>,
         val status: LiveStatus,
         val lines: List<LiveLine>,
+        val partial: String,
     )
 
     /** Auto-transcribe pair: (toggle value, finished-id-to-auto-fire). */
@@ -101,7 +109,12 @@ class RecordViewModel(
         combine(_finished, _autoTranscribe) { fin, auto ->
             AutoPack(on = auto, pendingId = fin?.takeIf { auto })
         },
-        combine(_liveEnabled, _liveEngine, _liveLanguages, _liveStatus, _liveLines, ::LivePack),
+        combine(
+            combine(_liveEnabled, _liveEngine, _liveLanguages, ::Triple),
+            _liveStatus, _liveLines, _livePartial,
+        ) { cfg, status, lines, partial ->
+            LivePack(cfg.first, cfg.second, cfg.third, status, lines, partial)
+        },
     ) { st, lvl, el, autoPack, live ->
         UiState(
             state = st,
@@ -116,6 +129,7 @@ class RecordViewModel(
             liveLanguages = live.languages,
             liveStatus = live.status,
             liveLines = live.lines,
+            livePartial = live.partial,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
@@ -132,14 +146,16 @@ class RecordViewModel(
         // When the recorder finishes saving, persist a Recording row and surface
         // its id so the UI can navigate to the detail screen.
         recorder.state.onEach { st ->
-            if (st is WavRecorder.State.Saved) {
+            // NonCancellable: if the VM is cleared mid-handler (user backs
+            // out during "Finalizing") a plain cancellation here would leave
+            // the WAV on disk with no Recording row, and the recorder stuck
+            // in Saved for the next VM's init to trip over.
+            if (st is WavRecorder.State.Saved) withContext(NonCancellable) {
                 val app = getApplication<Application>()
                 RecordingService.stop(app)
-                // Snapshot the live transcript BEFORE shutting the worker
-                // down — stopLive() clears it as part of the "leave the
-                // Record screen clean" flow below.
-                val liveLines = _liveLines.value
-                stopLive(clearTranscript = true)
+                // Snapshot the live transcript, including a streaming
+                // session's flushed trailing utterance — see finishLive.
+                val liveLines = finishLive()
                 val file = File(st.path)
                 val title = file.nameWithoutExtension
                 val durationSec = recorder.durationSeconds()
@@ -158,7 +174,7 @@ class RecordViewModel(
                         nl.ihnatov.transcriber.data.Segment(
                             recordingId = id,
                             startSeconds = it.startSec,
-                            endSeconds = it.startSec + 5.0,    // live chunks are ~5s
+                            endSeconds = it.endSec,
                             text = it.text,
                         )
                     }
@@ -230,6 +246,7 @@ class RecordViewModel(
             val out = File(dir, "Recording_$stamp.wav")
             _finished.value = null
             _liveLines.value = emptyList()
+            _livePartial.value = ""
             _liveStatus.value = LiveStatus.Idle
             recorder.start(out)
             if (_liveEnabled.value) startLive()
@@ -247,10 +264,13 @@ class RecordViewModel(
                 when (e) {
                     LiveTranscriber.Event.Loading -> _liveStatus.value = LiveStatus.Loading
                     LiveTranscriber.Event.Ready -> _liveStatus.value = LiveStatus.Running
-                    LiveTranscriber.Event.ModelMissing -> _liveStatus.value = LiveStatus.ModelMissing
+                    is LiveTranscriber.Event.ModelMissing -> _liveStatus.value = LiveStatus.ModelMissing(e.kind)
                     is LiveTranscriber.Event.Failed -> _liveStatus.value = LiveStatus.Failed(e.reason)
-                    is LiveTranscriber.Event.Segment ->
-                        _liveLines.value = _liveLines.value + LiveLine(e.startSec, e.text)
+                    is LiveTranscriber.Event.Partial -> _livePartial.value = e.text
+                    is LiveTranscriber.Event.Segment -> {
+                        _livePartial.value = ""
+                        _liveLines.value = _liveLines.value + LiveLine(e.startSec, e.endSec, e.text)
+                    }
                 }
             }
         }
@@ -258,7 +278,7 @@ class RecordViewModel(
     }
 
     /**
-     * Tear down the live worker.
+     * Tear down the live worker, fire-and-forget.
      *
      * @param clearTranscript when true, also wipes [_liveLines] and forces
      * status back to Idle. Pass true when the recording session is ending —
@@ -292,6 +312,7 @@ class RecordViewModel(
         // surfacing it. The background cleanup still runs to release the
         // native engine handle; Idle lands once it actually finishes.
         _liveStatus.value = LiveStatus.Stopping
+        _livePartial.value = ""
         if (clearTranscript) {
             _liveLines.value = emptyList()
         }
@@ -309,6 +330,38 @@ class RecordViewModel(
                 _liveStatus.value = LiveStatus.Idle
             }
         }
+    }
+
+    /**
+     * End-of-recording teardown for the Saved-state handler: returns the
+     * live transcript to seed Detail with and leaves the Record screen clean.
+     *
+     * A streaming (Nemotron) worker is awaited, because its [LiveTranscriber.stop]
+     * flushes the not-yet-endpointed trailing utterance and hands it back —
+     * quick, and otherwise the last sentence is missing from the seed every
+     * time. The chunk engines keep the fire-and-forget [stopLive]: their
+     * stop() can sit behind a whole in-flight Gemma chunk for many seconds,
+     * which isn't worth holding navigation for when the full transcription
+     * pass replaces the seed anyway.
+     */
+    private suspend fun finishLive(): List<LiveLine> {
+        val w = liveWorker
+        if (w == null || !w.isStreaming) {
+            val lines = _liveLines.value
+            stopLive(clearTranscript = true)
+            return lines
+        }
+        liveWorker = null
+        _liveStatus.value = LiveStatus.Stopping
+        liveEventsJob?.cancel()
+        liveEventsJob = null
+        val flushed = w.stop()
+        val lines = _liveLines.value +
+            listOfNotNull(flushed?.let { LiveLine(it.startSec, it.endSec, it.text) })
+        _liveLines.value = emptyList()
+        _livePartial.value = ""
+        _liveStatus.value = LiveStatus.Idle
+        return lines
     }
 
     fun pauseResume() {
@@ -342,28 +395,21 @@ class RecordViewModel(
     ) == PackageManager.PERMISSION_GRANTED
 
     /**
-     * Live transcription only supports Gemma4/WhisperCpp today (see
-     * [nl.ihnatov.transcriber.ui.record.RecordScreen]'s engineLabel /
-     * onCycleEngine — Parakeet/Omnilingual/Nemotron aren't wired into
-     * LiveTranscriber yet). Gemma4 is preferred when installed (same
-     * engine as file transcription, so prompts/vocabulary carry over),
-     * WhisperCpp next, and only once BOTH are confirmed absent does this
-     * fall back to WhisperCpp anyway as a last resort — the RUN strip's
-     * own "NO MODEL INSTALLED" warning covers that case, same as it does
-     * elsewhere in the app; there's no live-capable engine left to pick
-     * that would do better. An earlier version of this function defaulted
-     * to WhisperCpp unconditionally whenever Gemma4 was missing, without
-     * checking Whisper was actually there either — a phone with, say,
-     * only Parakeet installed (not live-capable at all) reproduced the
-     * exact "engine shows something that isn't installed" bug this
-     * function exists to prevent, just with a different missing model.
-     * Mirrors RecordingDetailViewModel's autoEngineFor.
+     * Checks every live-capable engine in [AsrBackendKind.LIVE_PRIORITY]
+     * order — the SAME list the Record screen's manual ENGINE-tag cycle
+     * reads, so the two can't silently drift out of sync — and picks the
+     * first one actually installed, before giving up and returning
+     * WhisperCpp anyway so the UI always has SOME value; the RUN strip's
+     * own "NO MODEL INSTALLED" warning covers the case where nothing at
+     * all is installed. Mirrors RecordingDetailViewModel's autoEngineFor.
+     * An earlier version of this function only ever checked Gemma4/
+     * WhisperCpp, reproducing the exact "engine shows something that
+     * isn't installed" bug this function exists to prevent whenever only
+     * one of the other three engines was installed.
      */
-    private fun defaultLiveEngine(): AsrBackendKind = when {
-        container.asrFactory.listModels(AsrBackendKind.Gemma4).isNotEmpty() -> AsrBackendKind.Gemma4
-        container.asrFactory.listModels(AsrBackendKind.WhisperCpp).isNotEmpty() -> AsrBackendKind.WhisperCpp
-        else -> AsrBackendKind.WhisperCpp
-    }
+    private fun defaultLiveEngine(): AsrBackendKind =
+        AsrBackendKind.LIVE_PRIORITY.firstOrNull { container.asrFactory.listModels(it).isNotEmpty() }
+            ?: AsrBackendKind.WhisperCpp
 
     companion object {
         private const val TAG = "RecordViewModel"

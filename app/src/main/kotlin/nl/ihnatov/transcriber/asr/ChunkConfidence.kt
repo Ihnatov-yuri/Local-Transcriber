@@ -12,6 +12,8 @@ package nl.ihnatov.transcriber.asr
  *
  * Each signal contributes to a 0..1 score; everything at or above
  * [lowThreshold] is a candidate for Super mode's second (arbitration) pass.
+ * [EnsembleBackend.pickBySanity] also uses it as a gate ahead of the vote:
+ * when exactly one engine's chunk text is low, the other engine's wins.
  */
 data class ChunkConfidence(val score: Double, val reasons: List<String>) {
 

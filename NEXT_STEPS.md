@@ -2,6 +2,8 @@
 
 > **September 2026:** the current roadmap is [docs/PLAN-2026-09.md](docs/PLAN-2026-09.md). Item A below (chunked diarization) shipped in `e98ce6d`; the rest is folded into that plan.
 
+> **1.2.0 (2026-09-18)** closed the plan's remaining gaps: Nemotron 3.5 streaming live transcription with partials, whisper.cpp v1.9.4 with per-word timestamps + confidence, per-word speaker attribution, ChunkConfidence gate and word-level vote for Whisper pairs in Super mode, Gemma merge map for non-Gemma runs, version compare, post-run name suggestions, one-tap over-segmentation hint. Still open: README real-time-factor table (needs the S24 Ultra), sherpa transducer confidence (upstream PR #3638).
+
 Live planning doc — features that didn't fit the current sprint, sorted by ROI.
 Everything above the line in [README.md](README.md) is shipped.
 

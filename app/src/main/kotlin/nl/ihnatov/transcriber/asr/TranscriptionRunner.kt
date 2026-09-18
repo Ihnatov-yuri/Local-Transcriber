@@ -5,12 +5,14 @@ import android.util.Log
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import nl.ihnatov.transcriber.audio.AudioDecoder
 import nl.ihnatov.transcriber.data.RecordingRepository
@@ -289,7 +291,10 @@ class TranscriptionRunner(
         val snapshotEngineId = recording.transcribedWithBackend ?: "unknown"
         val snapshotEngineLabel = recording.transcribedWithModel ?: snapshotEngineId
         runCatching { repository.snapshotCurrentTranscript(recordingId, snapshotEngineId, snapshotEngineLabel) }
-            .onFailure { Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it) }
+            .onFailure {
+                if (it is CancellationException) throw it
+                Log.w(TAG, "pre-run transcript snapshot failed (non-fatal)", it)
+            }
 
         send(AsrEvent.Stage("Reading audio", 0.1f))
         // For Gemma we stream-decode: a 1-hour MP3 is ~230 MB as float32 and
@@ -468,16 +473,17 @@ class TranscriptionRunner(
             // Gemma4Backend.suggestSpeakerMergeMap's own doc comment.
             val prepassClusters = sherpaSegmentsFromPrepass
             val prepassGemma = gemma
-            if (prepassGemma != null && prepassClusters != null) {
-                val summaries = prepassClusters.groupBy { it.speakerId }.map { (id, segs) ->
-                    ClusterSummary(
-                        id = id,
-                        durationSeconds = segs.sumOf { (it.end - it.start).toDouble() },
-                        confidence = segs.map { it.confidence }.average().toFloat(),
-                    )
-                }
+            // Skipped when the user pinned Expected Speakers: clustering was
+            // forced to exactly that count, and a merge would undo their pick.
+            if (prepassGemma != null && prepassClusters != null && expectedSpeakers <= 0) {
+                val summaries = clusterSummaries(prepassClusters)
                 if (summaries.size >= 2) {
-                    val mergePairs = runCatching { prepassGemma.suggestSpeakerMergeMap(summaries) }.getOrDefault(emptyList())
+                    // Rethrow cancellation — a bare runCatching here turned
+                    // a Stop during this call into "no merges" and let the
+                    // run carry on into the ASR pass.
+                    val mergePairs = runCatching { prepassGemma.suggestSpeakerMergeMap(summaries) }
+                        .onFailure { if (it is CancellationException) throw it }
+                        .getOrDefault(emptyList())
                     if (mergePairs.isNotEmpty()) {
                         val mapping = applyMergeMap(summaries.map { it.id }.toSet(), mergePairs)
                         val merged = prepassClusters.map { it.copy(speakerId = mapping[it.speakerId] ?: it.speakerId) }
@@ -1201,6 +1207,11 @@ class TranscriptionRunner(
             else -> primaryLanguage
         }
         val gemmaDiarized = gemma != null && diarize
+        // Clusters from the post-ASR diarization pass (branch 3 below) —
+        // kept so the Gemma merge-map cleanup can run over them later,
+        // once the transcript is safely saved. Stays null for the Gemma
+        // branches: their clusters already went through it in the pre-pass.
+        var postAsrClusters: List<DiarizationRunner.SpeakerSegment>? = null
         val assignedRaw: List<Pair<RawSegment, Int?>> = if (gemmaDiarized && sherpaSegmentsFromPrepass != null) {
             // Hybrid reconcile. Each parsed Gemma piece has chunk-relative
             // (start, end) from parseGemmaDiarSegments + an encoded
@@ -1298,7 +1309,13 @@ class TranscriptionRunner(
                 ))
                 rawSegments.map { it to null }
             } else {
-                assignSpeakers(rawSegments, diarRes.getOrThrow())
+                // Per WORD where the engine gave us words (Parakeet,
+                // Omnilingual, whisper.cpp), splitting a segment that spans
+                // a turn change; per-segment max-overlap otherwise. The
+                // coalescing below re-joins whatever ends up adjacent.
+                val clusters = diarRes.getOrThrow()
+                postAsrClusters = clusters
+                assignSpeakersPerWord(rawSegments, clusters)
             }
         } else {
             rawSegments.map { it to null }
@@ -1308,32 +1325,41 @@ class TranscriptionRunner(
         // full-file pass has both the left AND right neighbour of every
         // interior segment available, so this catches a few the partial
         // pass couldn't sandwich-detect at chunk boundaries.
-        val assigned = dropPureFillerSegments(coalesceBackchannels(assignedRaw))
+        //
+        // A function rather than straight-line code because the merge-map
+        // cleanup further down re-runs it with remapped speaker ids.
+        // Returns (rows, rowsWithNames): the former feeds title/classify
+        // and the sidecars, the latter is what gets persisted.
+        fun buildRows(pairs: List<Pair<RawSegment, Int?>>): Pair<List<Segment>, List<Segment>> {
+            val assigned = dropPureFillerSegments(coalesceBackchannels(pairs))
+            val rows = assigned.map { (raw, spkId) ->
+                Segment(
+                    recordingId = recordingId,
+                    startSeconds = raw.startSeconds,
+                    endSeconds = raw.endSeconds,
+                    text = raw.text.trim(),
+                    language = effectiveOutputLang,
+                    speaker = spkId?.let { "SPEAKER_%02d".format(it) },
+                )
+            }
+            val dedupedRows = dedupChunkBoundaries(
+                rows,
+                chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
+            )
+            // De-chunk: merge same-speaker turns across the tunable gap, same
+            // as the incremental path — this final pass also coalesces
+            // whatever the per-chunk passes couldn't (e.g. Whisper's single
+            // full-file run never went through the incremental path at all).
+            // Diarized runs only (see the incremental call for why).
+            val coalescedRows =
+                if (diarize) coalesceTurnSegments(dedupedRows, turnCoalesceGapSec) else dedupedRows
+            return rows to applyInferredSpeakerNames(coalescedRows)
+        }
 
         send(AsrEvent.Stage("Saving", 0.97f))
-        val rows = assigned.map { (raw, spkId) ->
-            Segment(
-                recordingId = recordingId,
-                startSeconds = raw.startSeconds,
-                endSeconds = raw.endSeconds,
-                text = raw.text.trim(),
-                language = effectiveOutputLang,
-                speaker = spkId?.let { "SPEAKER_%02d".format(it) },
-            )
-        }
-        val dedupedRows = dedupChunkBoundaries(
-            rows,
-            chunkBoundaryStartSeconds = chunkBoundaryStartSeconds,
-        )
-        // De-chunk: merge same-speaker turns across the tunable gap, same
-        // as the incremental path — this final pass also coalesces
-        // whatever the per-chunk passes couldn't (e.g. Whisper's single
-        // full-file run never went through the incremental path at all).
-        // Diarized runs only (see the incremental call for why).
-        val coalescedRows =
-            if (diarize) coalesceTurnSegments(dedupedRows, turnCoalesceGapSec) else dedupedRows
-        val rowsWithNames = applyInferredSpeakerNames(coalescedRows)
-        repository.replaceSegments(recordingId, rowsWithNames)
+        val built = buildRows(assignedRaw)
+        var rows = built.first
+        repository.replaceSegments(recordingId, built.second)
         // Re-read the row: the user may have re-titled, re-filed
         // (folderId) or categorised the recording while this run was in
         // flight, and Room's @Update replaces the WHOLE row — writing back
@@ -1356,21 +1382,39 @@ class TranscriptionRunner(
         // runs. Reuse the ASR engine when it IS Gemma; otherwise release
         // the ASR engine first (memory) and load a standalone Gemma for
         // the two short prompts, if one is installed and fits.
+        //
+        // The same standalone Gemma also runs the speaker merge-map
+        // cleanup for non-Gemma engines (the Gemma branches got it in the
+        // pre-pass). Deliberately here, AFTER the diarized transcript is
+        // saved, not before: the Gemma load is the one step of a
+        // Parakeet/Whisper run that can take the process down (LiteRT GPU
+        // path), and it must not take a finished transcript with it.
+        // Not when the user pinned Expected Speakers (a merge would undo
+        // their pick), and only from 3 clusters up: this pass can cost a
+        // whole extra Gemma load on a re-run that needs no title, and
+        // collapsing 2 clusters into 1 is almost never the right call.
+        val mergeClusters = postAsrClusters
+            ?.takeIf { gemma == null && expectedSpeakers <= 0 }
+            ?.let(::clusterSummaries)
+            ?.takeIf { it.size >= 3 }
         val wantsTitle = rows.isNotEmpty() && looksLikeDefaultTitle(updated.title)
         val wantsCategory = rows.isNotEmpty() && updated.category == null
         var asrReleased = false
         var standaloneTextGemma: Gemma4Backend? = null
         val textGemma: Gemma4Backend? = gemma ?: run {
-            if (!wantsTitle && !wantsCategory) return@run null
+            if (!wantsTitle && !wantsCategory && mergeClusters == null) return@run null
             val gModel = factory.resolveModel(AsrBackendKind.Gemma4) ?: return@run null
             if (checkGemmaE4BMemory() != null) return@run null
             asr.release()
             asrReleased = true
-            send(AsrEvent.Stage("Loading Gemma for naming", 0.975f))
+            send(AsrEvent.Stage(
+                if (mergeClusters != null) "Loading Gemma for speaker cleanup" else "Loading Gemma for naming",
+                0.975f,
+            ))
             val g = factory.create(AsrBackendKind.Gemma4) as? Gemma4Backend ?: return@run null
             val res = g.load(gModel.absolutePath)
             if (res.isFailure) {
-                Log.w(TAG, "standalone Gemma for text work failed to load; skipping title/classify", res.exceptionOrNull())
+                Log.w(TAG, "standalone Gemma for text work failed to load; skipping merge-map/title/classify", res.exceptionOrNull())
                 g.release()
                 null
             } else {
@@ -1379,30 +1423,57 @@ class TranscriptionRunner(
             }
         }
 
-        // Auto-title: if the recording still has the default timestamp-style
-        // title, ask Gemma for a short descriptive title. This is the
-        // biggest single Library improvement — "Recording_2026-05-17_14-23-30"
-        // is useless, "Q3 planning with Ahmed and Sara" is actually findable.
-        if (textGemma != null && wantsTitle) {
-            send(AsrEvent.Stage("Naming the recording", 0.98f))
-            val title = generateTitle(textGemma, rows)
-            if (!title.isNullOrBlank()) {
-                updated = updated.copy(title = title)
+        // try/finally so a Stop (or anything else) during these Gemma calls
+        // still frees the standalone engine — several GB of native memory
+        // that would otherwise fail the next run's memory guard.
+        // NonCancellable because Gemma4Backend.release() switches context,
+        // which throws straight away on an already-cancelled Job.
+        try {
+            // Speaker merge map: ask Gemma whether any of the clusters are
+            // the same person. Merges only, never splits; no suggestion (or
+            // no Gemma) leaves the saved transcript exactly as it is.
+            if (textGemma != null && mergeClusters != null) {
+                send(AsrEvent.Stage("Checking for over-split speakers", 0.977f))
+                val mergePairs = textGemma.suggestSpeakerMergeMap(mergeClusters)
+                if (mergePairs.isNotEmpty()) {
+                    val mapping = applyMergeMap(mergeClusters.map { it.id }.toSet(), mergePairs)
+                    val rebuilt = buildRows(remapAssignedSpeakers(assignedRaw, mapping))
+                    rows = rebuilt.first
+                    repository.replaceSegments(recordingId, rebuilt.second)
+                    val mergedCount = mergeClusters.size - mapping.values.distinct().size
+                    Log.i(TAG, "post-ASR merge map: merged $mergedCount of ${mergeClusters.size} clusters")
+                    if (mergedCount > 0) {
+                        send(AsrEvent.Stage("Gemma merged $mergedCount over-split speaker cluster(s)", 0.978f))
+                    }
+                }
             }
-        }
-        // Auto-classify: Meeting/Interview/Note/Idea. Unlike the title
-        // heuristic above, this never clobbers an existing value — once a
-        // recording has a category (from this or a future manual choice),
-        // a re-transcription leaves it alone rather than silently
-        // re-guessing. New to the Android app; see RecordingCategory's doc
-        // comment.
-        if (textGemma != null && wantsCategory) {
-            val category = classifyRecording(textGemma, rows)
-            if (category != null) {
-                updated = updated.copy(category = category.id)
+
+            // Auto-title: if the recording still has the default timestamp-style
+            // title, ask Gemma for a short descriptive title. This is the
+            // biggest single Library improvement — "Recording_2026-05-17_14-23-30"
+            // is useless, "Q3 planning with Ahmed and Sara" is actually findable.
+            if (textGemma != null && wantsTitle) {
+                send(AsrEvent.Stage("Naming the recording", 0.98f))
+                val title = generateTitle(textGemma, rows)
+                if (!title.isNullOrBlank()) {
+                    updated = updated.copy(title = title)
+                }
             }
+            // Auto-classify: Meeting/Interview/Note/Idea. Unlike the title
+            // heuristic above, this never clobbers an existing value — once a
+            // recording has a category (from this or a future manual choice),
+            // a re-transcription leaves it alone rather than silently
+            // re-guessing. New to the Android app; see RecordingCategory's doc
+            // comment.
+            if (textGemma != null && wantsCategory) {
+                val category = classifyRecording(textGemma, rows)
+                if (category != null) {
+                    updated = updated.copy(category = category.id)
+                }
+            }
+        } finally {
+            withContext(NonCancellable) { standaloneTextGemma?.release() }
         }
-        standaloneTextGemma?.release()
 
         repository.update(updated)
         if (!asrReleased) asr.release()
@@ -1618,6 +1689,33 @@ internal fun coalesceTurnSegments(rows: List<Segment>, gapSec: Double): List<Seg
         }
     }
     return out
+}
+
+/** One [ClusterSummary] per diarization cluster — the input to [Gemma4Backend.suggestSpeakerMergeMap]. */
+internal fun clusterSummaries(clusters: List<DiarizationRunner.SpeakerSegment>): List<ClusterSummary> =
+    clusters.groupBy { it.speakerId }.map { (id, segs) ->
+        ClusterSummary(
+            id = id,
+            durationSeconds = segs.sumOf { (it.end - it.start).toDouble() },
+            confidence = segs.map { it.confidence }.average().toFloat(),
+        )
+    }
+
+/**
+ * Apply an [applyMergeMap] result to already-assigned transcript
+ * segments, then renumber to 0..K-1 by first appearance so a merge
+ * doesn't leave a hole in the SPEAKER_nn sequence (same convention as
+ * [DiarizationRunner.renumberByFirstAppearance]). Ids missing from
+ * [mapping] pass through; unassigned (null) segments stay unassigned.
+ */
+internal fun remapAssignedSpeakers(
+    assigned: List<Pair<RawSegment, Int?>>,
+    mapping: Map<Int, Int>,
+): List<Pair<RawSegment, Int?>> {
+    val order = LinkedHashMap<Int, Int>()
+    return assigned.map { (seg, id) ->
+        seg to id?.let { mapping[it] ?: it }?.let { merged -> order.getOrPut(merged) { order.size } }
+    }
 }
 
 /**

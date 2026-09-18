@@ -21,12 +21,14 @@ import kotlinx.coroutines.withContext
  * boundaries. [AsrBackend.transcribe] still takes one whole buffer, same
  * as every other backend; the chunking is an internal detail.
  *
- * Word-level voting needs real per-word confidence, which no Android
- * engine has yet (see [RoverMerge]'s doc comment) — every merge here runs
- * with confidence defaulted to 1f, so disputed words are resolved purely
- * by [votePrior] until that lands upstream. Still meaningfully better
- * than picking one engine outright: matches stay matched, and genuinely
- * divergent chunks still reach arbitration.
+ * Real per-word confidence exists only on the whisper.cpp side (token
+ * probabilities, see [WhisperWordGrouping]); the sherpa-onnx engines have
+ * words but no confidence yet and Gemma has neither. [scoredWords] covers
+ * the mixed case; a pair with no confidence on either side still votes on
+ * [votePrior] alone. Before any vote, each engine's chunk text goes through
+ * [ChunkConfidence] — a text that fails that sanity check (repetition
+ * loop, far too short for the audio, refusal boilerplate) loses outright
+ * to a sane one rather than getting to contribute words ([pickBySanity]).
  */
 class EnsembleBackend(
     private val kindA: AsrBackendKind,
@@ -83,6 +85,8 @@ class EnsembleBackend(
             gemmaWedgeCount = 0
             gemmaBenched = false
             Result.success(Unit)
+        } catch (t: CancellationException) {
+            throw t
         } catch (t: Throwable) {
             Result.failure(t)
         }
@@ -187,6 +191,15 @@ class EnsembleBackend(
         if (textA.isEmpty()) return RawSegment(offsetSec, offsetSec + durationSec, textB)
         if (textB.isEmpty()) return RawSegment(offsetSec, offsetSec + durationSec, textA)
 
+        // Sanity gate, ahead of the vote: a degenerate text must not get
+        // to win substitutions or inject a looped phrase word by word. No
+        // arbitration either — there is nothing to arbitrate between a
+        // transcript and a failure.
+        pickBySanity(textA, textB, durationSec)?.let { sane ->
+            Log.i(TAG, "chunk @${offsetSec.toInt()}s: ${if (sane === textA) kindB else kindA} failed text sanity, other engine wins")
+            return RawSegment(offsetSec, offsetSec + durationSec, sane)
+        }
+
         val priorA = votePrior(kindA, language)
         val priorB = votePrior(kindB, language)
         val wordsA = segsA?.flatMap { it.words.orEmpty() }.orEmpty()
@@ -196,8 +209,8 @@ class EnsembleBackend(
         val agreement: Double
         val mergedText: String
         if (haveWords) {
-            val scoredA = wordsA.map { ScoredWord.of(it.text, it.confidence ?: 1f) }
-            val scoredB = wordsB.map { ScoredWord.of(it.text, it.confidence ?: 1f) }
+            val scoredA = scoredWords(wordsA, wordsB)
+            val scoredB = scoredWords(wordsB, wordsA)
             agreement = RoverMerge.diceSimilarity(scoredA.map { it.norm }, scoredB.map { it.norm })
             mergedText = if (agreement >= 0.999) {
                 if (priorA >= priorB) textA else textB
@@ -227,8 +240,8 @@ class EnsembleBackend(
         fallback: String,
     ): String {
         val arbiter = standaloneArbiter ?: return fallback
-        val scoredA = wordsA.map { ScoredWord.of(it.text, it.confidence ?: 1f) }
-        val scoredB = wordsB.map { ScoredWord.of(it.text, it.confidence ?: 1f) }
+        val scoredA = scoredWords(wordsA, wordsB)
+        val scoredB = scoredWords(wordsB, wordsA)
         val disputes = if (scoredA.isNotEmpty() && scoredB.isNotEmpty()) {
             RoverMerge.extractDisputes(scoredA, scoredB).take(MAX_DISPUTES_PER_CHUNK)
         } else emptyList()
@@ -283,6 +296,45 @@ class EnsembleBackend(
 
         /** Cost bound: a chunk with many disputed words only sends the worst few to Gemma, not all of them. */
         const val MAX_DISPUTES_PER_CHUNK = 8
+
+        /**
+         * Stand-in confidence for a word from an engine that reports none,
+         * used ONLY when the other engine does report real confidence
+         * (today: a sherpa engine paired with whisper.cpp). 1f there would
+         * make the unscored engine win every substitution no matter how
+         * sure Whisper is; this puts it at "a fairly sure Whisper word
+         * beats it, an unsure one doesn't". Deliberately above
+         * [RoverMerge]'s insertion floor so the unscored engine's
+         * single-engine words still survive. Not tuned on real data yet.
+         */
+        const val UNSCORED_WORD_CONFIDENCE = 0.7f
+
+        /**
+         * [words] as vote input. Real confidence is used wherever present;
+         * missing confidence becomes [UNSCORED_WORD_CONFIDENCE] when
+         * [other] side has real values, else 1f (neither side scored —
+         * the vote runs on [votePrior] alone, as before).
+         */
+        fun scoredWords(words: List<Word>, other: List<Word>): List<ScoredWord> {
+            val fallback = if (other.any { it.confidence != null }) UNSCORED_WORD_CONFIDENCE else 1f
+            return words.map { ScoredWord.of(it.text, it.confidence ?: fallback) }
+        }
+
+        /**
+         * [ChunkConfidence] gate between two non-empty chunk texts: when
+         * exactly one of them fails text sanity, returns the OTHER one
+         * (the same instance passed in); null when both pass or both fail
+         * — then the normal vote / arbitration decides.
+         */
+        fun pickBySanity(textA: String, textB: String, durationSec: Double): String? {
+            val lowA = ChunkConfidence.assess(textA, durationSec).isLow
+            val lowB = ChunkConfidence.assess(textB, durationSec).isLow
+            return when {
+                lowA && !lowB -> textB
+                lowB && !lowA -> textA
+                else -> null
+            }
+        }
 
         /** Pure predicate behind the benching decision — see [MAX_GEMMA_WEDGES_PER_RUN]'s doc comment. */
         fun shouldBench(wedgeCount: Int, maxWedges: Int): Boolean = wedgeCount >= maxWedges

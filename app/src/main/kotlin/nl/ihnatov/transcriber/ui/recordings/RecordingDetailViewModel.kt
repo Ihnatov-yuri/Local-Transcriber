@@ -4,13 +4,25 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
+import nl.ihnatov.transcriber.asr.DiarizationRunner
+import nl.ihnatov.transcriber.asr.VocabularyHarvester
+import nl.ihnatov.transcriber.asr.addLearnedTerm
+import nl.ihnatov.transcriber.data.TranscriptDiff
+import nl.ihnatov.transcriber.data.decodeSegments
 import nl.ihnatov.transcriber.asr.AsrBackendKind
 import nl.ihnatov.transcriber.asr.PostProcessor
 import nl.ihnatov.transcriber.asr.PostProcessingPreset
@@ -134,6 +146,151 @@ class RecordingDetailViewModel(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
+    // ─── Post-run hints (Phase 4 learned names + Phase 1 over-segmentation) ───
+
+    /**
+     * What the Detail screen offers right after a run finishes. Kept out
+     * of [UiState] on purpose: it changes on a different cadence (once per
+     * run) and the outer combine is already at its 5-flow arity limit.
+     */
+    data class RunHints(
+        /** Unknown names found in the fresh transcript — "+ Name" chips. Empty = row hidden. */
+        val nameSuggestions: List<VocabularyHarvester.Term> = emptyList(),
+        /**
+         * Distinct speaker count of the fresh transcript when it looks
+         * over-segmented (more than [DiarizationRunner.OVER_SEGMENTATION_WARNING_THRESHOLD]
+         * labels with Expected speakers left on AUTO); null = no hint.
+         */
+        val overSegmentedSpeakers: Int? = null,
+    )
+
+    private val _hints = MutableStateFlow(RunHints())
+    val hints: StateFlow<RunHints> = _hints.asStateFlow()
+
+    /**
+     * The expected-speakers value of the run THIS screen started, or null
+     * when the run in flight was started elsewhere (queue replay after a
+     * process restart) — the runner only reports over-segmentation as a
+     * transient Stage text, so this is how the hint knows AUTO was on.
+     */
+    private var lastRunExpectedSpeakers: Int? = null
+
+    init {
+        viewModelScope.launch {
+            var wasRunning = false
+            job.collect { j ->
+                if (j.running) {
+                    if (!wasRunning) _hints.value = RunHints() // a new run supersedes the old run's hints
+                } else if (wasRunning && j.error == null && j.stageLabel != CANCELLED_LABEL) {
+                    computeRunHints()
+                }
+                wasRunning = j.running
+            }
+        }
+    }
+
+    private suspend fun computeRunHints() {
+        val expected = lastRunExpectedSpeakers
+        try {
+            val segs = container.repository.observeSegments(recordingId).first()
+            val hints = withContext(Dispatchers.Default) {
+                val speakers = segs.mapNotNull { it.speaker }.distinct().size
+                val known = container.promptStore.vocabularyTerms() +
+                    container.learnedNamesStore.terms.value.map { it.spelling }
+                RunHints(
+                    nameSuggestions = VocabularyHarvester.suggest(
+                        text = segs.joinToString("\n") { it.text },
+                        knownTerms = known,
+                        dismissedKeys = container.learnedNamesStore.dismissedKeys.value,
+                    ),
+                    overSegmentedSpeakers = speakers.takeIf {
+                        expected != null && expected <= 0 &&
+                            it > DiarizationRunner.OVER_SEGMENTATION_WARNING_THRESHOLD
+                    },
+                )
+            }
+            _hints.value = hints
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            android.util.Log.w("DetailVM", "post-run hints failed", t)
+        }
+    }
+
+    /** One tap on a "+ Name" chip — same promotion path as Settings → Learned. */
+    fun addSuggestedName(term: VocabularyHarvester.Term) {
+        addLearnedTerm(container.promptStore, container.learnedNamesStore, term)
+        _hints.update { h -> h.copy(nameSuggestions = h.nameSuggestions.filter { it.key != term.key }) }
+    }
+
+    /** The × next to a chip — never offered again, here or in Settings → Learned. */
+    fun dismissSuggestedName(term: VocabularyHarvester.Term) {
+        container.learnedNamesStore.dismiss(term.key)
+        _hints.update { h -> h.copy(nameSuggestions = h.nameSuggestions.filter { it.key != term.key }) }
+    }
+
+    /** Hide the whole names row for now, without blacklisting anything. */
+    fun dismissNameSuggestions() {
+        _hints.update { it.copy(nameSuggestions = emptyList()) }
+    }
+
+    fun dismissOverSegmentedHint() {
+        _hints.update { it.copy(overSegmentedSpeakers = null) }
+    }
+
+    // ─── Version compare (Phase 4) ───────────────────────────────────
+
+    sealed interface CompareState {
+        val versionId: Long
+
+        data class Loading(override val versionId: Long) : CompareState
+        data class Ready(override val versionId: Long, val diff: TranscriptDiff.Result) : CompareState
+        data class Failed(override val versionId: Long, val reason: String) : CompareState
+    }
+
+    private val _compare = MutableStateFlow<CompareState?>(null)
+    val compare: StateFlow<CompareState?> = _compare.asStateFlow()
+    private var compareJob: Job? = null
+
+    /**
+     * Word-diff a saved version against the live transcript, off the main
+     * thread. Baseline = the saved version, so "removed" words exist only
+     * in that version and "added" words only in the current transcript.
+     */
+    fun compareVersion(versionId: Long) {
+        val version = ui.value.versions.firstOrNull { it.id == versionId } ?: return
+        val current = ui.value.segments
+        compareJob?.cancel()
+        _compare.value = CompareState.Loading(versionId)
+        compareJob = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.Default) {
+                    val old = decodeSegments(version.segmentsJson)
+                    if (old.isEmpty() && version.segmentCount > 0) null
+                    else TranscriptDiff.diff(
+                        old = old.joinToString("\n") { it.text },
+                        new = current.joinToString("\n") { it.text },
+                    )
+                }
+                _compare.value = if (result == null) {
+                    CompareState.Failed(versionId, "This saved version can't be read.")
+                } else {
+                    CompareState.Ready(versionId, result)
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                _compare.value = CompareState.Failed(versionId, t.message ?: "Compare failed")
+            }
+        }
+    }
+
+    fun clearCompare() {
+        compareJob?.cancel()
+        compareJob = null
+        _compare.value = null
+    }
+
     fun transcribe(
         backend: AsrBackendKind,
         languages: List<String>,
@@ -164,6 +321,7 @@ class RecordingDetailViewModel(
         maxQuality: Boolean = false,
     ) {
         val rec = ui.value.recording ?: return
+        lastRunExpectedSpeakers = if (diarize) expectedSpeakers else null
         container.transcriptionJobManager.start(
             recordingId = rec.id,
             params = TranscriptionJobManager.Params(
@@ -371,6 +529,9 @@ class RecordingDetailViewModel(
     }
 
     companion object {
+        /** [TranscriptionJobManager] paints this stage label when the user pressed Stop. */
+        private const val CANCELLED_LABEL = "Cancelled"
+
         fun factory(container: AppContainer, recordingId: Long): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

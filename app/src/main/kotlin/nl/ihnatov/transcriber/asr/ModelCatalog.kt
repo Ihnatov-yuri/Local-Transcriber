@@ -29,8 +29,8 @@ data class CatalogEntry(
      * `modelsDir()/<filename>/` instead of saving as a flat file at
      * `modelsDir()/<filename>` — [filename] names the destination
      * DIRECTORY in that case, not a file. Used by the sherpa-onnx
-     * directory-based engines (Parakeet: encoder/decoder/joiner + tokens;
-     * Omnilingual/Nemotron: one model file + tokens).
+     * directory-based engines (Parakeet/Nemotron: encoder/decoder/joiner +
+     * tokens; Omnilingual: one model file + tokens).
      */
     val isArchive: Boolean = false,
     /**

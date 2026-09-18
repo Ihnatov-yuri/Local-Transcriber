@@ -52,4 +52,26 @@ class VocabularyHarvesterTest {
             VocabularyHarvester.harvest(items, existingVocabulary = emptyList()).first().spelling,
         )
     }
+
+    @Test
+    fun `suggest filters known dismissed and ordinary words and ranks by mentions`() {
+        val text = "We met Kaiko and Orla at OWASP. Then Kaiko showed the Project plan. " +
+            "The project is late, the project slipped. Orla agreed with Kaiko on Monday. Zed left."
+        val out = VocabularyHarvester.suggest(
+            text,
+            knownTerms = listOf("orla"),
+            dismissedKeys = setOf("owasp"),
+        )
+        assertEquals(listOf("Kaiko"), out.map { it.spelling })
+        assertEquals(3, out.first().occurrences)
+        assertEquals("kaiko", out.first().key)
+    }
+
+    @Test
+    fun `suggest respects limit and dedupes by key`() {
+        val text = "I saw Alfa and Bravo and Charlie with Alfa and ALFA again."
+        val out = VocabularyHarvester.suggest(text, emptyList(), emptySet(), limit = 2)
+        assertEquals(2, out.size)
+        assertEquals("alfa", out.first().key)
+    }
 }
