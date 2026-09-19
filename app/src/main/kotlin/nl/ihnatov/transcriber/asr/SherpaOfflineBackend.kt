@@ -163,15 +163,15 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
     }
 
     /**
-     * Word reconstruction from subword tokens: NeMo/Parakeet-family models
-     * use a SentencePiece tokenizer where a leading `▁` marks the start of
-     * a new word — this is a best-effort heuristic, not verified against a
-     * live model in this environment (no test audio or downloaded model
-     * available here). If no token in a result carries the marker (a
-     * different tokenizer convention), every token falls back to being
-     * its own "word" rather than silently merging unrelated pieces.
+     * Word reconstruction from subword tokens. The models' SentencePiece
+     * vocabularies mark a word start with a leading `▁`, but sherpa-onnx
+     * hands result tokens back with that marker already turned into a
+     * plain space (verified on-device with Parakeet TDT v3: matching only
+     * `▁` merged every segment into one giant "word", which quietly
+     * reduced per-word speaker attribution and the Super-mode word vote
+     * to segment granularity). Accept either spelling.
      */
-    private fun reconstructWords(
+    internal fun reconstructWords(
         tokens: Array<String>,
         timestamps: FloatArray,
         durations: FloatArray,
@@ -189,9 +189,13 @@ class SherpaOfflineBackend(private val kind: AsrBackendKind) : AsrBackend {
         }
         for (i in tokens.indices) {
             val raw = tokens[i]
-            val isNewWord = raw.startsWith(SENTENCEPIECE_WORD_MARKER) || i == 0
-            val piece = raw.removePrefix(SENTENCEPIECE_WORD_MARKER)
-            if (piece.isEmpty()) continue
+            val isNewWord = i == 0 || raw.startsWith(SENTENCEPIECE_WORD_MARKER) || raw.startsWith(" ")
+            val piece = raw.removePrefix(SENTENCEPIECE_WORD_MARKER).trim()
+            if (piece.isEmpty()) {
+                // A bare marker token: the NEXT piece starts a new word.
+                if (isNewWord && buf.isNotEmpty()) flush()
+                continue
+            }
             val start = offsetSec + (timestamps.getOrElse(i) { 0f }).toDouble()
             val dur = durations.getOrElse(i) { 0.08f }.toDouble()
             if (isNewWord && buf.isNotEmpty()) flush()

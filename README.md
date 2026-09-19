@@ -8,6 +8,17 @@ The current roadmap — a research-backed plan to bring this app to parity with 
 
 ---
 
+## Speed on device
+
+Measured on a Galaxy S24 Ultra (CPU, debug build with release-optimised native code), 10-minute 16 kHz file, via `EngineSpeedTest` (`app/src/androidTest`):
+
+| Engine | Model load | 10 min of audio | Real-time factor |
+|---|---|---|---|
+| Parakeet TDT 0.6B v3 int8 | 4.6 s | 41.8 s | 14.4x |
+| Nemotron 3.5 streaming (live) | — | keeps pace with the microphone; partials well under 1 s behind speech | ≥ 1x by design |
+
+Omnilingual and whisper.cpp rows: run the same test with those models installed.
+
 ## Screenshots
 
 Editorial "ink-on-paper" design — paper background, single orange accent, monospace chrome. Dark mode shown.
